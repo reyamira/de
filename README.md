@@ -1,6 +1,6 @@
 # de
 
-`de` is a tiny inline directory explorer for your shell. It shows the current
+`de` is a tiny inline directory explorer and navigator. It shows the current
 directory, lets you walk into or out of folders, and changes the shell's working
 directory only when you confirm.
 
