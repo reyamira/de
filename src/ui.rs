@@ -1,15 +1,15 @@
-use crate::{App, Entry, Palette};
-use chrono::{DateTime, Local};
+use crate::{App, DateFormat, DisplaySettings, Entry, Palette, TimeFormat, Timezone};
+use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use std::time::SystemTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const TWO_PANE_MIN_WIDTH: u16 = 58;
 
-const MODIFIED_COLUMN_WIDTH: usize = 16;
 const MODIFIED_COLUMN_GAP: usize = 2;
 const MIN_NAME_COLUMN_WIDTH: usize = 12;
 pub fn render(frame: &mut Frame<'_>, app: &App) {
@@ -23,6 +23,7 @@ pub fn render_theme_preview(frame: &mut Frame<'_>, app: &App) {
 fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
     let area = frame.area();
     let palette = app.theme().palette();
+    let now = SystemTime::now();
     frame.render_widget(Clear, area);
 
     if area.height == 0 || area.width == 0 {
@@ -53,9 +54,9 @@ fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
 
     render_header(frame, app, header, &palette, theme_preview);
     if area.width >= TWO_PANE_MIN_WIDTH {
-        render_two_panes(frame, app, body, &palette);
+        render_two_panes(frame, app, body, &palette, now);
     } else {
-        render_current_entries(frame, app, body, false, &palette);
+        render_current_entries(frame, app, body, false, &palette, now);
     }
     if theme_preview {
         render_theme_footer(frame, app, footer, &palette);
@@ -90,7 +91,13 @@ fn render_header(
     );
 }
 
-fn render_two_panes(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+fn render_two_panes(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: &Palette,
+    now: SystemTime,
+) {
     let [left, divider, right] = Layout::horizontal([
         Constraint::Percentage(44),
         Constraint::Length(1),
@@ -98,12 +105,12 @@ fn render_two_panes(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Pale
     ])
     .areas(area);
 
-    render_current_entries(frame, app, left, true, palette);
+    render_current_entries(frame, app, left, true, palette, now);
     let divider_lines = (0..divider.height)
         .map(|_| Line::styled("│", muted_style(palette)))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(divider_lines), divider);
-    render_preview(frame, app, right, palette);
+    render_preview(frame, app, right, palette, now);
 }
 
 fn render_current_entries(
@@ -112,6 +119,7 @@ fn render_current_entries(
     area: Rect,
     titled: bool,
     palette: &Palette,
+    now: SystemTime,
 ) {
     if area.height == 0 {
         return;
@@ -124,9 +132,15 @@ fn render_current_entries(
         (None, area)
     };
 
+    let modified_width = modified_column_width(app.entries(), app.display_settings(), now);
     if let Some(title) = title {
         frame.render_widget(
-            Paragraph::new(pane_heading(" current", title.width as usize)).style(
+            Paragraph::new(pane_heading(
+                " current",
+                title.width as usize,
+                modified_width,
+            ))
+            .style(
                 Style::default()
                     .fg(palette.title)
                     .add_modifier(Modifier::BOLD),
@@ -159,7 +173,14 @@ fn render_current_entries(
     {
         let selected = index == app.selected();
         let prefix = if selected { "› " } else { "  " };
-        let text = entry_row(prefix, entry, list.width as usize);
+        let text = entry_row(
+            prefix,
+            entry,
+            list.width as usize,
+            modified_width,
+            app.display_settings(),
+            now,
+        );
         let style = if selected {
             emphasis_style(palette)
         } else {
@@ -170,14 +191,22 @@ fn render_current_entries(
     frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+fn render_preview(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: &Palette,
+    now: SystemTime,
+) {
     if area.height == 0 {
         return;
     }
     let [title, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let heading = format!(" next · {}", app.preview().label());
+    let modified_width =
+        modified_column_width(app.preview().entries(), app.display_settings(), now);
     frame.render_widget(
-        Paragraph::new(pane_heading(&heading, title.width as usize)).style(
+        Paragraph::new(pane_heading(&heading, title.width as usize, modified_width)).style(
             Style::default()
                 .fg(palette.title)
                 .add_modifier(Modifier::BOLD),
@@ -199,7 +228,14 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palett
         .take((list.height as usize).saturating_sub(lines.len()))
     {
         lines.push(Line::styled(
-            entry_row("  ", entry, list.width as usize),
+            entry_row(
+                "  ",
+                entry,
+                list.width as usize,
+                modified_width,
+                app.display_settings(),
+                now,
+            ),
             entry_style(entry, palette),
         ));
     }
@@ -389,12 +425,20 @@ fn fill_row(prefix: &str, value: &str, width: usize) -> String {
     output
 }
 
-fn entry_row(prefix: &str, entry: &Entry, width: usize) -> String {
-    if !shows_modified_column(width) {
+fn entry_row(
+    prefix: &str,
+    entry: &Entry,
+    width: usize,
+    modified_width: Option<usize>,
+    display: &DisplaySettings,
+    now: SystemTime,
+) -> String {
+    let Some(modified_width) = modified_width.filter(|value| shows_modified_column(width, *value))
+    else {
         return fill_row(prefix, &entry.display_name(), width);
-    }
+    };
 
-    let name_column_width = width - MODIFIED_COLUMN_GAP - MODIFIED_COLUMN_WIDTH;
+    let name_column_width = width - MODIFIED_COLUMN_GAP - modified_width;
     let prefix_width = UnicodeWidthStr::width(prefix);
     let name_width = name_column_width.saturating_sub(prefix_width);
     let mut output = format!(
@@ -403,36 +447,123 @@ fn entry_row(prefix: &str, entry: &Entry, width: usize) -> String {
     );
     let padding = name_column_width.saturating_sub(UnicodeWidthStr::width(output.as_str()));
     output.extend(std::iter::repeat_n(' ', padding + MODIFIED_COLUMN_GAP));
-    output.push_str(&format_modified(entry.modified));
+    let modified = format_modified(entry.modified, display, now);
+    let modified_padding = modified_width.saturating_sub(UnicodeWidthStr::width(modified.as_str()));
+    output.extend(std::iter::repeat_n(' ', modified_padding));
+    output.push_str(&modified);
     output
 }
 
-fn pane_heading(label: &str, width: usize) -> String {
-    if !shows_modified_column(width) {
+fn pane_heading(label: &str, width: usize, modified_width: Option<usize>) -> String {
+    let Some(modified_width) = modified_width.filter(|value| shows_modified_column(width, *value))
+    else {
         return shorten_right(label, width);
-    }
+    };
 
-    let label_width = width - MODIFIED_COLUMN_GAP - MODIFIED_COLUMN_WIDTH;
+    let label_width = width - MODIFIED_COLUMN_GAP - modified_width;
     let mut output = shorten_right(label, label_width);
     let padding = label_width.saturating_sub(UnicodeWidthStr::width(output.as_str()));
     output.extend(std::iter::repeat_n(' ', padding + MODIFIED_COLUMN_GAP));
-    output.push_str(&format!("{:>MODIFIED_COLUMN_WIDTH$}", "modified"));
+    output.push_str(&format!("{:<modified_width$}", "modified"));
     output
 }
 
-fn shows_modified_column(width: usize) -> bool {
-    width >= MIN_NAME_COLUMN_WIDTH + MODIFIED_COLUMN_GAP + MODIFIED_COLUMN_WIDTH
+fn modified_column_width(
+    entries: &[Entry],
+    display: &DisplaySettings,
+    now: SystemTime,
+) -> Option<usize> {
+    if !display.shows_modified() {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .map(|entry| format_modified(entry.modified, display, now))
+            .map(|value| UnicodeWidthStr::width(value.as_str()))
+            .chain(std::iter::once(UnicodeWidthStr::width("modified")))
+            .max()
+            .expect("the modified heading always contributes a width"),
+    )
 }
 
-fn format_modified(modified: Option<std::time::SystemTime>) -> String {
-    modified.map_or_else(
-        || format!("{:>MODIFIED_COLUMN_WIDTH$}", "—"),
-        |modified| {
-            DateTime::<Local>::from(modified)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
+fn shows_modified_column(width: usize, modified_width: usize) -> bool {
+    width >= MIN_NAME_COLUMN_WIDTH + MODIFIED_COLUMN_GAP + modified_width
+}
+
+fn format_modified(
+    modified: Option<SystemTime>,
+    display: &DisplaySettings,
+    now: SystemTime,
+) -> String {
+    let Some(modified) = modified else {
+        return "—".into();
+    };
+    if display.date_format() == &DateFormat::Relative {
+        return format_relative(modified, now);
+    }
+
+    let format = match display.date_format() {
+        DateFormat::Iso => match display.time_format() {
+            TimeFormat::TwelveHour => "%Y-%m-%d %I:%M %p",
+            TimeFormat::TwentyFourHour => "%Y-%m-%d %H:%M",
         },
-    )
+        DateFormat::Us => match display.time_format() {
+            TimeFormat::TwelveHour => "%m/%d/%y %I:%M %p",
+            TimeFormat::TwentyFourHour => "%m/%d/%y %H:%M",
+        },
+        DateFormat::European => match display.time_format() {
+            TimeFormat::TwelveHour => "%d/%m/%y %I:%M %p",
+            TimeFormat::TwentyFourHour => "%d/%m/%y %H:%M",
+        },
+        DateFormat::Custom(format) => format,
+        DateFormat::Relative => unreachable!("relative timestamps return above"),
+    };
+
+    match display.timezone() {
+        Timezone::Local => DateTime::<Local>::from(modified).format(format).to_string(),
+        Timezone::Utc => DateTime::<Utc>::from(modified).format(format).to_string(),
+    }
+}
+
+fn format_relative(modified: SystemTime, now: SystemTime) -> String {
+    let (future, seconds) = match modified.duration_since(now) {
+        Ok(duration) => (true, duration.as_secs()),
+        Err(error) => (false, error.duration().as_secs()),
+    };
+    if seconds < 60 {
+        return "just now".into();
+    }
+
+    let (amount, unit) = if seconds < 60 * 60 {
+        (seconds / 60, "min")
+    } else if seconds < 24 * 60 * 60 {
+        (seconds / (60 * 60), "hr")
+    } else if seconds < 30 * 24 * 60 * 60 {
+        let days = seconds / (24 * 60 * 60);
+        if days == 1 {
+            return if future {
+                "tomorrow".into()
+            } else {
+                "yesterday".into()
+            };
+        }
+        (days, "day")
+    } else if seconds < 365 * 24 * 60 * 60 {
+        (seconds / (30 * 24 * 60 * 60), "month")
+    } else {
+        (seconds / (365 * 24 * 60 * 60), "year")
+    };
+    let plural = if amount == 1 || matches!(unit, "min" | "hr") {
+        ""
+    } else {
+        "s"
+    };
+    if future {
+        format!("in {amount} {unit}{plural}")
+    } else {
+        format!("{amount} {unit}{plural} ago")
+    }
 }
 
 fn shorten_right(value: &str, max_width: usize) -> String {
@@ -491,7 +622,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::fs;
+    use std::time::Duration;
     use tempfile::tempdir;
+    use toml_edit::DocumentMut;
+
+    fn display_settings(contents: &str) -> DisplaySettings {
+        let document = contents.parse::<DocumentMut>().unwrap();
+        DisplaySettings::from_document(&document).unwrap()
+    }
 
     #[test]
     fn wide_render_shows_current_and_destination_panes() {
@@ -555,19 +693,55 @@ mod tests {
     }
 
     #[test]
-    fn modified_values_are_fixed_width_and_hidden_when_space_is_tight() {
-        let value = format_modified(Some(std::time::SystemTime::UNIX_EPOCH));
-        assert_eq!(
-            UnicodeWidthStr::width(value.as_str()),
-            MODIFIED_COLUMN_WIDTH
-        );
+    fn modified_values_follow_display_preferences_and_available_space() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        let default = DisplaySettings::default();
+        let value = format_modified(Some(SystemTime::UNIX_EPOCH), &default, now);
+        assert_eq!(UnicodeWidthStr::width(value.as_str()), 16);
         assert!(value.contains(':'));
+        assert_eq!(format_modified(None, &default, now), "—");
+        assert!(!shows_modified_column(29, 16));
+        assert!(shows_modified_column(30, 16));
+
+        let relative = display_settings("[display]\ndate_format = \"relative\"\n");
         assert_eq!(
-            UnicodeWidthStr::width(format_modified(None).as_str()),
-            MODIFIED_COLUMN_WIDTH
+            format_modified(Some(now - Duration::from_secs(4 * 60)), &relative, now,),
+            "4 min ago"
         );
-        assert!(!shows_modified_column(29));
-        assert!(shows_modified_column(30));
+        assert_eq!(
+            format_modified(Some(now - Duration::from_secs(59)), &relative, now),
+            "just now"
+        );
+        assert_eq!(
+            format_modified(
+                Some(now + Duration::from_secs(24 * 60 * 60)),
+                &relative,
+                now,
+            ),
+            "tomorrow"
+        );
+
+        let custom = display_settings(
+            "[display]\ndate_format = \"custom\"\ncustom_format = \"%Y/%m/%d %H:%M UTC\"\ntimezone = \"utc\"\n",
+        );
+        assert_eq!(
+            format_modified(Some(SystemTime::UNIX_EPOCH), &custom, now),
+            "1970/01/01 00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn modified_column_can_be_disabled() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("project")).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_display_settings(display_settings("[display]\nmodified = false\n"));
+        let backend = TestBackend::new(88, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert!(!terminal.backend().to_string().contains("modified"));
     }
 
     #[test]
@@ -590,7 +764,7 @@ mod tests {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("project")).unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        let themes = crate::ThemeCatalog::built_ins();
+        let themes = crate::Config::built_ins();
         app.set_theme(themes.find("dark").unwrap().clone());
         let backend = TestBackend::new(88, 6);
         let mut terminal = Terminal::new(backend).unwrap();

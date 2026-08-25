@@ -6,7 +6,7 @@ use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use de::backend::InlineBackend;
 use de::{
-    App, NavigationResult, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, ThemeCatalog, create_custom_theme,
+    App, Config, NavigationResult, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme,
     render, render_theme_preview, resolve_start_path, save_theme, shell_init,
 };
 use ratatui::Terminal;
@@ -152,13 +152,14 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(CliCommand::Theme { command: None }) => {
             require_terminal()?;
-            let catalog = ThemeCatalog::load()
-                .map_err(|error| format!("cannot load theme config: {error}"))?;
+            let catalog =
+                Config::load().map_err(|error| format!("cannot load theme config: {error}"))?;
             let start = resolve_start_path(None)
                 .map_err(|error| format!("cannot resolve current directory: {error}"))?;
             let mut app = App::new(start)
                 .map_err(|error| format!("cannot open current directory: {error}"))?;
             app.set_theme(resolve_theme(theme, &catalog)?);
+            app.set_display_settings(catalog.display().clone());
             if let Some(theme) =
                 run_theme_picker(app, &catalog).map_err(|error| error.to_string())?
             {
@@ -169,13 +170,14 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         None => {
             require_terminal()?;
-            let catalog = ThemeCatalog::load()
-                .map_err(|error| format!("cannot load theme config: {error}"))?;
+            let catalog =
+                Config::load().map_err(|error| format!("cannot load theme config: {error}"))?;
             let start = resolve_start_path(directory.as_deref())
                 .map_err(|error| format!("cannot resolve start directory: {error}"))?;
             let mut app =
                 App::new(start).map_err(|error| format!("cannot open start directory: {error}"))?;
             app.set_theme(resolve_theme(theme, &catalog)?);
+            app.set_display_settings(catalog.display().clone());
             if let Some(path) = run_picker(app).map_err(|error| error.to_string())? {
                 write_selected_path(&path).map_err(|error| error.to_string())?;
             }
@@ -191,7 +193,7 @@ fn require_terminal() -> Result<(), String> {
     Ok(())
 }
 
-fn resolve_theme(override_theme: Option<String>, catalog: &ThemeCatalog) -> Result<Theme, String> {
+fn resolve_theme(override_theme: Option<String>, catalog: &Config) -> Result<Theme, String> {
     let requested = if let Some(theme) = override_theme {
         theme
     } else {
@@ -228,7 +230,7 @@ fn run_picker(app: App) -> io::Result<Option<std::path::PathBuf>> {
     })
 }
 
-fn run_theme_picker(app: App, catalog: &ThemeCatalog) -> io::Result<Option<Theme>> {
+fn run_theme_picker(app: App, catalog: &Config) -> io::Result<Option<Theme>> {
     run_inline(app, render_theme_preview, |app, key, _| {
         handle_theme_key(app, key, catalog)
     })
@@ -296,7 +298,7 @@ fn run_inline<T>(
     outcome
 }
 
-fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &ThemeCatalog) -> InlineResult<Theme> {
+fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &Config) -> InlineResult<Theme> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return InlineResult::Cancel;
     }
@@ -583,7 +585,7 @@ mod tests {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("source")).unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        let catalog = ThemeCatalog::built_ins();
+        let catalog = Config::built_ins();
         assert_eq!(app.theme().name(), "auto");
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);

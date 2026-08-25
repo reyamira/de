@@ -1,3 +1,4 @@
+use crate::DisplaySettings;
 use ratatui::style::Color;
 use std::env;
 use std::fs;
@@ -39,16 +40,18 @@ impl Theme {
 }
 
 #[derive(Clone, Debug)]
-pub struct ThemeCatalog {
+pub struct Config {
     themes: Vec<Theme>,
     saved_theme: Option<String>,
+    display: DisplaySettings,
 }
 
-impl ThemeCatalog {
+impl Config {
     pub fn built_ins() -> Self {
         Self {
             themes: built_in_themes(),
             saved_theme: None,
+            display: DisplaySettings::default(),
         }
     }
 
@@ -68,12 +71,23 @@ impl ThemeCatalog {
     fn from_toml(contents: &str) -> io::Result<Self> {
         let document = parse_document(contents)?;
         let mut catalog = Self::built_ins();
+        catalog.display = DisplaySettings::from_document(&document)?;
 
         if let Some(item) = document.get("theme") {
-            let name = item
-                .as_str()
-                .ok_or_else(|| invalid_data("the top-level theme setting must be a string"))?;
-            catalog.saved_theme = Some(name.to_owned());
+            if let Some(name) = item.as_str() {
+                catalog.saved_theme = Some(name.to_owned());
+            } else if let Some(theme) = item.as_table() {
+                if let Some(selected) = theme.get("selected") {
+                    let name = selected
+                        .as_str()
+                        .ok_or_else(|| invalid_data("theme.selected must be a string"))?;
+                    catalog.saved_theme = Some(name.to_owned());
+                }
+            } else {
+                return Err(invalid_data(
+                    "theme must be a table; the legacy top-level value must be a string",
+                ));
+            }
         }
 
         let Some(themes_item) = document.get("themes") else {
@@ -115,6 +129,10 @@ impl ThemeCatalog {
 
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.themes.iter().map(|theme| theme.name.as_str())
+    }
+
+    pub const fn display(&self) -> &DisplaySettings {
+        &self.display
     }
 
     pub fn next(&self, current: &str) -> Theme {
@@ -192,14 +210,54 @@ pub fn create_custom_theme(name: &str) -> io::Result<PathBuf> {
 
 fn save_theme_at(path: &Path, name: &str) -> io::Result<()> {
     let mut document = read_document_or_new(path)?;
-    let is_new_setting = !document.contains_key("theme");
-    document["theme"] = value(name);
-    if is_new_setting {
-        document["theme"]
-            .as_value_mut()
-            .expect("a string value was assigned above")
-            .decor_mut()
-            .set_suffix("\n");
+    let legacy_prefix = document
+        .as_table()
+        .key("theme")
+        .and_then(|key| key.leaf_decor().prefix().cloned());
+    let legacy_suffix = document
+        .get("theme")
+        .and_then(Item::as_value)
+        .and_then(|value| value.decor().suffix().cloned());
+    let mut migrated_legacy_value = false;
+    match document.get_mut("theme") {
+        Some(item) if item.is_table() => {
+            item.as_table_mut()
+                .expect("the item was checked as a table above")["selected"] = value(name);
+        }
+        Some(item) if item.as_str().is_some() => {
+            let mut theme = Table::new();
+            theme["selected"] = value(name);
+            *item = Item::Table(theme);
+            migrated_legacy_value = true;
+        }
+        Some(_) => {
+            return Err(invalid_data(
+                "theme must be a table; the legacy top-level value must be a string",
+            ));
+        }
+        None => {
+            let mut theme = Table::new();
+            theme["selected"] = value(name);
+            document["theme"] = Item::Table(theme);
+        }
+    }
+    if migrated_legacy_value {
+        document
+            .as_table_mut()
+            .key_mut("theme")
+            .expect("the migrated theme table has a key")
+            .leaf_decor_mut()
+            .clear();
+        let decor = document["theme"]
+            .as_table_mut()
+            .expect("the legacy value was replaced with a table")
+            .decor_mut();
+        if let Some(prefix) = legacy_prefix {
+            decor.set_prefix(prefix);
+        }
+        if let Some(suffix) = legacy_suffix {
+            decor.set_suffix(suffix);
+        }
     }
     write_document(path, &document)
 }
@@ -562,7 +620,7 @@ mod tests {
 
     #[test]
     fn built_in_themes_cycle_in_both_directions() {
-        let catalog = ThemeCatalog::built_ins();
+        let catalog = Config::built_ins();
         assert_eq!(catalog.next("auto").name(), "light");
         assert_eq!(catalog.previous("auto").name(), "rose");
         assert_eq!(catalog.next("rose").name(), "auto");
@@ -570,9 +628,13 @@ mod tests {
 
     #[test]
     fn config_loads_a_saved_custom_theme_with_overrides() {
-        let catalog = ThemeCatalog::from_toml(
+        let catalog = Config::from_toml(
             r##"
-theme = "midnight"
+[theme]
+selected = "midnight"
+
+[display]
+date_format = "relative"
 
 [themes.midnight]
 extends = "dark"
@@ -584,11 +646,38 @@ dim_muted = true
         .unwrap();
 
         assert_eq!(catalog.saved_theme(), Some("midnight"));
+        assert_eq!(
+            catalog.display().date_format(),
+            &crate::DateFormat::Relative
+        );
         let midnight = catalog.find("midnight").unwrap();
         assert_eq!(midnight.palette().accent, Color::Rgb(0x12, 0x34, 0x56));
         assert_eq!(midnight.palette().text, Color::White);
         assert_eq!(midnight.palette().emphasis_background, Color::LightCyan);
         assert!(midnight.palette().dim_muted);
+    }
+
+    #[test]
+    fn legacy_top_level_theme_is_still_read() {
+        let config = Config::from_toml("theme = \"dark\"\n").unwrap();
+        assert_eq!(config.saved_theme(), Some("dark"));
+    }
+
+    #[test]
+    fn grouped_theme_selection_updates_without_losing_other_settings() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[theme]\nselected = \"auto\"\nfuture_setting = \"keep\"\n",
+        )
+        .unwrap();
+
+        save_theme_at(&path, "forest").unwrap();
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.contains("selected = \"forest\""));
+        assert!(saved.contains("future_setting = \"keep\""));
     }
 
     #[test]
@@ -598,14 +687,17 @@ dim_muted = true
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             &path,
-            "# keep this comment\ntheme = \"auto\"\n\n[themes.night]\nextends = \"dark\"\n",
+            "# keep this comment\ntheme = \"auto\" # keep inline\n\n[themes.night]\nextends = \"dark\"\n",
         )
         .unwrap();
 
         save_theme_at(&path, "night").unwrap();
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.contains("# keep this comment"));
-        assert!(saved.contains("theme = \"night\""));
+        assert!(saved.contains("# keep inline"));
+        assert!(saved.contains("[theme]"), "saved config:\n{saved}");
+        assert!(saved.contains("selected = \"night\""));
+        assert!(!saved.contains("theme = \"auto\""));
         assert!(saved.contains("[themes.night]"));
     }
 
@@ -614,15 +706,15 @@ dim_muted = true
         let temp = tempdir().unwrap();
         let path = temp.path().join("de/config.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "# preferences\ntheme = \"forest\"\n").unwrap();
+        fs::write(&path, "# preferences\n[theme]\nselected = \"forest\"\n").unwrap();
 
         create_custom_theme_at(&path, "midnight").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("# preferences"));
-        assert!(contents.contains("theme = \"forest\""));
+        assert!(contents.contains("selected = \"forest\""));
         assert!(contents.contains("[themes.midnight]"));
         assert!(
-            ThemeCatalog::from_toml(&contents)
+            Config::from_toml(&contents)
                 .unwrap()
                 .find("midnight")
                 .is_some()
@@ -637,7 +729,7 @@ dim_muted = true
 
     #[test]
     fn invalid_custom_values_are_rejected() {
-        let bad_color = ThemeCatalog::from_toml(
+        let bad_color = Config::from_toml(
             r##"[themes.neon]
 extends = "dark"
 accent = "#123"
@@ -647,16 +739,15 @@ accent = "#123"
         assert_eq!(bad_color.kind(), io::ErrorKind::InvalidData);
 
         let bad_parent =
-            ThemeCatalog::from_toml("[themes.neon]\nextends = \"another-custom-theme\"\n")
-                .unwrap_err();
+            Config::from_toml("[themes.neon]\nextends = \"another-custom-theme\"\n").unwrap_err();
         assert_eq!(bad_parent.kind(), io::ErrorKind::InvalidData);
 
         let non_ascii_hex =
-            ThemeCatalog::from_toml("[themes.neon]\nextends = \"dark\"\naccent = \"#aéaaa\"\n")
+            Config::from_toml("[themes.neon]\nextends = \"dark\"\naccent = \"#aéaaa\"\n")
                 .unwrap_err();
         assert_eq!(non_ascii_hex.kind(), io::ErrorKind::InvalidData);
 
-        let duplicate = ThemeCatalog::from_toml(
+        let duplicate = Config::from_toml(
             "[themes.night]\nextends = \"dark\"\n[themes.NIGHT]\nextends = \"light\"\n",
         )
         .unwrap_err();
@@ -665,7 +756,7 @@ accent = "#123"
 
     #[test]
     fn auto_and_mono_use_adaptive_reverse_emphasis() {
-        let catalog = ThemeCatalog::built_ins();
+        let catalog = Config::built_ins();
         assert!(catalog.find("auto").unwrap().palette().reverse_emphasis);
         assert!(catalog.find("mono").unwrap().palette().reverse_emphasis);
         assert!(!catalog.find("dark").unwrap().palette().reverse_emphasis);

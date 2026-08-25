@@ -66,7 +66,8 @@ That adds a complete starting palette to `config.toml` without replacing other
 settings or comments:
 
 ```toml
-theme = "midnight"
+[theme]
+selected = "midnight"
 
 [themes.midnight]
 extends = "dark"
@@ -87,6 +88,47 @@ theme and override only what it needs. Colors accept `#RRGGBB`, `default`, or
 ANSI names such as `blue`, `light-cyan`, and `dark-gray`. After editing, run
 `de theme` to preview it alongside the built-ins. Custom names also work with
 `--theme` and `DE_THEME`.
+
+## Date and time
+
+Modification timestamps use local time in `YYYY-MM-DD HH:MM` form by default.
+Change their presentation in the same `config.toml` file:
+
+```toml
+[display]
+modified = true
+date_format = "iso"
+time_format = "24h"
+timezone = "local"
+```
+
+`date_format` accepts `iso`, `us`, `european`, `relative`, or `custom`:
+
+| Setting | Example |
+| --- | --- |
+| `iso` | `2026-08-25 15:02` |
+| `us` with `time_format = "12h"` | `08/25/26 03:02 PM` |
+| `european` | `25/08/26 15:02` |
+| `relative` | `4 min ago`, `yesterday`, `3 months ago` |
+
+`time_format` accepts `12h` or `24h`, and `timezone` accepts `local` or `utc`.
+Set `modified = false` to hide the column entirely. Sorting by modification time
+still uses the exact filesystem timestamp regardless of its presentation.
+
+For complete control, use a
+[Chrono strftime format](https://docs.rs/chrono/latest/chrono/format/strftime/):
+
+```toml
+[display]
+date_format = "custom"
+custom_format = "%b %e, %Y at %l:%M %p"
+timezone = "local"
+```
+
+Custom formats replace both the date and time presets; relative timestamps do
+not use the clock or timezone settings. Column width follows the rendered values
+automatically. When the terminal is too narrow to retain a readable filename
+column, timestamps collapse away with the rest of the responsive layout.
 
 ## Controls
 
@@ -125,7 +167,7 @@ carries into the preview pane and navigated directories.
   raw mode, cursor movement, and colors.
 - [Clap](https://docs.rs/clap/) parses arguments and generates the styled help,
   version, subcommand, and error output.
-- [toml_edit](https://docs.rs/toml_edit/) reads and updates theme settings while
+- [toml_edit](https://docs.rs/toml_edit/) reads and updates configuration while
   retaining the user's formatting and comments.
 
 The small relative-coordinate backend in `src/backend.rs` keeps the picker

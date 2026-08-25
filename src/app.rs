@@ -1,4 +1,4 @@
-use crate::Theme;
+use crate::{DisplaySettings, Theme};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -114,6 +114,7 @@ pub struct App {
     sort_mode: SortMode,
     sort_direction: SortDirection,
     theme: Theme,
+    display: DisplaySettings,
 }
 
 impl App {
@@ -145,6 +146,7 @@ impl App {
             sort_mode,
             sort_direction,
             theme: Theme::auto(),
+            display: DisplaySettings::default(),
         };
         app.refresh_preview();
         Ok(app)
@@ -204,6 +206,14 @@ impl App {
 
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    pub fn display_settings(&self) -> &DisplaySettings {
+        &self.display
+    }
+
+    pub fn set_display_settings(&mut self, display: DisplaySettings) {
+        self.display = display;
     }
 
     pub fn move_up(&mut self) {

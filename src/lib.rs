@@ -1,11 +1,13 @@
 mod app;
 pub mod backend;
+mod config;
 mod theme;
 mod ui;
 
 pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode};
+pub use config::{DateFormat, DisplaySettings, TimeFormat, Timezone};
 pub use theme::{
-    Palette, THEME_ENV, Theme, ThemeCatalog, create_custom_theme, save_theme, theme_config_path,
+    Config, Palette, THEME_ENV, Theme, create_custom_theme, save_theme, theme_config_path,
 };
 pub use ui::{TWO_PANE_MIN_WIDTH, render, render_theme_preview};
 
