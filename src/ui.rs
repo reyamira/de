@@ -268,18 +268,20 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
     let hidden = if app.show_hidden() { "on" } else { "off" };
     let sort = app.sort_mode().label();
     let direction = app.sort_direction().symbol();
-    let line = if area.width >= 84 {
+    let line = if area.width >= 94 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint(" select  ", palette),
             key("pgup/dn", palette),
             hint(" jump  ", palette),
             key("→", palette),
-            hint(" open  ", palette),
+            hint(" folder  ", palette),
             key("←", palette),
             hint(" parent  ", palette),
             key("/", palette),
             hint(" find  ", palette),
+            key("o", palette),
+            hint(" open  ", palette),
             key("↵", palette),
             hint(" go  ", palette),
             key("s", palette),
@@ -287,18 +289,20 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             key(".", palette),
             hint(format!(" hidden:{hidden}"), palette),
         ])
-    } else if area.width >= 72 {
+    } else if area.width >= 80 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint(" select  ", palette),
             key("pgup/dn", palette),
             hint(" jump  ", palette),
             key("→", palette),
-            hint(" open  ", palette),
+            hint(" folder  ", palette),
             key("←", palette),
             hint(" parent  ", palette),
             key("/", palette),
             hint(" find  ", palette),
+            key("o", palette),
+            hint(" open  ", palette),
             key("↵", palette),
             hint(" go  ", palette),
             key("s", palette),
@@ -311,37 +315,45 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             key("pg↑↓", palette),
             hint("  ", palette),
             key("→", palette),
-            hint("open  ", palette),
+            hint("dir  ", palette),
             key("←", palette),
             hint("back  ", palette),
             key("/", palette),
             hint("find  ", palette),
-            key("s", palette),
-            hint(format!(":{sort}{direction}"), palette),
-        ])
-    } else if area.width >= 34 {
-        Line::from(vec![
-            key(" ↑↓", palette),
-            hint("  ", palette),
-            key("pg↑↓", palette),
-            hint("  ", palette),
-            key("/", palette),
-            hint("find  ", palette),
+            key("o", palette),
+            hint("open  ", palette),
             key("s", palette),
             hint(format!(":{sort}{direction}  "), palette),
+            key("↵", palette),
+            hint("go", palette),
+        ])
+    } else if area.width >= 32 {
+        Line::from(vec![
+            key(" ↑↓", palette),
+            hint(" ", palette),
+            key("pg↑↓", palette),
+            hint(" ", palette),
+            key("/", palette),
+            hint("find ", palette),
+            key("o", palette),
+            hint("open ", palette),
+            key("s", palette),
+            hint(format!(":{sort}{direction} "), palette),
             key("↵", palette),
             hint("go", palette),
         ])
     } else {
         Line::from(vec![
             key(" ↑↓", palette),
-            hint("  ", palette),
-            key("→", palette),
-            hint("open  ", palette),
-            key("←", palette),
-            hint("back  ", palette),
+            hint(" ", palette),
+            key("o", palette),
+            hint("open ", palette),
             key("↵", palette),
-            hint("go", palette),
+            hint("go ", palette),
+            key("→", palette),
+            hint("dir ", palette),
+            key("←", palette),
+            hint("back", palette),
         ])
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -638,7 +650,7 @@ mod tests {
         fs::write(temp.path().join("project/main.rs"), "fn main() {}").unwrap();
         fs::write(temp.path().join("README.md"), "hello").unwrap();
         let app = App::new(temp.path().to_path_buf()).unwrap();
-        let backend = TestBackend::new(88, 8);
+        let backend = TestBackend::new(100, 8);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -651,6 +663,7 @@ mod tests {
         assert!(rendered.contains('│'));
         assert!(rendered.contains("hidden:off"));
         assert!(rendered.contains("sort:name↑"));
+        assert!(rendered.contains("o open"));
     }
 
     #[test]

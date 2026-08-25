@@ -12,8 +12,9 @@ columns, `de` collapses to a single pane instead of squeezing the listings.
 Each pane shows local modification times when it is wide enough to keep the
 entry names readable.
 
-It is intentionally not a file manager. Files are dimmed context; there are no
-delete, rename, copy, edit, or open commands.
+It is intentionally not a full file manager. Files stay visually secondary to
+directories, but `o` can hand the highlighted file to its default application.
+There are no delete, rename, copy, or built-in edit commands.
 
 ## Install
 
@@ -89,6 +90,7 @@ asks the parent shell to `cd` there.
 | `/` | Filter entries in the current directory |
 | `s` | Toggle sorting by name or modification time |
 | `Shift+S` | Toggle ascending or descending order |
+| `o` | Open the highlighted file with its default application |
 | `Enter` | Change to the directory currently displayed |
 | `.` | Toggle hidden entries |
 | `r` | Refresh |
@@ -97,6 +99,11 @@ asks the parent shell to `cd` there.
 The important distinction is that `Enter` accepts the directory in the header,
 not the highlighted child. Use `Right` to explore and `Enter` when you have
 arrived.
+
+Press `o` on a file to open it with the operating system's default application.
+On Linux, `de` uses `xdg-open`; on macOS, it uses `open`. Opening a file exits
+the picker without changing the shell's working directory. Directories continue
+to use the navigation controls above.
 
 Filtering uses a case-insensitive substring match. Type after pressing `/`, use
 the normal arrow and page keys to move through matches, and press `Backspace` to

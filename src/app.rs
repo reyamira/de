@@ -53,6 +53,7 @@ impl Entry {
 pub enum NavigationResult {
     Continue,
     Accept(PathBuf),
+    Open(PathBuf),
     Cancel,
 }
 
@@ -302,7 +303,7 @@ impl App {
             return;
         };
         if !entry.is_dir {
-            self.status = Some("files are shown for context; de only enters directories".into());
+            self.status = Some("use o to open files; de only enters directories".into());
             return;
         }
 
@@ -335,6 +336,19 @@ impl App {
 
     pub fn accept(&self) -> NavigationResult {
         NavigationResult::Accept(self.current_dir.clone())
+    }
+
+    pub fn open_selected(&mut self) -> NavigationResult {
+        let Some(entry) = self.selected_entry() else {
+            self.status = Some("nothing selected to open".into());
+            return NavigationResult::Continue;
+        };
+        if entry.is_dir {
+            self.status = Some("select a file to open; use right to enter directories".into());
+            return NavigationResult::Continue;
+        }
+
+        NavigationResult::Open(entry.path.clone())
     }
 
     fn navigate_to(&mut self, target: PathBuf, select_name: Option<&OsStr>) {
@@ -417,7 +431,7 @@ impl App {
             self.preview = Preview {
                 label,
                 entries: Vec::new(),
-                message: Some("file · shown for context only".into()),
+                message: Some("file · press o to open".into()),
             };
             return;
         }
@@ -608,6 +622,27 @@ mod tests {
     }
 
     #[test]
+    fn open_returns_the_highlighted_file_without_changing_directory() {
+        let (temp, mut app) = fixture();
+        app.move_last();
+
+        assert_eq!(
+            app.open_selected(),
+            NavigationResult::Open(temp.path().join("notes.txt"))
+        );
+        assert_eq!(app.current_dir(), temp.path());
+    }
+
+    #[test]
+    fn open_rejects_a_highlighted_directory_without_navigating() {
+        let (temp, mut app) = fixture();
+
+        assert_eq!(app.open_selected(), NavigationResult::Continue);
+        assert_eq!(app.current_dir(), temp.path());
+        assert!(app.status().unwrap().contains("select a file"));
+    }
+
+    #[test]
     fn preview_follows_the_highlight_without_navigating() {
         let (temp, mut app) = fixture();
         assert_eq!(app.current_dir(), temp.path());
@@ -622,10 +657,7 @@ mod tests {
 
         app.move_last();
         assert_eq!(app.preview().label(), "notes.txt");
-        assert_eq!(
-            app.preview().message(),
-            Some("file · shown for context only")
-        );
+        assert_eq!(app.preview().message(), Some("file · press o to open"));
     }
 
     #[test]

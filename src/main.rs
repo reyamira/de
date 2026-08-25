@@ -15,13 +15,14 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
   → or l/Tab         Open folder     ← or h/Backspace  Go to parent
   /                  Filter          s                  Name / modified
   Shift+S            Ascending / descending
+  o                  Open file with its default application
   . / r              Hidden / refresh
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
@@ -178,8 +179,16 @@ fn run(cli: Cli) -> Result<(), String> {
                 App::new(start).map_err(|error| format!("cannot open start directory: {error}"))?;
             app.set_theme(resolve_theme(theme, &catalog)?);
             app.set_display_settings(catalog.display().clone());
-            if let Some(path) = run_picker(app).map_err(|error| error.to_string())? {
-                write_selected_path(&path).map_err(|error| error.to_string())?;
+            if let Some(action) = run_picker(app).map_err(|error| error.to_string())? {
+                match action {
+                    PickerAction::ChangeDirectory(path) => {
+                        write_selected_path(&path).map_err(|error| error.to_string())?;
+                    }
+                    PickerAction::OpenFile(path) => {
+                        open_with_default_app(&path)
+                            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+                    }
+                }
             }
         }
     }
@@ -220,11 +229,19 @@ enum InlineResult<T> {
     Cancel,
 }
 
-fn run_picker(app: App) -> io::Result<Option<std::path::PathBuf>> {
+enum PickerAction {
+    ChangeDirectory(std::path::PathBuf),
+    OpenFile(std::path::PathBuf),
+}
+
+fn run_picker(app: App) -> io::Result<Option<PickerAction>> {
     run_inline(app, render, |app, key, page_rows| {
         match handle_key(app, key, page_rows) {
             NavigationResult::Continue => InlineResult::Continue,
-            NavigationResult::Accept(path) => InlineResult::Accept(path),
+            NavigationResult::Accept(path) => {
+                InlineResult::Accept(PickerAction::ChangeDirectory(path))
+            }
+            NavigationResult::Open(path) => InlineResult::Accept(PickerAction::OpenFile(path)),
             NavigationResult::Cancel => InlineResult::Cancel,
         }
     })
@@ -390,11 +407,51 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
         KeyCode::Char('S') => app.toggle_sort_direction(),
         KeyCode::Char('.') => app.toggle_hidden(),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('o') => return app.open_selected(),
         KeyCode::Enter => return app.accept(),
         KeyCode::Esc | KeyCode::Char('q') => return NavigationResult::Cancel,
         _ => {}
     }
     NavigationResult::Continue
+}
+
+fn open_with_default_app(path: &Path) -> io::Result<()> {
+    let mut command = default_open_command(path)?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn default_open_command(path: &Path) -> io::Result<Command> {
+    let mut command = Command::new("open");
+    command.arg(path);
+    Ok(command)
+}
+
+#[cfg(target_os = "windows")]
+fn default_open_command(path: &Path) -> io::Result<Command> {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "start", ""]).arg(path);
+    Ok(command)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn default_open_command(path: &Path) -> io::Result<Command> {
+    let mut command = Command::new("xdg-open");
+    command.arg(path);
+    Ok(command)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn default_open_command(_path: &Path) -> io::Result<Command> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "opening files is not supported on this platform",
+    ))
 }
 
 struct RawModeGuard {
@@ -511,6 +568,7 @@ mod tests {
             .to_string();
         assert!(help.contains("Picker controls:"));
         assert!(help.contains("PageUp/PageDown"));
+        assert!(help.contains("Open file with its default application"));
         assert!(help.contains("de theme"));
         assert!(help.contains("de init --help"));
         assert!(!help.contains("eval \"$(command de init bash)\""));
@@ -578,6 +636,52 @@ mod tests {
         );
         assert_eq!(app.sort_mode().label(), "time");
         assert_eq!(app.sort_direction().symbol(), "↓");
+    }
+
+    #[test]
+    fn lowercase_o_opens_the_highlighted_file_and_enter_still_accepts_the_directory() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("source")).unwrap();
+        fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.move_last();
+
+        let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut app, open, 5),
+            NavigationResult::Open(temp.path().join("notes.txt"))
+        );
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut app, enter, 5),
+            NavigationResult::Accept(temp.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn o_remains_filter_text_while_filtering() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_filter();
+
+        let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(handle_key(&mut app, open, 5), NavigationResult::Continue);
+        assert_eq!(app.filter_query(), "o");
+    }
+
+    #[test]
+    fn default_opener_receives_the_file_path_as_one_argument() {
+        let path = Path::new("a file with spaces.txt");
+        let command = default_open_command(path).unwrap();
+        let args = command.get_args().collect::<Vec<_>>();
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(args, ["/C", "start", "", "a file with spaces.txt"]);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(args, ["a file with spaces.txt"]);
     }
 
     #[test]
