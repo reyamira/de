@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Verify tag matches package version
+        run: |
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "v${package_version}" = "${GITHUB_REF_NAME}"
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package archive and checksum
+        run: |
+          archive="de-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "${archive}"
+          cp "target/${{ matrix.target }}/release/de" "${archive}/de"
+          cp README.md LICENSE "${archive}/"
+          tar -czf "${archive}.tar.gz" "${archive}"
+          shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: de-${{ matrix.target }}
+          path: |
+            de-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            de-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --generate-notes \
+            --title "de ${GITHUB_REF_NAME}"

@@ -13,13 +13,24 @@ entry names readable.
 It is intentionally not a file manager. Files are dimmed context; there are no
 delete, rename, copy, edit, or open commands.
 
-## Try it
+## Install
+
+Install the latest source directly with Cargo:
 
 ```sh
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+cargo install --git https://github.com/reyamira/de --locked
+```
+
+Prebuilt archives for Linux and macOS on x86-64 and ARM64 are available from
+[GitHub Releases](https://github.com/reyamira/de/releases). Each archive includes
+`de`, this README, and the MIT license; SHA-256 checksums are published alongside
+the archives. Extract the archive, then place `de` somewhere on your `PATH`.
+
+Set up the shell function that allows `de` to change its parent shell's working
+directory:
+
+```sh
 eval "$(command de init bash)" # use zsh here if appropriate
-de
 ```
 
 For fish:
@@ -28,8 +39,18 @@ For fish:
 command de init fish | source
 ```
 
-Add the relevant initialization line to your shell profile once you decide to
-keep it. The generated function captures the directory printed by the executable
+Add the relevant initialization line to your shell profile to enable `de` in
+future sessions.
+
+## Build from source
+
+```sh
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
+de
+```
+
+The generated shell function captures the directory printed by the executable
 and asks the parent shell to `cd` there; a child process cannot change its parent
 shell's directory directly.
 
