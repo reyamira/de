@@ -24,7 +24,7 @@ installed command is `de`):
 cargo install de-cli --locked
 ```
 
-`--locked` tells Cargo to use the exact dependency versions in the published
+> `--locked` tells Cargo to use the exact dependency versions in the published
 `Cargo.lock`—the same versions tested for this release—instead of resolving
 newer compatible versions. It is optional, but makes the install reproducible.
 
@@ -32,6 +32,14 @@ Prebuilt archives for Linux and macOS on x86-64 and ARM64 are available from
 [GitHub Releases](https://github.com/reyamira/de/releases). Each archive includes
 `de`, this README, and the MIT license; SHA-256 checksums are published alongside
 the archives. Extract the archive, then place `de` somewhere on your `PATH`.
+
+### Or Build from source
+
+```sh
+cargo build --release
+export PATH="$PWD/target/release:$PATH"
+de
+```
 
 ### Shell integration
 
@@ -70,13 +78,35 @@ command de init fish | source
 defined. The wrapper captures the directory printed by the executable and then
 asks the parent shell to `cd` there.
 
-## Build from source
+## Controls
 
-```sh
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
-de
-```
+| Key | Action |
+| --- | --- |
+| `Up` / `Down`, `j` / `k` | Select an entry |
+| `PageUp` / `PageDown` | Jump one visible page through the entries |
+| `Right`, `l`, `Tab` | Make the previewed directory current |
+| `Left`, `h`, `Backspace` | Go to the parent directory |
+| `/` | Filter entries in the current directory |
+| `s` | Toggle sorting by name or modification time |
+| `Shift+S` | Toggle ascending or descending order |
+| `Enter` | Change to the directory currently displayed |
+| `.` | Toggle hidden entries |
+| `r` | Refresh |
+| `Escape`, `q`, `Ctrl-C` | Cancel without changing directory |
+
+The important distinction is that `Enter` accepts the directory in the header,
+not the highlighted child. Use `Right` to explore and `Enter` when you have
+arrived.
+
+Filtering uses a case-insensitive substring match. Type after pressing `/`, use
+the normal arrow and page keys to move through matches, and press `Backspace` to
+edit the query. `Escape` clears an active filter first; press it again to cancel
+`de`.
+
+Name sorting is case-insensitive and alphabetical. Sort criterion and direction
+are independent, so modification time can show either oldest or newest first.
+Directories remain grouped above files in every mode, and the selected sort
+carries into the preview pane and navigated directories.
 
 ## Themes
 
@@ -174,36 +204,6 @@ Custom formats replace both the date and time presets; relative timestamps do
 not use the clock or timezone settings. Column width follows the rendered values
 automatically. When the terminal is too narrow to retain a readable filename
 column, timestamps collapse away with the rest of the responsive layout.
-
-## Controls
-
-| Key | Action |
-| --- | --- |
-| `Up` / `Down`, `j` / `k` | Select an entry |
-| `PageUp` / `PageDown` | Jump one visible page through the entries |
-| `Right`, `l`, `Tab` | Make the previewed directory current |
-| `Left`, `h`, `Backspace` | Go to the parent directory |
-| `/` | Filter entries in the current directory |
-| `s` | Toggle sorting by name or modification time |
-| `Shift+S` | Toggle ascending or descending order |
-| `Enter` | Change to the directory currently displayed |
-| `.` | Toggle hidden entries |
-| `r` | Refresh |
-| `Escape`, `q`, `Ctrl-C` | Cancel without changing directory |
-
-The important distinction is that `Enter` accepts the directory in the header,
-not the highlighted child. Use `Right` to explore and `Enter` when you have
-arrived.
-
-Filtering uses a case-insensitive substring match. Type after pressing `/`, use
-the normal arrow and page keys to move through matches, and press `Backspace` to
-edit the query. `Escape` clears an active filter first; press it again to cancel
-`de`.
-
-Name sorting is case-insensitive and alphabetical. Sort criterion and direction
-are independent, so modification time can show either oldest or newest first.
-Directories remain grouped above files in every mode, and the selected sort
-carries into the preview pane and navigated directories.
 
 ## Built with
 
