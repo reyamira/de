@@ -33,6 +33,61 @@ keep it. The generated function captures the directory printed by the executable
 and asks the parent shell to `cd` there; a child process cannot change its parent
 shell's directory directly.
 
+## Themes
+
+Run the interactive selector to preview the real picker with every built-in and
+custom theme, then save the one you choose:
+
+```sh
+de theme
+```
+
+Use `Left`/`Right` or `Up`/`Down` to preview `auto`, `light`, `dark`, `mono`,
+`ocean`, `forest`, `amber`, and `rose`. `Enter` saves the displayed theme;
+`Escape` cancels without changing the saved choice. On Linux, settings live in
+`$XDG_CONFIG_HOME/de/config.toml`, or `~/.config/de/config.toml` when
+`XDG_CONFIG_HOME` is unset.
+
+For a one-time override, use `de --theme dark`. `DE_THEME=mono de` provides an
+environment-level override. Precedence is command-line flag, environment,
+saved choice, then `auto`.
+
+The `auto` theme uses the terminal's default foreground and background, its
+ANSI palette, and reverse video for selection. That adapts without trying to
+guess the background color or waiting for a terminal query.
+
+Create an editable custom theme with:
+
+```sh
+de theme create midnight
+```
+
+That adds a complete starting palette to `config.toml` without replacing other
+settings or comments:
+
+```toml
+theme = "midnight"
+
+[themes.midnight]
+extends = "dark"
+accent = "#7dd3fc"
+text = "default"
+muted = "#94a3b8"
+title = "#c4b5fd"
+error = "#fb7185"
+symlink = "#f0abfc"
+selection_fg = "#0f172a"
+selection_bg = "#67e8f9"
+reverse_selection = false
+dim_muted = false
+```
+
+Every field after `extends` is optional. A custom theme can extend any built-in
+theme and override only what it needs. Colors accept `#RRGGBB`, `default`, or
+ANSI names such as `blue`, `light-cyan`, and `dark-gray`. After editing, run
+`de theme` to preview it alongside the built-ins. Custom names also work with
+`--theme` and `DE_THEME`.
+
 ## Controls
 
 | Key | Action |
@@ -70,6 +125,8 @@ carries into the preview pane and navigated directories.
   raw mode, cursor movement, and colors.
 - [Clap](https://docs.rs/clap/) parses arguments and generates the styled help,
   version, subcommand, and error output.
+- [toml_edit](https://docs.rs/toml_edit/) reads and updates theme settings while
+  retaining the user's formatting and comments.
 
 The small relative-coordinate backend in `src/backend.rs` keeps the picker
 inline without requiring the terminal to answer an absolute cursor-position

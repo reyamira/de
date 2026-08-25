@@ -1,3 +1,4 @@
+use crate::Theme;
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -112,6 +113,7 @@ pub struct App {
     filter: String,
     sort_mode: SortMode,
     sort_direction: SortDirection,
+    theme: Theme,
 }
 
 impl App {
@@ -142,6 +144,7 @@ impl App {
             filter: String::new(),
             sort_mode,
             sort_direction,
+            theme: Theme::auto(),
         };
         app.refresh_preview();
         Ok(app)
@@ -193,6 +196,14 @@ impl App {
 
     pub fn sort_direction(&self) -> SortDirection {
         self.sort_direction
+    }
+
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
     }
 
     pub fn move_up(&mut self) {

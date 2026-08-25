@@ -5,9 +5,13 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use de::backend::InlineBackend;
-use de::{App, NavigationResult, TWO_PANE_MIN_WIDTH, render, resolve_start_path, shell_init};
+use de::{
+    App, NavigationResult, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, ThemeCatalog, create_custom_theme,
+    render, render_theme_preview, resolve_start_path, save_theme, shell_init,
+};
 use ratatui::Terminal;
 use ratatui::layout::Rect;
+use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -21,6 +25,7 @@ const PICKER_HELP: &str = "Picker controls:
   . / r              Hidden / refresh
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
+Run `de theme` to preview and save a color theme.
 Run `de init --help` for shell setup.";
 
 const SHELL_SETUP_HELP: &str = "Setup examples:
@@ -53,6 +58,10 @@ const CLI_STYLES: Styles = Styles::styled()
     subcommand_precedence_over_arg = true
 )]
 struct Cli {
+    /// Use a built-in or custom color theme for this invocation
+    #[arg(long, value_name = "THEME")]
+    theme: Option<String>,
+
     /// Directory to start exploring from
     #[arg(value_name = "DIRECTORY")]
     directory: Option<OsString>,
@@ -72,6 +81,21 @@ enum CliCommand {
         /// Shell whose integration should be generated
         #[arg(value_enum)]
         shell: Shell,
+    },
+
+    /// Preview, save, or create themes
+    Theme {
+        #[command(subcommand)]
+        command: Option<ThemeCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ThemeCommand {
+    /// Add an editable custom theme template to config.toml
+    Create {
+        /// Name for the custom theme
+        name: String,
     },
 }
 
@@ -106,19 +130,52 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
-    match cli.command {
+    let Cli {
+        theme,
+        directory,
+        command,
+    } = cli;
+    match command {
         Some(CliCommand::Init { shell }) => {
             let script = shell_init(shell.name()).expect("Clap limits shells to supported values");
             println!("{script}");
         }
-        None => {
-            if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-                return Err("interactive mode needs a terminal on stdin and stderr".into());
+        Some(CliCommand::Theme {
+            command: Some(ThemeCommand::Create { name }),
+        }) => {
+            let path = create_custom_theme(&name)
+                .map_err(|error| format!("cannot create theme {name:?}: {error}"))?;
+            eprintln!(
+                "Created theme {name} in {}. Edit its colors, then run `de theme` to preview it.",
+                path.display()
+            );
+        }
+        Some(CliCommand::Theme { command: None }) => {
+            require_terminal()?;
+            let catalog = ThemeCatalog::load()
+                .map_err(|error| format!("cannot load theme config: {error}"))?;
+            let start = resolve_start_path(None)
+                .map_err(|error| format!("cannot resolve current directory: {error}"))?;
+            let mut app = App::new(start)
+                .map_err(|error| format!("cannot open current directory: {error}"))?;
+            app.set_theme(resolve_theme(theme, &catalog)?);
+            if let Some(theme) =
+                run_theme_picker(app, &catalog).map_err(|error| error.to_string())?
+            {
+                let path = save_theme(theme.name())
+                    .map_err(|error| format!("cannot save theme: {error}"))?;
+                eprintln!("Saved theme {} to {}", theme.name(), path.display());
             }
-            let start = resolve_start_path(cli.directory.as_deref())
+        }
+        None => {
+            require_terminal()?;
+            let catalog = ThemeCatalog::load()
+                .map_err(|error| format!("cannot load theme config: {error}"))?;
+            let start = resolve_start_path(directory.as_deref())
                 .map_err(|error| format!("cannot resolve start directory: {error}"))?;
-            let app =
+            let mut app =
                 App::new(start).map_err(|error| format!("cannot open start directory: {error}"))?;
+            app.set_theme(resolve_theme(theme, &catalog)?);
             if let Some(path) = run_picker(app).map_err(|error| error.to_string())? {
                 write_selected_path(&path).map_err(|error| error.to_string())?;
             }
@@ -127,7 +184,61 @@ fn run(cli: Cli) -> Result<(), String> {
     Ok(())
 }
 
-fn run_picker(mut app: App) -> io::Result<Option<std::path::PathBuf>> {
+fn require_terminal() -> Result<(), String> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err("interactive mode needs a terminal on stdin and stderr".into());
+    }
+    Ok(())
+}
+
+fn resolve_theme(override_theme: Option<String>, catalog: &ThemeCatalog) -> Result<Theme, String> {
+    let requested = if let Some(theme) = override_theme {
+        theme
+    } else {
+        match env::var(THEME_ENV) {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => catalog.saved_theme().unwrap_or("auto").to_owned(),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(format!("{THEME_ENV} must be valid UTF-8"));
+            }
+        }
+    };
+
+    catalog.find(&requested).cloned().ok_or_else(|| {
+        format!(
+            "unknown theme {requested:?}; available themes: {}",
+            catalog.names().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+enum InlineResult<T> {
+    Continue,
+    Accept(T),
+    Cancel,
+}
+
+fn run_picker(app: App) -> io::Result<Option<std::path::PathBuf>> {
+    run_inline(app, render, |app, key, page_rows| {
+        match handle_key(app, key, page_rows) {
+            NavigationResult::Continue => InlineResult::Continue,
+            NavigationResult::Accept(path) => InlineResult::Accept(path),
+            NavigationResult::Cancel => InlineResult::Cancel,
+        }
+    })
+}
+
+fn run_theme_picker(app: App, catalog: &ThemeCatalog) -> io::Result<Option<Theme>> {
+    run_inline(app, render_theme_preview, |app, key, _| {
+        handle_theme_key(app, key, catalog)
+    })
+}
+
+fn run_inline<T>(
+    mut app: App,
+    mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App),
+    mut handle: impl FnMut(&mut App, KeyEvent, usize) -> InlineResult<T>,
+) -> io::Result<Option<T>> {
     enable_raw_mode()?;
     let mut raw_mode = RawModeGuard {
         viewport_active: false,
@@ -140,16 +251,16 @@ fn run_picker(mut app: App) -> io::Result<Option<std::path::PathBuf>> {
     raw_mode.viewport_active = true;
     let mut terminal = Terminal::new(backend)?;
 
-    let outcome: io::Result<Option<std::path::PathBuf>> = (|| {
+    let outcome: io::Result<Option<T>> = (|| {
         loop {
-            terminal.draw(|frame| render(frame, &app))?;
+            terminal.draw(|frame| draw(frame, &app))?;
             match event::read()? {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
                     let page_rows = visible_entry_rows(&app, terminal_width, viewport_height);
-                    match handle_key(&mut app, key, page_rows) {
-                        NavigationResult::Continue => {
+                    match handle(&mut app, key, page_rows) {
+                        InlineResult::Continue => {
                             let desired =
                                 desired_viewport_height(&app, terminal_width, terminal_height);
                             if desired != viewport_height {
@@ -160,8 +271,8 @@ fn run_picker(mut app: App) -> io::Result<Option<std::path::PathBuf>> {
                                 viewport_height = desired;
                             }
                         }
-                        NavigationResult::Accept(path) => break Ok(Some(path)),
-                        NavigationResult::Cancel => break Ok(None),
+                        InlineResult::Accept(value) => break Ok(Some(value)),
+                        InlineResult::Cancel => break Ok(None),
                     }
                 }
                 Event::Resize(width, height) => {
@@ -183,6 +294,25 @@ fn run_picker(mut app: App) -> io::Result<Option<std::path::PathBuf>> {
     drop(terminal);
     cleanup?;
     outcome
+}
+
+fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &ThemeCatalog) -> InlineResult<Theme> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return InlineResult::Cancel;
+    }
+
+    match key.code {
+        KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+            app.set_theme(catalog.previous(app.theme().name()));
+        }
+        KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('l') | KeyCode::Char('j') => {
+            app.set_theme(catalog.next(app.theme().name()))
+        }
+        KeyCode::Enter => return InlineResult::Accept(app.theme().clone()),
+        KeyCode::Esc | KeyCode::Char('q') => return InlineResult::Cancel,
+        _ => {}
+    }
+    InlineResult::Continue
 }
 
 fn desired_viewport_height(app: &App, terminal_width: u16, terminal_height: u16) -> u16 {
@@ -312,7 +442,29 @@ mod tests {
     fn parses_a_start_directory() {
         let cli = Cli::try_parse_from(["de", "../somewhere"]).unwrap();
         assert_eq!(cli.directory, Some(OsString::from("../somewhere")));
+        assert_eq!(cli.theme, None);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_a_one_time_theme_and_the_theme_selector() {
+        let cli = Cli::try_parse_from(["de", "--theme", "dark", "../somewhere"]).unwrap();
+        assert_eq!(cli.theme.as_deref(), Some("dark"));
+        assert!(cli.command.is_none());
+
+        let cli = Cli::try_parse_from(["de", "theme"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Theme { command: None })
+        ));
+
+        let cli = Cli::try_parse_from(["de", "theme", "create", "midnight"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Theme {
+                command: Some(ThemeCommand::Create { name })
+            }) if name == "midnight"
+        ));
     }
 
     #[test]
@@ -343,6 +495,8 @@ mod tests {
         let help = Cli::try_parse_from(["de", "-h"]).unwrap_err().to_string();
         assert!(help.contains("Usage:"));
         assert!(help.contains("Commands:"));
+        assert!(help.contains("theme"));
+        assert!(help.contains("--theme <THEME>"));
         assert!(help.contains("DIRECTORY"));
         assert!(!help.contains("Picker controls:"));
         assert!(!help.contains("Setup examples:"));
@@ -355,6 +509,7 @@ mod tests {
             .to_string();
         assert!(help.contains("Picker controls:"));
         assert!(help.contains("PageUp/PageDown"));
+        assert!(help.contains("de theme"));
         assert!(help.contains("de init --help"));
         assert!(!help.contains("eval \"$(command de init bash)\""));
     }
@@ -421,5 +576,34 @@ mod tests {
         );
         assert_eq!(app.sort_mode().label(), "time");
         assert_eq!(app.sort_direction().symbol(), "↓");
+    }
+
+    #[test]
+    fn theme_picker_cycles_both_ways_and_accepts_the_previewed_theme() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("source")).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let catalog = ThemeCatalog::built_ins();
+        assert_eq!(app.theme().name(), "auto");
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_theme_key(&mut app, right, &catalog),
+            InlineResult::Continue
+        ));
+        assert_eq!(app.theme().name(), "light");
+
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_theme_key(&mut app, left, &catalog),
+            InlineResult::Continue
+        ));
+        assert_eq!(app.theme().name(), "auto");
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        match handle_theme_key(&mut app, enter, &catalog) {
+            InlineResult::Accept(theme) => assert_eq!(theme.name(), "auto"),
+            _ => panic!("Enter should accept the previewed theme"),
+        }
     }
 }

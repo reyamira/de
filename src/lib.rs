@@ -1,9 +1,13 @@
 mod app;
 pub mod backend;
+mod theme;
 mod ui;
 
 pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode};
-pub use ui::{TWO_PANE_MIN_WIDTH, render};
+pub use theme::{
+    Palette, THEME_ENV, Theme, ThemeCatalog, create_custom_theme, save_theme, theme_config_path,
+};
+pub use ui::{TWO_PANE_MIN_WIDTH, render, render_theme_preview};
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -51,7 +55,7 @@ pub fn shell_init(shell: &str) -> Option<&'static str> {
         "bash" | "zsh" => Some(
             r#"de() {
     case "${1-}" in
-        -h|--help|-V|--version|init)
+        -h|--help|-V|--version|init|theme)
             command de "$@"
             return
             ;;
@@ -66,7 +70,7 @@ pub fn shell_init(shell: &str) -> Option<&'static str> {
             r#"function de
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help -V --version init
+            case -h --help -V --version init theme
                 command de $argv
                 return
         end
@@ -90,7 +94,7 @@ mod tests {
         let init = shell_init("bash").unwrap();
         assert!(init.contains("command de"));
         assert!(init.contains("builtin cd --"));
-        assert!(init.contains("-h|--help|-V|--version|init"));
+        assert!(init.contains("-h|--help|-V|--version|init|theme"));
     }
 
     #[test]

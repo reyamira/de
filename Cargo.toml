@@ -12,6 +12,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29.0"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+toml_edit = "0.23"
 unicode-width = "0.2.2"
 
 [dev-dependencies]

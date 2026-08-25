@@ -1,8 +1,8 @@
-use crate::{App, Entry};
+use crate::{App, Entry, Palette};
 use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -12,12 +12,17 @@ pub const TWO_PANE_MIN_WIDTH: u16 = 58;
 const MODIFIED_COLUMN_WIDTH: usize = 16;
 const MODIFIED_COLUMN_GAP: usize = 2;
 const MIN_NAME_COLUMN_WIDTH: usize = 12;
-const ACCENT: Color = Color::LightCyan;
-const TEXT: Color = Color::White;
-const MUTED: Color = Color::Gray;
-
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    render_picker(frame, app, false);
+}
+
+pub fn render_theme_preview(frame: &mut Frame<'_>, app: &App) {
+    render_picker(frame, app, true);
+}
+
+fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
     let area = frame.area();
+    let palette = app.theme().palette();
     frame.render_widget(Clear, area);
 
     if area.height == 0 || area.width == 0 {
@@ -29,7 +34,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                 &app.current_dir().to_string_lossy(),
                 area.width as usize,
             ))
-            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            .style(
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
             area,
         );
         return;
@@ -42,35 +51,46 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     ])
     .areas(area);
 
-    render_header(frame, app, header);
+    render_header(frame, app, header, &palette, theme_preview);
     if area.width >= TWO_PANE_MIN_WIDTH {
-        render_two_panes(frame, app, body);
+        render_two_panes(frame, app, body, &palette);
     } else {
-        render_current_entries(frame, app, body, false);
+        render_current_entries(frame, app, body, false, &palette);
     }
-    render_footer(frame, app, footer);
+    if theme_preview {
+        render_theme_footer(frame, app, footer, &palette);
+    } else {
+        render_footer(frame, app, footer, &palette);
+    }
 }
 
-fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let path_width = area.width.saturating_sub(5) as usize;
+fn render_header(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: &Palette,
+    theme_preview: bool,
+) {
+    let badge = if theme_preview { " de theme " } else { " de " };
+    let badge_width = UnicodeWidthStr::width(badge);
+    let path_width = (area.width as usize).saturating_sub(badge_width + 1);
     let path = shorten_left(&app.current_dir().to_string_lossy(), path_width);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
+            Span::styled(badge, emphasis_style(palette)),
+            Span::raw(" "),
             Span::styled(
-                " de ",
+                path,
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
+                    .fg(palette.text)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" "),
-            Span::styled(path, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
         ])),
         area,
     );
 }
 
-fn render_two_panes(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_two_panes(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
     let [left, divider, right] = Layout::horizontal([
         Constraint::Percentage(44),
         Constraint::Length(1),
@@ -78,15 +98,21 @@ fn render_two_panes(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ])
     .areas(area);
 
-    render_current_entries(frame, app, left, true);
+    render_current_entries(frame, app, left, true, palette);
     let divider_lines = (0..divider.height)
-        .map(|_| Line::styled("│", Style::default().fg(MUTED)))
+        .map(|_| Line::styled("│", muted_style(palette)))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(divider_lines), divider);
-    render_preview(frame, app, right);
+    render_preview(frame, app, right, palette);
 }
 
-fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: bool) {
+fn render_current_entries(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    titled: bool,
+    palette: &Palette,
+) {
     if area.height == 0 {
         return;
     }
@@ -102,7 +128,7 @@ fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: 
         frame.render_widget(
             Paragraph::new(pane_heading(" current", title.width as usize)).style(
                 Style::default()
-                    .fg(Color::LightBlue)
+                    .fg(palette.title)
                     .add_modifier(Modifier::BOLD),
             ),
             title,
@@ -113,7 +139,7 @@ fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: 
     if let Some(status) = app.status() {
         lines.push(Line::styled(
             shorten_right(status, list.width as usize),
-            Style::default().fg(Color::LightRed),
+            Style::default().fg(palette.error),
         ));
     }
 
@@ -121,7 +147,7 @@ fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: 
     let offset = app.selected().saturating_add(1).saturating_sub(entry_rows);
 
     if app.entries().is_empty() && lines.len() < list.height as usize {
-        lines.push(Line::styled("  (empty)", Style::default().fg(MUTED)));
+        lines.push(Line::styled("  (empty)", muted_style(palette)));
     }
 
     for (index, entry) in app
@@ -135,19 +161,16 @@ fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: 
         let prefix = if selected { "› " } else { "  " };
         let text = entry_row(prefix, entry, list.width as usize);
         let style = if selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD)
+            emphasis_style(palette)
         } else {
-            entry_style(entry)
+            entry_style(entry, palette)
         };
         lines.push(Line::styled(text, style));
     }
     frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
     if area.height == 0 {
         return;
     }
@@ -156,7 +179,7 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(pane_heading(&heading, title.width as usize)).style(
             Style::default()
-                .fg(Color::LightBlue)
+                .fg(palette.title)
                 .add_modifier(Modifier::BOLD),
         ),
         title,
@@ -166,7 +189,7 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if let Some(message) = app.preview().message() {
         lines.push(Line::styled(
             shorten_right(&format!("  {message}"), list.width as usize),
-            Style::default().fg(MUTED),
+            muted_style(palette),
         ));
     }
     for entry in app
@@ -177,24 +200,30 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
     {
         lines.push(Line::styled(
             entry_row("  ", entry, list.width as usize),
-            entry_style(entry),
+            entry_style(entry, palette),
         ));
     }
     frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
     if app.is_filtering() {
         let line = Line::from(vec![
-            key(" / "),
-            hint("filter: "),
-            Span::styled(app.filter_query().to_owned(), Style::default().fg(TEXT)),
-            Span::styled("▏", Style::default().fg(ACCENT)),
-            hint(format!(
-                "  {}/{} matches  esc clear",
-                app.entries().len(),
-                app.total_entry_count()
-            )),
+            key(" / ", palette),
+            hint("filter: ", palette),
+            Span::styled(
+                app.filter_query().to_owned(),
+                Style::default().fg(palette.text),
+            ),
+            Span::styled("▏", Style::default().fg(palette.accent)),
+            hint(
+                format!(
+                    "  {}/{} matches  esc clear",
+                    app.entries().len(),
+                    app.total_entry_count()
+                ),
+                palette,
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -205,101 +234,150 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let direction = app.sort_direction().symbol();
     let line = if area.width >= 84 {
         Line::from(vec![
-            key(" ↑↓"),
-            hint(" select  "),
-            key("pgup/dn"),
-            hint(" jump  "),
-            key("→"),
-            hint(" open  "),
-            key("←"),
-            hint(" parent  "),
-            key("/"),
-            hint(" find  "),
-            key("↵"),
-            hint(" go  "),
-            key("s"),
-            hint(format!(" sort:{sort}{direction}  ")),
-            key("."),
-            hint(format!(" hidden:{hidden}")),
+            key(" ↑↓", palette),
+            hint(" select  ", palette),
+            key("pgup/dn", palette),
+            hint(" jump  ", palette),
+            key("→", palette),
+            hint(" open  ", palette),
+            key("←", palette),
+            hint(" parent  ", palette),
+            key("/", palette),
+            hint(" find  ", palette),
+            key("↵", palette),
+            hint(" go  ", palette),
+            key("s", palette),
+            hint(format!(" sort:{sort}{direction}  "), palette),
+            key(".", palette),
+            hint(format!(" hidden:{hidden}"), palette),
         ])
     } else if area.width >= 72 {
         Line::from(vec![
-            key(" ↑↓"),
-            hint(" select  "),
-            key("pgup/dn"),
-            hint(" jump  "),
-            key("→"),
-            hint(" open  "),
-            key("←"),
-            hint(" parent  "),
-            key("/"),
-            hint(" find  "),
-            key("↵"),
-            hint(" go  "),
-            key("s"),
-            hint(format!(" sort:{sort}{direction}")),
+            key(" ↑↓", palette),
+            hint(" select  ", palette),
+            key("pgup/dn", palette),
+            hint(" jump  ", palette),
+            key("→", palette),
+            hint(" open  ", palette),
+            key("←", palette),
+            hint(" parent  ", palette),
+            key("/", palette),
+            hint(" find  ", palette),
+            key("↵", palette),
+            hint(" go  ", palette),
+            key("s", palette),
+            hint(format!(" sort:{sort}{direction}"), palette),
         ])
     } else if area.width >= 50 {
         Line::from(vec![
-            key(" ↑↓"),
-            hint("  "),
-            key("pg↑↓"),
-            hint("  "),
-            key("→"),
-            hint("open  "),
-            key("←"),
-            hint("back  "),
-            key("/"),
-            hint("find  "),
-            key("s"),
-            hint(format!(":{sort}{direction}")),
+            key(" ↑↓", palette),
+            hint("  ", palette),
+            key("pg↑↓", palette),
+            hint("  ", palette),
+            key("→", palette),
+            hint("open  ", palette),
+            key("←", palette),
+            hint("back  ", palette),
+            key("/", palette),
+            hint("find  ", palette),
+            key("s", palette),
+            hint(format!(":{sort}{direction}"), palette),
         ])
     } else if area.width >= 34 {
         Line::from(vec![
-            key(" ↑↓"),
-            hint("  "),
-            key("pg↑↓"),
-            hint("  "),
-            key("/"),
-            hint("find  "),
-            key("s"),
-            hint(format!(":{sort}{direction}  ")),
-            key("↵"),
-            hint("go"),
+            key(" ↑↓", palette),
+            hint("  ", palette),
+            key("pg↑↓", palette),
+            hint("  ", palette),
+            key("/", palette),
+            hint("find  ", palette),
+            key("s", palette),
+            hint(format!(":{sort}{direction}  "), palette),
+            key("↵", palette),
+            hint("go", palette),
         ])
     } else {
         Line::from(vec![
-            key(" ↑↓"),
-            hint("  "),
-            key("→"),
-            hint("open  "),
-            key("←"),
-            hint("back  "),
-            key("↵"),
-            hint("go"),
+            key(" ↑↓", palette),
+            hint("  ", palette),
+            key("→", palette),
+            hint("open  ", palette),
+            key("←", palette),
+            hint("back  ", palette),
+            key("↵", palette),
+            hint("go", palette),
         ])
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn key(value: impl Into<std::borrow::Cow<'static, str>>) -> Span<'static> {
+fn render_theme_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+    let line = if area.width >= 48 {
+        Line::from(vec![
+            key(" ←→/↑↓", palette),
+            hint(" preview  ", palette),
+            Span::styled(format!(" {} ", app.theme().name()), emphasis_style(palette)),
+            key("  enter", palette),
+            hint(" save  ", palette),
+            key("esc", palette),
+            hint(" cancel", palette),
+        ])
+    } else {
+        Line::from(vec![
+            key(" ←→", palette),
+            hint(" ", palette),
+            Span::styled(app.theme().name().to_owned(), emphasis_style(palette)),
+            key("  ↵", palette),
+            hint("save  ", palette),
+            key("esc", palette),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn emphasis_style(palette: &Palette) -> Style {
+    let style = Style::default()
+        .fg(palette.emphasis_foreground)
+        .bg(palette.emphasis_background)
+        .add_modifier(Modifier::BOLD);
+    if palette.reverse_emphasis {
+        style.add_modifier(Modifier::REVERSED)
+    } else {
+        style
+    }
+}
+
+fn muted_style(palette: &Palette) -> Style {
+    let style = Style::default().fg(palette.muted);
+    if palette.dim_muted {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
+}
+
+fn key(value: impl Into<std::borrow::Cow<'static, str>>, palette: &Palette) -> Span<'static> {
     Span::styled(
         value,
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
     )
 }
 
-fn hint(value: impl Into<std::borrow::Cow<'static, str>>) -> Span<'static> {
-    Span::styled(value, Style::default().fg(MUTED))
+fn hint(value: impl Into<std::borrow::Cow<'static, str>>, palette: &Palette) -> Span<'static> {
+    Span::styled(value, muted_style(palette))
 }
 
-fn entry_style(entry: &Entry) -> Style {
+fn entry_style(entry: &Entry, palette: &Palette) -> Style {
     if entry.is_symlink {
-        Style::default().fg(Color::LightMagenta)
+        Style::default().fg(palette.symlink)
     } else if entry.is_dir {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED)
+        muted_style(palette)
     }
 }
 
@@ -505,5 +583,28 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         assert!(terminal.backend().to_string().contains("sort:time↓"));
+    }
+
+    #[test]
+    fn theme_preview_uses_the_real_picker_and_selector_controls() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("project")).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let themes = crate::ThemeCatalog::built_ins();
+        app.set_theme(themes.find("dark").unwrap().clone());
+        let backend = TestBackend::new(88, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_theme_preview(frame, &app))
+            .unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("de theme"));
+        assert!(rendered.contains("next · project/"));
+        assert!(rendered.contains("dark"));
+        assert!(rendered.contains("preview"));
+        assert!(rendered.contains("enter save"));
+        assert!(rendered.contains("esc cancel"));
     }
 }
