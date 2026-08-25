@@ -7,6 +7,8 @@ directory only when you confirm.
 At normal terminal widths, the left pane is the directory you are currently
 exploring and the right pane previews the highlighted destination. Below 58
 columns, `de` collapses to a single pane instead of squeezing the listings.
+Each pane shows local modification times when it is wide enough to keep the
+entry names readable.
 
 It is intentionally not a file manager. Files are dimmed context; there are no
 delete, rename, copy, edit, or open commands.
@@ -40,6 +42,8 @@ shell's directory directly.
 | `Right`, `l`, `Tab` | Make the previewed directory current |
 | `Left`, `h`, `Backspace` | Go to the parent directory |
 | `/` | Filter entries in the current directory |
+| `s` | Toggle sorting by name or modification time |
+| `Shift+S` | Toggle ascending or descending order |
 | `Enter` | Change to the directory currently displayed |
 | `.` | Toggle hidden entries |
 | `r` | Refresh |
@@ -53,6 +57,11 @@ Filtering uses a case-insensitive substring match. Type after pressing `/`, use
 the normal arrow and page keys to move through matches, and press `Backspace` to
 edit the query. `Escape` clears an active filter first; press it again to cancel
 `de`.
+
+Name sorting is case-insensitive and alphabetical. Sort criterion and direction
+are independent, so modification time can show either oldest or newest first.
+Directories remain grouped above files in every mode, and the selected sort
+carries into the preview pane and navigated directories.
 
 ## Built with
 

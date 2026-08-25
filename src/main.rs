@@ -16,7 +16,9 @@ use std::process::ExitCode;
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
   → or l/Tab         Open folder     ← or h/Backspace  Go to parent
-  /                  Filter          . / r              Hidden / refresh
+  /                  Filter          s                  Name / modified
+  Shift+S            Ascending / descending
+  . / r              Hidden / refresh
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
 Run `de init --help` for shell setup.";
@@ -252,6 +254,8 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
         KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => app.enter_selected(),
         KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => app.go_parent(),
         KeyCode::Char('/') => app.begin_filter(),
+        KeyCode::Char('s') => app.cycle_sort(),
+        KeyCode::Char('S') => app.toggle_sort_direction(),
         KeyCode::Char('.') => app.toggle_hidden(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Enter => return app.accept(),
@@ -393,5 +397,29 @@ mod tests {
         assert!(app.filter_query().is_empty());
         assert_eq!(app.entries().len(), 2);
         assert_eq!(handle_key(&mut app, escape, 5), NavigationResult::Cancel);
+    }
+
+    #[test]
+    fn lowercase_s_changes_criterion_and_uppercase_s_changes_direction() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("source")).unwrap();
+        fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+
+        let lowercase = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut app, lowercase, 5),
+            NavigationResult::Continue
+        );
+        assert_eq!(app.sort_mode().label(), "time");
+        assert_eq!(app.sort_direction().symbol(), "↑");
+
+        let uppercase = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT);
+        assert_eq!(
+            handle_key(&mut app, uppercase, 5),
+            NavigationResult::Continue
+        );
+        assert_eq!(app.sort_mode().label(), "time");
+        assert_eq!(app.sort_direction().symbol(), "↓");
     }
 }

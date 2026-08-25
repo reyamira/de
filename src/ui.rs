@@ -1,4 +1,5 @@
 use crate::{App, Entry};
+use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,6 +9,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const TWO_PANE_MIN_WIDTH: u16 = 58;
 
+const MODIFIED_COLUMN_WIDTH: usize = 16;
+const MODIFIED_COLUMN_GAP: usize = 2;
+const MIN_NAME_COLUMN_WIDTH: usize = 12;
 const ACCENT: Color = Color::LightCyan;
 const TEXT: Color = Color::White;
 const MUTED: Color = Color::Gray;
@@ -96,7 +100,7 @@ fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: 
 
     if let Some(title) = title {
         frame.render_widget(
-            Paragraph::new(" current").style(
+            Paragraph::new(pane_heading(" current", title.width as usize)).style(
                 Style::default()
                     .fg(Color::LightBlue)
                     .add_modifier(Modifier::BOLD),
@@ -129,7 +133,7 @@ fn render_current_entries(frame: &mut Frame<'_>, app: &App, area: Rect, titled: 
     {
         let selected = index == app.selected();
         let prefix = if selected { "› " } else { "  " };
-        let text = fill_row(prefix, &entry.display_name(), list.width as usize);
+        let text = entry_row(prefix, entry, list.width as usize);
         let style = if selected {
             Style::default()
                 .fg(Color::Black)
@@ -148,20 +152,13 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
     let [title, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    let label_width = title.width.saturating_sub(8) as usize;
+    let heading = format!(" next · {}", app.preview().label());
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " next · ",
-                Style::default()
-                    .fg(Color::LightBlue)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                shorten_right(app.preview().label(), label_width),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ])),
+        Paragraph::new(pane_heading(&heading, title.width as usize)).style(
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ),
         title,
     );
 
@@ -179,7 +176,7 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .take((list.height as usize).saturating_sub(lines.len()))
     {
         lines.push(Line::styled(
-            fill_row("  ", &entry.display_name(), list.width as usize),
+            entry_row("  ", entry, list.width as usize),
             entry_style(entry),
         ));
     }
@@ -204,7 +201,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let hidden = if app.show_hidden() { "on" } else { "off" };
-    let line = if area.width >= 72 {
+    let sort = app.sort_mode().label();
+    let direction = app.sort_direction().symbol();
+    let line = if area.width >= 84 {
         Line::from(vec![
             key(" ↑↓"),
             hint(" select  "),
@@ -218,14 +217,16 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             hint(" find  "),
             key("↵"),
             hint(" go  "),
+            key("s"),
+            hint(format!(" sort:{sort}{direction}  ")),
             key("."),
             hint(format!(" hidden:{hidden}")),
         ])
-    } else if area.width >= 50 {
+    } else if area.width >= 72 {
         Line::from(vec![
             key(" ↑↓"),
             hint(" select  "),
-            key("pg↑↓"),
+            key("pgup/dn"),
             hint(" jump  "),
             key("→"),
             hint(" open  "),
@@ -234,18 +235,35 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             key("/"),
             hint(" find  "),
             key("↵"),
-            hint(" go"),
+            hint(" go  "),
+            key("s"),
+            hint(format!(" sort:{sort}{direction}")),
+        ])
+    } else if area.width >= 50 {
+        Line::from(vec![
+            key(" ↑↓"),
+            hint("  "),
+            key("pg↑↓"),
+            hint("  "),
+            key("→"),
+            hint("open  "),
+            key("←"),
+            hint("back  "),
+            key("/"),
+            hint("find  "),
+            key("s"),
+            hint(format!(":{sort}{direction}")),
         ])
     } else if area.width >= 34 {
         Line::from(vec![
             key(" ↑↓"),
-            hint(" select  "),
+            hint("  "),
             key("pg↑↓"),
             hint("  "),
             key("/"),
             hint("find  "),
-            key("→"),
-            hint("open  "),
+            key("s"),
+            hint(format!(":{sort}{direction}  ")),
             key("↵"),
             hint("go"),
         ])
@@ -291,6 +309,52 @@ fn fill_row(prefix: &str, value: &str, width: usize) -> String {
     let padding = width.saturating_sub(UnicodeWidthStr::width(output.as_str()));
     output.extend(std::iter::repeat_n(' ', padding));
     output
+}
+
+fn entry_row(prefix: &str, entry: &Entry, width: usize) -> String {
+    if !shows_modified_column(width) {
+        return fill_row(prefix, &entry.display_name(), width);
+    }
+
+    let name_column_width = width - MODIFIED_COLUMN_GAP - MODIFIED_COLUMN_WIDTH;
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let name_width = name_column_width.saturating_sub(prefix_width);
+    let mut output = format!(
+        "{prefix}{}",
+        shorten_right(&entry.display_name(), name_width)
+    );
+    let padding = name_column_width.saturating_sub(UnicodeWidthStr::width(output.as_str()));
+    output.extend(std::iter::repeat_n(' ', padding + MODIFIED_COLUMN_GAP));
+    output.push_str(&format_modified(entry.modified));
+    output
+}
+
+fn pane_heading(label: &str, width: usize) -> String {
+    if !shows_modified_column(width) {
+        return shorten_right(label, width);
+    }
+
+    let label_width = width - MODIFIED_COLUMN_GAP - MODIFIED_COLUMN_WIDTH;
+    let mut output = shorten_right(label, label_width);
+    let padding = label_width.saturating_sub(UnicodeWidthStr::width(output.as_str()));
+    output.extend(std::iter::repeat_n(' ', padding + MODIFIED_COLUMN_GAP));
+    output.push_str(&format!("{:>MODIFIED_COLUMN_WIDTH$}", "modified"));
+    output
+}
+
+fn shows_modified_column(width: usize) -> bool {
+    width >= MIN_NAME_COLUMN_WIDTH + MODIFIED_COLUMN_GAP + MODIFIED_COLUMN_WIDTH
+}
+
+fn format_modified(modified: Option<std::time::SystemTime>) -> String {
+    modified.map_or_else(
+        || format!("{:>MODIFIED_COLUMN_WIDTH$}", "—"),
+        |modified| {
+            DateTime::<Local>::from(modified)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        },
+    )
 }
 
 fn shorten_right(value: &str, max_width: usize) -> String {
@@ -358,7 +422,7 @@ mod tests {
         fs::write(temp.path().join("project/main.rs"), "fn main() {}").unwrap();
         fs::write(temp.path().join("README.md"), "hello").unwrap();
         let app = App::new(temp.path().to_path_buf()).unwrap();
-        let backend = TestBackend::new(78, 8);
+        let backend = TestBackend::new(88, 8);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -366,9 +430,11 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("current"));
         assert!(rendered.contains("next · project/"));
+        assert!(rendered.contains("modified"));
         assert!(rendered.contains("main.rs"));
         assert!(rendered.contains('│'));
         assert!(rendered.contains("hidden:off"));
+        assert!(rendered.contains("sort:name↑"));
     }
 
     #[test]
@@ -385,6 +451,7 @@ mod tests {
         assert_eq!(terminal.backend().buffer().area.width, 24);
         assert!(rendered.contains("↵go"));
         assert!(!rendered.contains("next ·"));
+        assert!(!rendered.contains("modified"));
     }
 
     #[test]
@@ -407,5 +474,36 @@ mod tests {
         assert!(rendered.contains("filter: cargo"));
         assert!(rendered.contains("2/3 matches"));
         assert!(!rendered.contains("README.md"));
+    }
+
+    #[test]
+    fn modified_values_are_fixed_width_and_hidden_when_space_is_tight() {
+        let value = format_modified(Some(std::time::SystemTime::UNIX_EPOCH));
+        assert_eq!(
+            UnicodeWidthStr::width(value.as_str()),
+            MODIFIED_COLUMN_WIDTH
+        );
+        assert!(value.contains(':'));
+        assert_eq!(
+            UnicodeWidthStr::width(format_modified(None).as_str()),
+            MODIFIED_COLUMN_WIDTH
+        );
+        assert!(!shows_modified_column(29));
+        assert!(shows_modified_column(30));
+    }
+
+    #[test]
+    fn footer_reflects_the_active_sort_mode() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("project")).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.cycle_sort();
+        app.toggle_sort_direction();
+        let backend = TestBackend::new(88, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert!(terminal.backend().to_string().contains("sort:time↓"));
     }
 }

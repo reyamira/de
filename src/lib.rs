@@ -2,7 +2,7 @@ mod app;
 pub mod backend;
 mod ui;
 
-pub use app::{App, Entry, NavigationResult, Preview};
+pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode};
 pub use ui::{TWO_PANE_MIN_WIDTH, render};
 
 use std::ffi::OsStr;

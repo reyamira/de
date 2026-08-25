@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {
@@ -10,6 +11,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_symlink: bool,
+    pub modified: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +55,50 @@ pub enum NavigationResult {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortMode {
+    Name,
+    Modified,
+}
+
+impl SortMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Modified => "time",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Modified,
+            Self::Modified => Self::Name,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    pub const fn symbol(self) -> &'static str {
+        match self {
+            Self::Ascending => "↑",
+            Self::Descending => "↓",
+        }
+    }
+
+    const fn opposite(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     current_dir: PathBuf,
@@ -64,6 +110,8 @@ pub struct App {
     preview: Preview,
     filtering: bool,
     filter: String,
+    sort_mode: SortMode,
+    sort_direction: SortDirection,
 }
 
 impl App {
@@ -75,7 +123,9 @@ impl App {
             ));
         }
 
-        let entries = read_entries(&start, false)?;
+        let sort_mode = SortMode::Name;
+        let sort_direction = SortDirection::Ascending;
+        let entries = read_entries(&start, false, sort_mode, sort_direction)?;
         let mut app = Self {
             current_dir: start,
             all_entries: entries.clone(),
@@ -90,6 +140,8 @@ impl App {
             },
             filtering: false,
             filter: String::new(),
+            sort_mode,
+            sort_direction,
         };
         app.refresh_preview();
         Ok(app)
@@ -133,6 +185,14 @@ impl App {
 
     pub fn filter_query(&self) -> &str {
         &self.filter
+    }
+
+    pub fn sort_mode(&self) -> SortMode {
+        self.sort_mode
+    }
+
+    pub fn sort_direction(&self) -> SortDirection {
+        self.sort_direction
     }
 
     pub fn move_up(&mut self) {
@@ -202,6 +262,20 @@ impl App {
         self.apply_filter(selected_name.as_deref());
     }
 
+    pub fn cycle_sort(&mut self) {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        self.sort_mode = self.sort_mode.next();
+        sort_entries(&mut self.all_entries, self.sort_mode, self.sort_direction);
+        self.apply_filter(selected_name.as_deref());
+    }
+
+    pub fn toggle_sort_direction(&mut self) {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        self.sort_direction = self.sort_direction.opposite();
+        sort_entries(&mut self.all_entries, self.sort_mode, self.sort_direction);
+        self.apply_filter(selected_name.as_deref());
+    }
+
     pub fn enter_selected(&mut self) {
         let Some(entry) = self.selected_entry() else {
             return;
@@ -243,7 +317,12 @@ impl App {
     }
 
     fn navigate_to(&mut self, target: PathBuf, select_name: Option<&OsStr>) {
-        match read_entries(&target, self.show_hidden) {
+        match read_entries(
+            &target,
+            self.show_hidden,
+            self.sort_mode,
+            self.sort_direction,
+        ) {
             Ok(entries) => {
                 self.current_dir = target;
                 self.filter.clear();
@@ -264,7 +343,12 @@ impl App {
 
     fn reload_preserving_selection(&mut self) {
         let selected_name = self.selected_entry().map(|entry| entry.name.clone());
-        match read_entries(&self.current_dir, self.show_hidden) {
+        match read_entries(
+            &self.current_dir,
+            self.show_hidden,
+            self.sort_mode,
+            self.sort_direction,
+        ) {
             Ok(entries) => {
                 self.all_entries = entries;
                 self.apply_filter(selected_name.as_deref());
@@ -317,7 +401,12 @@ impl App {
             return;
         }
 
-        match read_entries(&entry.path, self.show_hidden) {
+        match read_entries(
+            &entry.path,
+            self.show_hidden,
+            self.sort_mode,
+            self.sort_direction,
+        ) {
             Ok(entries) => {
                 self.preview = Preview {
                     label,
@@ -336,7 +425,12 @@ impl App {
     }
 }
 
-fn read_entries(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+fn read_entries(
+    path: &Path,
+    show_hidden: bool,
+    sort_mode: SortMode,
+    sort_direction: SortDirection,
+) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for result in fs::read_dir(path)? {
         let dir_entry = match result {
@@ -352,30 +446,67 @@ fn read_entries(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
             Ok(file_type) => file_type,
             Err(_) => continue,
         };
+        let metadata = dir_entry.metadata().ok();
         let is_symlink = file_type.is_symlink();
         let is_dir = file_type.is_dir()
-            || (is_symlink && dir_entry.metadata().is_ok_and(|metadata| metadata.is_dir()));
+            || (is_symlink && metadata.as_ref().is_some_and(|metadata| metadata.is_dir()));
+        let modified = metadata.and_then(|metadata| metadata.modified().ok());
 
         entries.push(Entry {
             name,
             path: dir_entry.path(),
             is_dir,
             is_symlink,
+            modified,
         });
     }
 
-    entries.sort_by(compare_entries);
+    sort_entries(&mut entries, sort_mode, sort_direction);
     Ok(entries)
 }
 
-fn compare_entries(left: &Entry, right: &Entry) -> Ordering {
-    right.is_dir.cmp(&left.is_dir).then_with(|| {
-        left.name
-            .to_string_lossy()
-            .to_lowercase()
-            .cmp(&right.name.to_string_lossy().to_lowercase())
-            .then_with(|| left.name.cmp(&right.name))
-    })
+fn sort_entries(entries: &mut [Entry], sort_mode: SortMode, sort_direction: SortDirection) {
+    entries.sort_by(|left, right| compare_entries(left, right, sort_mode, sort_direction));
+}
+
+fn compare_entries(
+    left: &Entry,
+    right: &Entry,
+    sort_mode: SortMode,
+    sort_direction: SortDirection,
+) -> Ordering {
+    right
+        .is_dir
+        .cmp(&left.is_dir)
+        .then_with(|| match sort_mode {
+            SortMode::Name => apply_direction(compare_names(left, right), sort_direction),
+            SortMode::Modified => match (left.modified, right.modified) {
+                (Some(left_time), Some(right_time)) => apply_direction(
+                    left_time
+                        .cmp(&right_time)
+                        .then_with(|| compare_names(left, right)),
+                    sort_direction,
+                ),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => apply_direction(compare_names(left, right), sort_direction),
+            },
+        })
+}
+
+fn apply_direction(order: Ordering, sort_direction: SortDirection) -> Ordering {
+    match sort_direction {
+        SortDirection::Ascending => order,
+        SortDirection::Descending => order.reverse(),
+    }
+}
+
+fn compare_names(left: &Entry, right: &Entry) -> Ordering {
+    left.name
+        .to_string_lossy()
+        .to_lowercase()
+        .cmp(&right.name.to_string_lossy().to_lowercase())
+        .then_with(|| left.name.cmp(&right.name))
 }
 
 fn is_hidden(name: &OsStr) -> bool {
@@ -386,6 +517,7 @@ fn is_hidden(name: &OsStr) -> bool {
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn fixture() -> (tempfile::TempDir, App) {
@@ -408,6 +540,7 @@ mod tests {
             .map(|entry| entry.display_name())
             .collect();
         assert_eq!(names, ["Alpha/", "zeta/", "notes.txt"]);
+        assert!(app.entries().iter().all(|entry| entry.modified.is_some()));
     }
 
     #[test]
@@ -510,5 +643,75 @@ mod tests {
         assert_eq!(app.selected(), 2);
         app.page_up(99);
         assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn sort_criterion_and_direction_are_independent_and_preserve_selection() {
+        let (_temp, mut app) = fixture();
+        for entry in &mut app.all_entries {
+            let seconds = match entry.name.to_string_lossy().as_ref() {
+                "Alpha" => 10,
+                "zeta" => 20,
+                "notes.txt" => 30,
+                _ => 0,
+            };
+            entry.modified = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+        }
+        app.entries = app.all_entries.clone();
+
+        assert_eq!(app.sort_mode(), SortMode::Name);
+        assert_eq!(app.sort_direction(), SortDirection::Ascending);
+        assert_eq!(app.selected_entry().unwrap().display_name(), "Alpha/");
+
+        app.cycle_sort();
+        let names: Vec<_> = app.entries().iter().map(Entry::display_name).collect();
+        assert_eq!(app.sort_mode(), SortMode::Modified);
+        assert_eq!(app.sort_direction(), SortDirection::Ascending);
+        assert_eq!(names, ["Alpha/", "zeta/", "notes.txt"]);
+        assert_eq!(app.selected_entry().unwrap().display_name(), "Alpha/");
+
+        app.toggle_sort_direction();
+        let names: Vec<_> = app.entries().iter().map(Entry::display_name).collect();
+        assert_eq!(app.sort_mode(), SortMode::Modified);
+        assert_eq!(app.sort_direction(), SortDirection::Descending);
+        assert_eq!(names, ["zeta/", "Alpha/", "notes.txt"]);
+        assert_eq!(app.selected_entry().unwrap().display_name(), "Alpha/");
+        assert_eq!(app.preview().label(), "Alpha/");
+
+        app.cycle_sort();
+        let names: Vec<_> = app.entries().iter().map(Entry::display_name).collect();
+        assert_eq!(app.sort_mode(), SortMode::Name);
+        assert_eq!(app.sort_direction(), SortDirection::Descending);
+        assert_eq!(names, ["zeta/", "Alpha/", "notes.txt"]);
+        assert_eq!(app.selected_entry().unwrap().display_name(), "Alpha/");
+
+        let mut incomplete_metadata = vec![
+            Entry {
+                name: "unknown".into(),
+                path: "unknown".into(),
+                is_dir: false,
+                is_symlink: false,
+                modified: None,
+            },
+            Entry {
+                name: "known".into(),
+                path: "known".into(),
+                is_dir: false,
+                is_symlink: false,
+                modified: Some(SystemTime::UNIX_EPOCH),
+            },
+        ];
+        sort_entries(
+            &mut incomplete_metadata,
+            SortMode::Modified,
+            SortDirection::Ascending,
+        );
+        assert_eq!(incomplete_metadata[0].name, "known");
+        sort_entries(
+            &mut incomplete_metadata,
+            SortMode::Modified,
+            SortDirection::Descending,
+        );
+        assert_eq!(incomplete_metadata[0].name, "known");
     }
 }
