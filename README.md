@@ -33,21 +33,42 @@ Prebuilt archives for Linux and macOS on x86-64 and ARM64 are available from
 `de`, this README, and the MIT license; SHA-256 checksums are published alongside
 the archives. Extract the archive, then place `de` somewhere on your `PATH`.
 
-Set up the shell function that allows `de` to change its parent shell's working
-directory:
+### Shell integration
 
-```sh
-eval "$(command de init bash)" # use zsh here if appropriate
+The `de` executable cannot change its parent shell's working directory by
+itself. `de init <shell>` prints a small wrapper function to stdout; it does not
+modify your shell configuration. The commands below evaluate that function in
+your current shell. Add the same command to the listed startup file to enable
+`de` in future shells.
+
+#### Bash
+
+Run now, then add the same line to `~/.bashrc`:
+
+```bash
+eval "$(command de init bash)"
 ```
 
-For fish:
+#### Zsh
+
+Run now, then add the same line to `~/.zshrc`:
+
+```zsh
+eval "$(command de init zsh)"
+```
+
+#### Fish
+
+Run now, then add the same line to `~/.config/fish/config.fish`:
 
 ```fish
 command de init fish | source
 ```
 
-Add the relevant initialization line to your shell profile to enable `de` in
-future sessions.
+`eval` and `source` load the generated wrapper into the current shell. The
+`command de` calls explicitly invoke the executable even after that wrapper is
+defined. The wrapper captures the directory printed by the executable and then
+asks the parent shell to `cd` there.
 
 ## Build from source
 
@@ -56,10 +77,6 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 de
 ```
-
-The generated shell function captures the directory printed by the executable
-and asks the parent shell to `cd` there; a child process cannot change its parent
-shell's directory directly.
 
 ## Themes
 
