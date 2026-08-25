@@ -13,21 +13,21 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-const AFTER_HELP: &str = "Navigation:
-  ↑/↓, j/k            Select an entry
-  PageUp/PageDown      Jump one visible page
-  →, l, Tab           Enter the directory shown in the right pane
-  ←, h, Backspace     Go to the parent directory
-  /                    Filter entries in the current directory
-  Enter               Change the shell to the current directory
-  . / r               Toggle hidden entries / refresh
-  Esc                  Clear the active filter, then cancel
-  q, Ctrl-C            Cancel without changing directory
+const PICKER_HELP: &str = "Picker controls:
+  ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
+  → or l/Tab         Open folder     ← or h/Backspace  Go to parent
+  /                  Filter          . / r              Hidden / refresh
+  Enter              Go here         Esc / q / Ctrl-C   Cancel
 
-Shell setup:
-  Bash:  eval \"$(command de init bash)\"
-  Zsh:   eval \"$(command de init zsh)\"
-  Fish:  command de init fish | source";
+Run `de init --help` for shell setup.";
+
+const SHELL_SETUP_HELP: &str = "Setup examples:
+  Bash   eval \"$(command de init bash)\"
+  Zsh    eval \"$(command de init zsh)\"
+  Fish   command de init fish | source
+
+Add the command for your shell to its startup file to make `de` available in
+future sessions.";
 
 const CLI_STYLES: Styles = Styles::styled()
     .header(AnsiColor::BrightCyan.on_default().bold())
@@ -44,7 +44,7 @@ const CLI_STYLES: Styles = Styles::styled()
     version,
     about = "Explore directories inline, then cd when you confirm",
     long_about = None,
-    after_help = AFTER_HELP,
+    after_long_help = PICKER_HELP,
     styles = CLI_STYLES,
     disable_help_subcommand = true,
     args_conflicts_with_subcommands = true,
@@ -62,6 +62,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum CliCommand {
     /// Print shell integration code
+    #[command(
+        long_about = "Print the shell function that lets de change its parent shell's directory.",
+        after_long_help = SHELL_SETUP_HELP
+    )]
     Init {
         /// Shell whose integration should be generated
         #[arg(value_enum)]
@@ -71,8 +75,11 @@ enum CliCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Shell {
+    /// Bash
     Bash,
+    /// Z shell
     Zsh,
+    /// Fish
     Fish,
 }
 
@@ -328,16 +335,37 @@ mod tests {
     }
 
     #[test]
-    fn generated_help_includes_commands_and_navigation() {
+    fn short_help_stays_focused_on_the_clap_interface() {
+        let help = Cli::try_parse_from(["de", "-h"]).unwrap_err().to_string();
+        assert!(help.contains("Usage:"));
+        assert!(help.contains("Commands:"));
+        assert!(help.contains("DIRECTORY"));
+        assert!(!help.contains("Picker controls:"));
+        assert!(!help.contains("Setup examples:"));
+    }
+
+    #[test]
+    fn long_help_adds_picker_controls_and_routes_shell_setup() {
         let help = Cli::try_parse_from(["de", "--help"])
             .unwrap_err()
             .to_string();
-        assert!(help.contains("Usage:"));
-        assert!(help.contains("Commands:"));
-        assert!(help.contains("Navigation:"));
+        assert!(help.contains("Picker controls:"));
         assert!(help.contains("PageUp/PageDown"));
-        assert!(help.contains("Filter entries"));
-        assert!(help.contains("DIRECTORY"));
+        assert!(help.contains("de init --help"));
+        assert!(!help.contains("eval \"$(command de init bash)\""));
+    }
+
+    #[test]
+    fn init_long_help_owns_shell_setup_examples() {
+        let help = Cli::try_parse_from(["de", "init", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("Possible values:"));
+        assert!(help.contains("bash"));
+        assert!(help.contains("zsh"));
+        assert!(help.contains("fish"));
+        assert!(help.contains("Setup examples:"));
+        assert!(help.contains("command de init fish | source"));
     }
 
     #[test]
