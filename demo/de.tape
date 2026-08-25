@@ -10,37 +10,44 @@ Setup "/bin/bash" "demo/fixture.sh" "setup"
 Cleanup "/bin/bash" "demo/fixture.sh" "cleanup"
 Launch "/bin/bash" "demo/shell.sh"
 
-Wait "de-demo workspace $"
-Sleep 800ms
+Wait "de-demo ~/workspace $"
 Mark ready
-Type "de" Pace 100ms
+Sleep 1600ms
+Type "ls" Pace 140ms
+Key enter
+Wait "frontend"
+Sleep 1800ms
+Type "de" Pace 140ms
 Key enter
 Wait "workspace"
 Mark picker
-Sleep 1200ms
+Sleep 2400ms
 Key down
-Sleep 650ms
+Wait "guides/"
+Sleep 1400ms
 Key up
+Sleep 1000ms
 Key right
 Wait "api"
-Sleep 900ms
+Sleep 2200ms
 Key down
-Sleep 500ms
+Wait "health.rs"
+Sleep 1400ms
 Key up
-Sleep 350ms
+Sleep 900ms
 Key right
 Wait "src"
-Sleep 900ms
+Sleep 1800ms
 Key left
 Wait "api"
-Sleep 700ms
-Type "/test" Pace 120ms
-Sleep 900ms
+Sleep 1500ms
+Type "/test" Pace 180ms
+Wait "filter: test"
+Sleep 2000ms
 Mark filtered
 Key escape
-Sleep 500ms
+Sleep 900ms
 Key enter
-Wait "de-demo api $"
+Wait "de-demo ~/workspace/api $"
 Mark done
-Sleep 1400ms
 Stop

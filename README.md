@@ -24,6 +24,10 @@ installed command is `de`):
 cargo install de-cli --locked
 ```
 
+`--locked` tells Cargo to use the exact dependency versions in the published
+`Cargo.lock`—the same versions tested for this release—instead of resolving
+newer compatible versions. It is optional, but makes the install reproducible.
+
 Prebuilt archives for Linux and macOS on x86-64 and ARM64 are available from
 [GitHub Releases](https://github.com/reyamira/de/releases). Each archive includes
 `de`, this README, and the MIT license; SHA-256 checksums are published alongside
