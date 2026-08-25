@@ -1,6 +1,6 @@
 [package]
-name = "de"
-version = "0.1.0"
+name = "de-cli"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A tiny inline directory explorer for your shell"
@@ -10,6 +10,14 @@ homepage = "https://github.com/reyamira/de"
 readme = "README.md"
 keywords = ["cli", "directory", "terminal", "tui"]
 categories = ["command-line-utilities"]
+
+[lib]
+name = "de"
+path = "src/lib.rs"
+
+[[bin]]
+name = "de"
+path = "src/main.rs"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

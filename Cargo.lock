@@ -273,8 +273,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "de"
-version = "0.1.0"
+name = "de-cli"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",

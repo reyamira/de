@@ -1,0 +1,9 @@
+{
+  "clips": [
+    {
+      "from": "ready",
+      "to": "done",
+      "caption": "Explore, filter, and cd without leaving the terminal"
+    }
+  ]
+}

@@ -4,6 +4,8 @@
 directory, lets you walk into or out of folders, and changes the shell's working
 directory only when you confirm.
 
+![Navigating directories with de](demo/de.gif)
+
 At normal terminal widths, the left pane is the directory you are currently
 exploring and the right pane previews the highlighted destination. Below 58
 columns, `de` collapses to a single pane instead of squeezing the listings.
@@ -15,10 +17,11 @@ delete, rename, copy, edit, or open commands.
 
 ## Install
 
-Install the latest source directly with Cargo:
+Install from crates.io with Cargo (the package is named `de-cli`, but the
+installed command is `de`):
 
 ```sh
-cargo install --git https://github.com/reyamira/de --locked
+cargo install de-cli --locked
 ```
 
 Prebuilt archives for Linux and macOS on x86-64 and ARM64 are available from
@@ -202,6 +205,18 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
+
+The README demo is driven by the checked-in Terminal Control tape. To replay it
+after building the release binary:
+
+```sh
+cargo build --release
+termctrl play demo/de.tape
+```
+
+The tape creates and removes its own synthetic fixture under `/tmp`; its private
+`.termctrl` timeline and intermediate MP4 are gitignored. `demo/de.gif` is the
+small public artifact embedded above.
 
 The UI is rendered on stderr so stdout remains a clean selected-path protocol
 for the shell wrapper. On Unix, path bytes are preserved by the executable; like
