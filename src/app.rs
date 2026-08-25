@@ -56,11 +56,14 @@ pub enum NavigationResult {
 #[derive(Debug)]
 pub struct App {
     current_dir: PathBuf,
+    all_entries: Vec<Entry>,
     entries: Vec<Entry>,
     selected: usize,
     show_hidden: bool,
     status: Option<String>,
     preview: Preview,
+    filtering: bool,
+    filter: String,
 }
 
 impl App {
@@ -75,6 +78,7 @@ impl App {
         let entries = read_entries(&start, false)?;
         let mut app = Self {
             current_dir: start,
+            all_entries: entries.clone(),
             entries,
             selected: 0,
             show_hidden: false,
@@ -84,6 +88,8 @@ impl App {
                 entries: Vec::new(),
                 message: None,
             },
+            filtering: false,
+            filter: String::new(),
         };
         app.refresh_preview();
         Ok(app)
@@ -95,6 +101,10 @@ impl App {
 
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    pub fn total_entry_count(&self) -> usize {
+        self.all_entries.len()
     }
 
     pub fn selected(&self) -> usize {
@@ -115,6 +125,14 @@ impl App {
 
     pub fn preview(&self) -> &Preview {
         &self.preview
+    }
+
+    pub fn is_filtering(&self) -> bool {
+        self.filtering
+    }
+
+    pub fn filter_query(&self) -> &str {
+        &self.filter
     }
 
     pub fn move_up(&mut self) {
@@ -141,6 +159,47 @@ impl App {
         self.status = None;
         self.selected = self.entries.len().saturating_sub(1);
         self.refresh_preview();
+    }
+
+    pub fn page_up(&mut self, rows: usize) {
+        self.status = None;
+        self.selected = self.selected.saturating_sub(rows.max(1));
+        self.refresh_preview();
+    }
+
+    pub fn page_down(&mut self, rows: usize) {
+        self.status = None;
+        if !self.entries.is_empty() {
+            self.selected = self
+                .selected
+                .saturating_add(rows.max(1))
+                .min(self.entries.len() - 1);
+        }
+        self.refresh_preview();
+    }
+
+    pub fn begin_filter(&mut self) {
+        self.filtering = true;
+        self.status = None;
+    }
+
+    pub fn push_filter_char(&mut self, character: char) {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        self.filter.push(character);
+        self.apply_filter(selected_name.as_deref());
+    }
+
+    pub fn pop_filter_char(&mut self) {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        self.filter.pop();
+        self.apply_filter(selected_name.as_deref());
+    }
+
+    pub fn clear_filter(&mut self) {
+        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
+        self.filter.clear();
+        self.filtering = false;
+        self.apply_filter(selected_name.as_deref());
     }
 
     pub fn enter_selected(&mut self) {
@@ -187,7 +246,10 @@ impl App {
         match read_entries(&target, self.show_hidden) {
             Ok(entries) => {
                 self.current_dir = target;
-                self.entries = entries;
+                self.filter.clear();
+                self.filtering = false;
+                self.all_entries = entries;
+                self.entries = self.all_entries.clone();
                 self.selected = select_name
                     .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
                     .unwrap_or(0);
@@ -204,13 +266,9 @@ impl App {
         let selected_name = self.selected_entry().map(|entry| entry.name.clone());
         match read_entries(&self.current_dir, self.show_hidden) {
             Ok(entries) => {
-                self.entries = entries;
-                self.selected = selected_name
-                    .as_ref()
-                    .and_then(|name| self.entries.iter().position(|entry| &entry.name == name))
-                    .unwrap_or(0);
+                self.all_entries = entries;
+                self.apply_filter(selected_name.as_deref());
                 self.status = None;
-                self.refresh_preview();
             }
             Err(error) => {
                 self.status = Some(format!(
@@ -219,6 +277,24 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn apply_filter(&mut self, selected_name: Option<&OsStr>) {
+        let query = self.filter.to_lowercase();
+        self.entries = if query.is_empty() {
+            self.all_entries.clone()
+        } else {
+            self.all_entries
+                .iter()
+                .filter(|entry| entry.name.to_string_lossy().to_lowercase().contains(&query))
+                .cloned()
+                .collect()
+        };
+        self.selected = selected_name
+            .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
+            .unwrap_or(0);
+        self.status = None;
+        self.refresh_preview();
     }
 
     fn refresh_preview(&mut self) {
@@ -396,5 +472,43 @@ mod tests {
             app.preview().message(),
             Some("file · shown for context only")
         );
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_scoped_and_reversible() {
+        let (_temp, mut app) = fixture();
+        app.begin_filter();
+        for character in "ALP".chars() {
+            app.push_filter_char(character);
+        }
+
+        assert!(app.is_filtering());
+        assert_eq!(app.filter_query(), "ALP");
+        assert_eq!(app.total_entry_count(), 3);
+        assert_eq!(app.entries().len(), 1);
+        assert_eq!(app.selected_entry().unwrap().display_name(), "Alpha/");
+        assert_eq!(app.preview().label(), "Alpha/");
+
+        app.pop_filter_char();
+        assert_eq!(app.filter_query(), "AL");
+        app.clear_filter();
+        assert!(!app.is_filtering());
+        assert!(app.filter_query().is_empty());
+        assert_eq!(app.entries().len(), 3);
+    }
+
+    #[test]
+    fn page_navigation_clamps_to_the_available_entries() {
+        let (_temp, mut app) = fixture();
+        app.page_down(2);
+        assert_eq!(app.selected(), 2);
+
+        app.page_up(1);
+        assert_eq!(app.selected(), 1);
+
+        app.page_down(99);
+        assert_eq!(app.selected(), 2);
+        app.page_up(99);
+        assert_eq!(app.selected(), 0);
     }
 }

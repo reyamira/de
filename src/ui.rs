@@ -187,33 +187,67 @@ fn render_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.is_filtering() {
+        let line = Line::from(vec![
+            key(" / "),
+            hint("filter: "),
+            Span::styled(app.filter_query().to_owned(), Style::default().fg(TEXT)),
+            Span::styled("▏", Style::default().fg(ACCENT)),
+            hint(format!(
+                "  {}/{} matches  esc clear",
+                app.entries().len(),
+                app.total_entry_count()
+            )),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let hidden = if app.show_hidden() { "on" } else { "off" };
-    let line = if area.width >= 64 {
+    let line = if area.width >= 72 {
         Line::from(vec![
             key(" ↑↓"),
             hint(" select  "),
+            key("pgup/dn"),
+            hint(" jump  "),
             key("→"),
             hint(" open  "),
             key("←"),
             hint(" parent  "),
-            key("enter"),
+            key("/"),
+            hint(" find  "),
+            key("↵"),
             hint(" go  "),
-            key("esc"),
-            hint(" cancel  "),
             key("."),
             hint(format!(" hidden:{hidden}")),
+        ])
+    } else if area.width >= 50 {
+        Line::from(vec![
+            key(" ↑↓"),
+            hint(" select  "),
+            key("pg↑↓"),
+            hint(" jump  "),
+            key("→"),
+            hint(" open  "),
+            key("←"),
+            hint(" parent  "),
+            key("/"),
+            hint(" find  "),
+            key("↵"),
+            hint(" go"),
         ])
     } else if area.width >= 34 {
         Line::from(vec![
             key(" ↑↓"),
             hint(" select  "),
+            key("pg↑↓"),
+            hint("  "),
+            key("/"),
+            hint("find  "),
             key("→"),
-            hint(" open  "),
-            key("←"),
-            hint(" parent  "),
-            key("enter"),
-            hint(" go  "),
-            key("esc"),
+            hint("open  "),
+            key("↵"),
+            hint("go"),
         ])
     } else {
         Line::from(vec![
@@ -351,5 +385,27 @@ mod tests {
         assert_eq!(terminal.backend().buffer().area.width, 24);
         assert!(rendered.contains("↵go"));
         assert!(!rendered.contains("next ·"));
+    }
+
+    #[test]
+    fn filter_mode_renders_the_query_and_match_count() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("Cargo-project")).unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::write(temp.path().join("README.md"), "hello").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_filter();
+        for character in "cargo".chars() {
+            app.push_filter_char(character);
+        }
+        let backend = TestBackend::new(78, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("filter: cargo"));
+        assert!(rendered.contains("2/3 matches"));
+        assert!(!rendered.contains("README.md"));
     }
 }

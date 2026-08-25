@@ -36,8 +36,10 @@ shell's directory directly.
 | Key | Action |
 | --- | --- |
 | `Up` / `Down`, `j` / `k` | Select an entry |
+| `PageUp` / `PageDown` | Jump one visible page through the entries |
 | `Right`, `l`, `Tab` | Make the previewed directory current |
 | `Left`, `h`, `Backspace` | Go to the parent directory |
+| `/` | Filter entries in the current directory |
 | `Enter` | Change to the directory currently displayed |
 | `.` | Toggle hidden entries |
 | `r` | Refresh |
@@ -46,6 +48,11 @@ shell's directory directly.
 The important distinction is that `Enter` accepts the directory in the header,
 not the highlighted child. Use `Right` to explore and `Enter` when you have
 arrived.
+
+Filtering uses a case-insensitive substring match. Type after pressing `/`, use
+the normal arrow and page keys to move through matches, and press `Backspace` to
+edit the query. `Escape` clears an active filter first; press it again to cancel
+`de`.
 
 ## Built with
 

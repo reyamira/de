@@ -15,11 +15,14 @@ use std::process::ExitCode;
 
 const AFTER_HELP: &str = "Navigation:
   ↑/↓, j/k            Select an entry
+  PageUp/PageDown      Jump one visible page
   →, l, Tab           Enter the directory shown in the right pane
   ←, h, Backspace     Go to the parent directory
+  /                    Filter entries in the current directory
   Enter               Change the shell to the current directory
   . / r               Toggle hidden entries / refresh
-  Esc, q, Ctrl-C      Cancel without changing directory
+  Esc                  Clear the active filter, then cancel
+  q, Ctrl-C            Cancel without changing directory
 
 Shell setup:
   Bash:  eval \"$(command de init bash)\"
@@ -135,7 +138,8 @@ fn run_picker(mut app: App) -> io::Result<Option<std::path::PathBuf>> {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    match handle_key(&mut app, key) {
+                    let page_rows = visible_entry_rows(&app, terminal_width, viewport_height);
+                    match handle_key(&mut app, key, page_rows) {
                         NavigationResult::Continue => {
                             let desired =
                                 desired_viewport_height(&app, terminal_width, terminal_height);
@@ -192,18 +196,55 @@ fn desired_viewport_height(app: &App, terminal_width: u16, terminal_height: u16)
     content_height.min(terminal_height.saturating_sub(1).max(1))
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> NavigationResult {
+fn visible_entry_rows(app: &App, terminal_width: u16, viewport_height: u16) -> usize {
+    let chrome_rows = if terminal_width >= TWO_PANE_MIN_WIDTH {
+        3
+    } else {
+        2
+    };
+    usize::from(viewport_height.saturating_sub(chrome_rows))
+        .saturating_sub(usize::from(app.status().is_some()))
+        .max(1)
+}
+
+fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResult {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return NavigationResult::Cancel;
+    }
+
+    if app.is_filtering() {
+        match key.code {
+            KeyCode::Up => app.move_up(),
+            KeyCode::Down => app.move_down(),
+            KeyCode::PageUp => app.page_up(page_rows),
+            KeyCode::PageDown => app.page_down(page_rows),
+            KeyCode::Home => app.move_first(),
+            KeyCode::End => app.move_last(),
+            KeyCode::Right | KeyCode::Tab => app.enter_selected(),
+            KeyCode::Left => app.go_parent(),
+            KeyCode::Backspace => app.pop_filter_char(),
+            KeyCode::Enter => return app.accept(),
+            KeyCode::Esc => app.clear_filter(),
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.push_filter_char(character);
+            }
+            _ => {}
+        }
+        return NavigationResult::Continue;
     }
 
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+        KeyCode::PageUp => app.page_up(page_rows),
+        KeyCode::PageDown => app.page_down(page_rows),
         KeyCode::Home | KeyCode::Char('g') => app.move_first(),
         KeyCode::End | KeyCode::Char('G') => app.move_last(),
         KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => app.enter_selected(),
         KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => app.go_parent(),
+        KeyCode::Char('/') => app.begin_filter(),
         KeyCode::Char('.') => app.toggle_hidden(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Enter => return app.accept(),
@@ -253,6 +294,8 @@ fn write_selected_path(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_a_start_directory() {
@@ -292,6 +335,35 @@ mod tests {
         assert!(help.contains("Usage:"));
         assert!(help.contains("Commands:"));
         assert!(help.contains("Navigation:"));
+        assert!(help.contains("PageUp/PageDown"));
+        assert!(help.contains("Filter entries"));
         assert!(help.contains("DIRECTORY"));
+    }
+
+    #[test]
+    fn slash_enters_filter_mode_and_escape_clears_before_canceling() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("source")).unwrap();
+        fs::write(temp.path().join("notes.txt"), "notes").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+
+        let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert_eq!(handle_key(&mut app, slash, 5), NavigationResult::Continue);
+        assert!(app.is_filtering());
+
+        let character = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut app, character, 5),
+            NavigationResult::Continue
+        );
+        assert_eq!(app.filter_query(), "s");
+        assert_eq!(app.entries().len(), 2);
+
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(handle_key(&mut app, escape, 5), NavigationResult::Continue);
+        assert!(!app.is_filtering());
+        assert!(app.filter_query().is_empty());
+        assert_eq!(app.entries().len(), 2);
+        assert_eq!(handle_key(&mut app, escape, 5), NavigationResult::Cancel);
     }
 }
