@@ -1,4 +1,4 @@
-use crate::DisplaySettings;
+use crate::{BrowseDefaults, DisplaySettings};
 use ratatui::style::Color;
 use std::env;
 use std::fs;
@@ -44,6 +44,7 @@ pub struct Config {
     themes: Vec<Theme>,
     saved_theme: Option<String>,
     display: DisplaySettings,
+    defaults: BrowseDefaults,
 }
 
 impl Config {
@@ -52,6 +53,7 @@ impl Config {
             themes: built_in_themes(),
             saved_theme: None,
             display: DisplaySettings::default(),
+            defaults: BrowseDefaults::default(),
         }
     }
 
@@ -72,6 +74,7 @@ impl Config {
         let document = parse_document(contents)?;
         let mut catalog = Self::built_ins();
         catalog.display = DisplaySettings::from_document(&document)?;
+        catalog.defaults = BrowseDefaults::from_document(&document)?;
 
         if let Some(item) = document.get("theme") {
             if let Some(name) = item.as_str() {
@@ -135,6 +138,10 @@ impl Config {
         &self.display
     }
 
+    pub const fn defaults(&self) -> BrowseDefaults {
+        self.defaults
+    }
+
     pub fn next(&self, current: &str) -> Theme {
         let index = self
             .themes
@@ -192,6 +199,19 @@ pub fn save_theme(name: &str) -> io::Result<PathBuf> {
     let path = theme_config_path()?;
     save_theme_at(&path, name)?;
     Ok(path)
+}
+
+/// Save the picker's current toggles as the starting state for future runs.
+pub fn save_defaults(defaults: BrowseDefaults) -> io::Result<PathBuf> {
+    let path = theme_config_path()?;
+    save_defaults_at(&path, defaults)?;
+    Ok(path)
+}
+
+fn save_defaults_at(path: &Path, defaults: BrowseDefaults) -> io::Result<()> {
+    let mut document = read_document_or_new(path)?;
+    defaults.write_to(&mut document)?;
+    write_document(path, &document)
 }
 
 pub fn create_custom_theme(name: &str) -> io::Result<PathBuf> {
@@ -302,7 +322,17 @@ fn create_custom_theme_at(path: &Path, name: &str) -> io::Result<()> {
 fn read_document_or_new(path: &Path) -> io::Result<DocumentMut> {
     match fs::read_to_string(path) {
         Ok(contents) => parse_document(&contents),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DocumentMut::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Carry a theme saved in the legacy plain-text file forward, since
+            // creating config.toml stops that file from being read.
+            let mut document = DocumentMut::new();
+            if let Some(name) = load_legacy_theme(path)? {
+                let mut theme = Table::new();
+                theme["selected"] = value(name);
+                document["theme"] = Item::Table(theme);
+            }
+            Ok(document)
+        }
         Err(error) => Err(error),
     }
 }
@@ -699,6 +729,53 @@ dim_muted = true
         assert!(saved.contains("selected = \"night\""));
         assert!(!saved.contains("theme = \"auto\""));
         assert!(saved.contains("[themes.night]"));
+    }
+
+    #[test]
+    fn saving_defaults_keeps_a_legacy_theme_and_comments() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# mine\ntheme = \"ocean\" # inline\n").unwrap();
+
+        let defaults = BrowseDefaults {
+            show_hidden: true,
+            sort_mode: crate::SortMode::Modified,
+            sort_direction: crate::SortDirection::Descending,
+        };
+        save_defaults_at(&path, defaults).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# mine"));
+        assert!(
+            saved.contains("theme = \"ocean\" # inline"),
+            "saved config:\n{saved}"
+        );
+
+        let config = Config::from_toml(&saved).unwrap();
+        assert_eq!(config.saved_theme(), Some("ocean"));
+        assert_eq!(config.defaults(), defaults);
+    }
+
+    #[test]
+    fn creating_config_carries_forward_the_legacy_theme_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path.with_file_name("theme"), "dark\n").unwrap();
+
+        save_defaults_at(&path, BrowseDefaults::default()).unwrap();
+        let config = Config::from_toml(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.saved_theme(), Some("dark"));
+    }
+
+    #[test]
+    fn saving_defaults_creates_a_missing_config() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+
+        save_defaults_at(&path, BrowseDefaults::default()).unwrap();
+        let config = Config::from_toml(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.defaults(), BrowseDefaults::default());
     }
 
     #[test]

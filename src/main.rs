@@ -7,7 +7,7 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use de::backend::InlineBackend;
 use de::{
     App, Config, NavigationResult, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme,
-    render, render_theme_preview, resolve_start_path, save_theme, shell_init,
+    render, render_theme_preview, resolve_start_path, save_defaults, save_theme, shell_init,
 };
 use ratatui::Terminal;
 use ratatui::layout::Rect;
@@ -24,6 +24,7 @@ const PICKER_HELP: &str = "Picker controls:
   Shift+S            Ascending / descending
   o                  Open file with its default application
   . / r              Hidden / refresh
+  w                  Save hidden and sort settings as defaults
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
 Run `de theme` to preview and save a color theme.
@@ -153,11 +154,10 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Some(CliCommand::Theme { command: None }) => {
             require_terminal()?;
-            let catalog =
-                Config::load().map_err(|error| format!("cannot load theme config: {error}"))?;
+            let catalog = Config::load().map_err(|error| format!("cannot load config: {error}"))?;
             let start = resolve_start_path(None)
                 .map_err(|error| format!("cannot resolve current directory: {error}"))?;
-            let mut app = App::new(start)
+            let mut app = App::with_defaults(start, catalog.defaults())
                 .map_err(|error| format!("cannot open current directory: {error}"))?;
             app.set_theme(resolve_theme(theme, &catalog)?);
             app.set_display_settings(catalog.display().clone());
@@ -171,12 +171,11 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         None => {
             require_terminal()?;
-            let catalog =
-                Config::load().map_err(|error| format!("cannot load theme config: {error}"))?;
+            let catalog = Config::load().map_err(|error| format!("cannot load config: {error}"))?;
             let start = resolve_start_path(directory.as_deref())
                 .map_err(|error| format!("cannot resolve start directory: {error}"))?;
-            let mut app =
-                App::new(start).map_err(|error| format!("cannot open start directory: {error}"))?;
+            let mut app = App::with_defaults(start, catalog.defaults())
+                .map_err(|error| format!("cannot open start directory: {error}"))?;
             app.set_theme(resolve_theme(theme, &catalog)?);
             app.set_display_settings(catalog.display().clone());
             if let Some(action) = run_picker(app).map_err(|error| error.to_string())? {
@@ -407,12 +406,20 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
         KeyCode::Char('S') => app.toggle_sort_direction(),
         KeyCode::Char('.') => app.toggle_hidden(),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('w') => save_current_defaults(app),
         KeyCode::Char('o') => return app.open_selected(),
         KeyCode::Enter => return app.accept(),
         KeyCode::Esc | KeyCode::Char('q') => return NavigationResult::Cancel,
         _ => {}
     }
     NavigationResult::Continue
+}
+
+fn save_current_defaults(app: &mut App) {
+    match save_defaults(app.browse_defaults()) {
+        Ok(path) => app.set_status(format!("saved defaults to {}", path.display())),
+        Err(error) => app.set_status(format!("cannot save defaults: {error}")),
+    }
 }
 
 fn open_with_default_app(path: &Path) -> io::Result<()> {

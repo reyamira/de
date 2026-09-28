@@ -1,4 +1,4 @@
-use crate::{DisplaySettings, Theme};
+use crate::{BrowseDefaults, DisplaySettings, Theme};
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -120,6 +120,10 @@ pub struct App {
 
 impl App {
     pub fn new(start: PathBuf) -> io::Result<Self> {
+        Self::with_defaults(start, BrowseDefaults::default())
+    }
+
+    pub fn with_defaults(start: PathBuf, defaults: BrowseDefaults) -> io::Result<Self> {
         if !start.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
@@ -127,15 +131,18 @@ impl App {
             ));
         }
 
-        let sort_mode = SortMode::Name;
-        let sort_direction = SortDirection::Ascending;
-        let entries = read_entries(&start, false, sort_mode, sort_direction)?;
+        let BrowseDefaults {
+            show_hidden,
+            sort_mode,
+            sort_direction,
+        } = defaults;
+        let entries = read_entries(&start, show_hidden, sort_mode, sort_direction)?;
         let mut app = Self {
             current_dir: start,
             all_entries: entries.clone(),
             entries,
             selected: 0,
-            show_hidden: false,
+            show_hidden,
             status: None,
             preview: Preview {
                 label: "preview".into(),
@@ -179,6 +186,19 @@ impl App {
 
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
+    }
+
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = Some(status.into());
+    }
+
+    /// The current in-session toggles, in the form saved to `[defaults]`.
+    pub fn browse_defaults(&self) -> BrowseDefaults {
+        BrowseDefaults {
+            show_hidden: self.show_hidden,
+            sort_mode: self.sort_mode,
+            sort_direction: self.sort_direction,
+        }
     }
 
     pub fn preview(&self) -> &Preview {
@@ -576,6 +596,29 @@ mod tests {
             .collect();
         assert_eq!(names, ["Alpha/", "zeta/", "notes.txt"]);
         assert!(app.entries().iter().all(|entry| entry.modified.is_some()));
+    }
+
+    #[test]
+    fn starts_from_configured_defaults() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("Alpha")).unwrap();
+        fs::create_dir(temp.path().join("zeta")).unwrap();
+        fs::create_dir(temp.path().join(".secret")).unwrap();
+        let defaults = BrowseDefaults {
+            show_hidden: true,
+            sort_mode: SortMode::Name,
+            sort_direction: SortDirection::Descending,
+        };
+
+        let app = App::with_defaults(temp.path().to_path_buf(), defaults).unwrap();
+
+        let names: Vec<_> = app
+            .entries()
+            .iter()
+            .map(|entry| entry.display_name())
+            .collect();
+        assert_eq!(names, ["zeta/", "Alpha/", ".secret/"]);
+        assert_eq!(app.browse_defaults(), defaults);
     }
 
     #[test]

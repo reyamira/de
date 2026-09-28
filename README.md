@@ -93,6 +93,7 @@ asks the parent shell to `cd` there.
 | `o` | Open the highlighted file with its default application |
 | `Enter` | Change to the directory currently displayed |
 | `.` | Toggle hidden entries |
+| `w` | Save the current hidden and sort settings as defaults |
 | `r` | Refresh |
 | `Escape`, `q`, `Ctrl-C` | Cancel without changing directory |
 
@@ -114,6 +115,27 @@ Name sorting is case-insensitive and alphabetical. Sort criterion and direction
 are independent, so modification time can show either oldest or newest first.
 Directories remain grouped above files in every mode, and the selected sort
 carries into the preview pane and navigated directories.
+
+## Defaults
+
+Hidden entries, sort criterion, and sort direction reset to their defaults each
+time `de` starts. To change what it starts with, set them up the way you like
+and press `w`. That writes them to the `[defaults]` table in `config.toml` (see
+[Themes](#themes) for where the file lives), leaving other settings and
+comments untouched. Toggling during a session never changes the saved defaults
+on its own.
+
+You can also edit the table directly:
+
+```toml
+[defaults]
+hidden = false
+sort = "name"
+order = "ascending"
+```
+
+`hidden` is `true` or `false`, `sort` accepts `name` or `modified`, and `order`
+accepts `ascending` or `descending`. Omitted keys keep the values shown above.
 
 ## Themes
 
