@@ -7,8 +7,8 @@ mod ui;
 pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode};
 pub use config::{BrowseDefaults, DateFormat, DisplaySettings, TimeFormat, Timezone};
 pub use theme::{
-    Config, Palette, THEME_ENV, Theme, create_custom_theme, save_defaults, save_theme,
-    theme_config_path,
+    Config, Palette, THEME_ENV, Theme, create_custom_theme, ensure_config_file, save_defaults,
+    save_theme, theme_config_path,
 };
 pub use ui::{TWO_PANE_MIN_WIDTH, render, render_theme_preview};
 
@@ -58,7 +58,7 @@ pub fn shell_init(shell: &str) -> Option<&'static str> {
         "bash" | "zsh" => Some(
             r#"de() {
     case "${1-}" in
-        -h|--help|-V|--version|init|theme)
+        -h|--help|-V|--version|init|theme|config)
             command de "$@"
             return
             ;;
@@ -73,7 +73,7 @@ pub fn shell_init(shell: &str) -> Option<&'static str> {
             r#"function de
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help -V --version init theme
+            case -h --help -V --version init theme config
                 command de $argv
                 return
         end
@@ -97,7 +97,10 @@ mod tests {
         let init = shell_init("bash").unwrap();
         assert!(init.contains("command de"));
         assert!(init.contains("builtin cd --"));
-        assert!(init.contains("-h|--help|-V|--version|init|theme"));
+        assert!(init.contains("        -h|--help|-V|--version|init|theme|config)\n"));
+
+        let init = shell_init("fish").unwrap();
+        assert!(init.contains("case -h --help -V --version init theme config\n"));
     }
 
     #[test]

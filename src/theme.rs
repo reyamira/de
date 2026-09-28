@@ -201,6 +201,24 @@ pub fn save_theme(name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Create config.toml if it does not exist yet, so it can be opened in an
+/// editor. An existing file is left untouched.
+pub fn ensure_config_file() -> io::Result<PathBuf> {
+    let path = theme_config_path()?;
+    ensure_config_file_at(&path)?;
+    Ok(path)
+}
+
+fn ensure_config_file_at(path: &Path) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            write_document(path, &read_document_or_new(path)?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Save the picker's current toggles as the starting state for future runs.
 pub fn save_defaults(defaults: BrowseDefaults) -> io::Result<PathBuf> {
     let path = theme_config_path()?;
@@ -766,6 +784,29 @@ dim_muted = true
         save_defaults_at(&path, BrowseDefaults::default()).unwrap();
         let config = Config::from_toml(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(config.saved_theme(), Some("dark"));
+    }
+
+    #[test]
+    fn ensuring_the_config_file_carries_forward_the_legacy_theme_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path.with_file_name("theme"), "dark\n").unwrap();
+
+        ensure_config_file_at(&path).unwrap();
+        let config = Config::from_toml(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.saved_theme(), Some("dark"));
+    }
+
+    #[test]
+    fn ensuring_the_config_file_leaves_an_existing_file_alone() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# exactly this\n").unwrap();
+
+        ensure_config_file_at(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# exactly this\n");
     }
 
     #[test]

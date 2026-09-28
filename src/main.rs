@@ -7,7 +7,8 @@ use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_m
 use de::backend::InlineBackend;
 use de::{
     App, Config, NavigationResult, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme,
-    render, render_theme_preview, resolve_start_path, save_defaults, save_theme, shell_init,
+    ensure_config_file, render, render_theme_preview, resolve_start_path, save_defaults,
+    save_theme, shell_init, theme_config_path,
 };
 use ratatui::Terminal;
 use ratatui::layout::Rect;
@@ -28,6 +29,7 @@ const PICKER_HELP: &str = "Picker controls:
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
 Run `de theme` to preview and save a color theme.
+Run `de config edit` to change settings in your editor.
 Run `de init --help` for shell setup.";
 
 const SHELL_SETUP_HELP: &str = "Setup examples:
@@ -90,6 +92,22 @@ enum CliCommand {
         #[command(subcommand)]
         command: Option<ThemeCommand>,
     },
+
+    /// Locate or edit config.toml
+    #[command(arg_required_else_help = true)]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the path to config.toml
+    Path,
+
+    /// Open config.toml in $VISUAL or $EDITOR, creating it if needed
+    Edit,
 }
 
 #[derive(Debug, Subcommand)]
@@ -151,6 +169,26 @@ fn run(cli: Cli) -> Result<(), String> {
                 "Created theme {name} in {}. Edit its colors, then run `de theme` to preview it.",
                 path.display()
             );
+        }
+        Some(CliCommand::Config {
+            command: ConfigCommand::Path,
+        }) => {
+            let path =
+                theme_config_path().map_err(|error| format!("cannot locate config: {error}"))?;
+            println!("{}", path.display());
+        }
+        Some(CliCommand::Config {
+            command: ConfigCommand::Edit,
+        }) => {
+            let path =
+                ensure_config_file().map_err(|error| format!("cannot create config: {error}"))?;
+            let status = editor_command(&path)?
+                .status()
+                .map_err(|error| format!("cannot start editor: {error}"))?;
+            if !status.success() {
+                return Err(format!("editor exited with {status}"));
+            }
+            Config::load().map_err(|error| format!("{} has an error: {error}", path.display()))?;
         }
         Some(CliCommand::Theme { command: None }) => {
             require_terminal()?;
@@ -422,6 +460,40 @@ fn save_current_defaults(app: &mut App) {
     }
 }
 
+/// Build the editor invocation from `$VISUAL`, then `$EDITOR`. On Unix the
+/// value runs through `sh`, like Git does, so editors with arguments such as
+/// `code --wait` work.
+fn editor_command(path: &Path) -> Result<Command, String> {
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(env::var_os)
+        .find(|value| !value.is_empty());
+
+    #[cfg(unix)]
+    {
+        let mut script = editor.unwrap_or_else(|| OsString::from("vi"));
+        script.push(" \"$@\"");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).arg("sh").arg(path);
+        Ok(command)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let editor = editor.ok_or("set VISUAL or EDITOR to choose an editor")?;
+        let editor = editor
+            .to_str()
+            .ok_or("VISUAL or EDITOR must be valid UTF-8")?;
+        let mut parts = editor.split_whitespace();
+        let program = parts
+            .next()
+            .ok_or("set VISUAL or EDITOR to choose an editor")?;
+        let mut command = Command::new(program);
+        command.args(parts).arg(path);
+        Ok(command)
+    }
+}
+
 fn open_with_default_app(path: &Path) -> io::Result<()> {
     let mut command = default_open_command(path)?;
     command
@@ -531,6 +603,30 @@ mod tests {
                 command: Some(ThemeCommand::Create { name })
             }) if name == "midnight"
         ));
+    }
+
+    #[test]
+    fn config_requires_a_subcommand() {
+        let cli = Cli::try_parse_from(["de", "config", "path"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Config {
+                command: ConfigCommand::Path
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["de", "config", "edit"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Config {
+                command: ConfigCommand::Edit
+            })
+        ));
+
+        assert_eq!(
+            Cli::try_parse_from(["de", "config"]).unwrap_err().kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     #[test]

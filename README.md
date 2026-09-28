@@ -116,13 +116,28 @@ are independent, so modification time can show either oldest or newest first.
 Directories remain grouped above files in every mode, and the selected sort
 carries into the preview pane and navigated directories.
 
+## Configuration
+
+Settings live in one `config.toml`. On both Linux and macOS it is
+`$XDG_CONFIG_HOME/de/config.toml`, or `~/.config/de/config.toml` when
+`XDG_CONFIG_HOME` is unset or not an absolute path. macOS does not use
+`~/Library/Application Support`.
+
+```sh
+de config path   # print the file's location
+de config edit   # open it in $VISUAL or $EDITOR, creating it if needed
+```
+
+`de config edit` falls back to `vi` when neither variable is set, and checks the
+file after the editor exits so a typo is reported immediately rather than on the
+next launch. The sections below describe what the file can contain.
+
 ## Defaults
 
 Hidden entries, sort criterion, and sort direction reset to their defaults each
 time `de` starts. To change what it starts with, set them up the way you like
-and press `w`. That writes them to the `[defaults]` table in `config.toml` (see
-[Themes](#themes) for where the file lives), leaving other settings and
-comments untouched. Toggling during a session never changes the saved defaults
+and press `w`. That writes them to the `[defaults]` table in `config.toml`,
+leaving other settings and comments untouched. Toggling during a session never changes the saved defaults
 on its own.
 
 You can also edit the table directly:
@@ -148,10 +163,7 @@ de theme
 
 Use `Left`/`Right` or `Up`/`Down` to preview `auto`, `light`, `dark`, `mono`,
 `ocean`, `forest`, `amber`, and `rose`. `Enter` saves the displayed theme;
-`Escape` cancels without changing the saved choice. On both Linux and macOS,
-settings live in `$XDG_CONFIG_HOME/de/config.toml`, or
-`~/.config/de/config.toml` when `XDG_CONFIG_HOME` is unset or not an absolute
-path. macOS does not use `~/Library/Application Support`.
+`Escape` cancels without changing the saved choice.
 
 For a one-time override, use `de --theme dark`. `DE_THEME=mono de` provides an
 environment-level override. Precedence is command-line flag, environment,
