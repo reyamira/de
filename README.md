@@ -126,9 +126,10 @@ de theme
 
 Use `Left`/`Right` or `Up`/`Down` to preview `auto`, `light`, `dark`, `mono`,
 `ocean`, `forest`, `amber`, and `rose`. `Enter` saves the displayed theme;
-`Escape` cancels without changing the saved choice. On Linux, settings live in
-`$XDG_CONFIG_HOME/de/config.toml`, or `~/.config/de/config.toml` when
-`XDG_CONFIG_HOME` is unset.
+`Escape` cancels without changing the saved choice. On both Linux and macOS,
+settings live in `$XDG_CONFIG_HOME/de/config.toml`, or
+`~/.config/de/config.toml` when `XDG_CONFIG_HOME` is unset or not an absolute
+path. macOS does not use `~/Library/Application Support`.
 
 For a one-time override, use `de --theme dark`. `DE_THEME=mono de` provides an
 environment-level override. Precedence is command-line flag, environment,
