@@ -6,9 +6,10 @@ use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use de::backend::InlineBackend;
 use de::{
-    App, Config, NavigationResult, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme,
-    ensure_config_file, render, render_theme_preview, resolve_start_path, save_defaults,
-    save_theme, shell_init, theme_config_path,
+    App, BrowseDefaults, CONFIG_PICKER_MIN_HEIGHT, Config, DisplaySettings, NavigationResult,
+    SettingsPicker, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme, ensure_config_file,
+    render, render_config_picker, render_theme_preview, resolve_start_path, save_defaults,
+    save_settings, save_theme, shell_init, theme_config_path,
 };
 use ratatui::Terminal;
 use ratatui::layout::Rect;
@@ -29,7 +30,7 @@ const PICKER_HELP: &str = "Picker controls:
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
 Run `de theme` to preview and save a color theme.
-Run `de config edit` to change settings in your editor.
+Run `de config` to change settings, or `de config edit` to open the file.
 Run `de init --help` for shell setup.";
 
 const SHELL_SETUP_HELP: &str = "Setup examples:
@@ -93,11 +94,10 @@ enum CliCommand {
         command: Option<ThemeCommand>,
     },
 
-    /// Locate or edit config.toml
-    #[command(arg_required_else_help = true)]
+    /// Change settings, or locate and edit config.toml
     Config {
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: Option<ConfigCommand>,
     },
 }
 
@@ -171,14 +171,31 @@ fn run(cli: Cli) -> Result<(), String> {
             );
         }
         Some(CliCommand::Config {
-            command: ConfigCommand::Path,
+            command: Some(ConfigCommand::Path),
         }) => {
             let path =
                 theme_config_path().map_err(|error| format!("cannot locate config: {error}"))?;
             println!("{}", path.display());
         }
+        Some(CliCommand::Config { command: None }) => {
+            require_terminal()?;
+            let catalog = Config::load().map_err(|error| format!("cannot load config: {error}"))?;
+            let start = resolve_start_path(None)
+                .map_err(|error| format!("cannot resolve current directory: {error}"))?;
+            let mut app = App::with_defaults(start, catalog.defaults())
+                .map_err(|error| format!("cannot open current directory: {error}"))?;
+            app.set_theme(resolve_theme(theme, &catalog)?);
+            app.set_display_settings(catalog.display().clone());
+            if let Some((defaults, display)) =
+                run_config_picker(app).map_err(|error| error.to_string())?
+            {
+                let path = save_settings(defaults, &display)
+                    .map_err(|error| format!("cannot save settings: {error}"))?;
+                eprintln!("Saved settings to {}", path.display());
+            }
+        }
         Some(CliCommand::Config {
-            command: ConfigCommand::Edit,
+            command: Some(ConfigCommand::Edit),
         }) => {
             let path =
                 ensure_config_file().map_err(|error| format!("cannot create config: {error}"))?;
@@ -272,28 +289,53 @@ enum PickerAction {
 }
 
 fn run_picker(app: App) -> io::Result<Option<PickerAction>> {
-    run_inline(app, render, |app, key, page_rows| {
-        match handle_key(app, key, page_rows) {
+    run_inline(
+        app,
+        (),
+        0,
+        |frame, app, ()| render(frame, app),
+        |app, (), key, page_rows| match handle_key(app, key, page_rows) {
             NavigationResult::Continue => InlineResult::Continue,
             NavigationResult::Accept(path) => {
                 InlineResult::Accept(PickerAction::ChangeDirectory(path))
             }
             NavigationResult::Open(path) => InlineResult::Accept(PickerAction::OpenFile(path)),
             NavigationResult::Cancel => InlineResult::Cancel,
-        }
-    })
+        },
+    )
 }
 
 fn run_theme_picker(app: App, catalog: &Config) -> io::Result<Option<Theme>> {
-    run_inline(app, render_theme_preview, |app, key, _| {
-        handle_theme_key(app, key, catalog)
-    })
+    run_inline(
+        app,
+        (),
+        0,
+        |frame, app, ()| render_theme_preview(frame, app),
+        |app, (), key, _| handle_theme_key(app, key, catalog),
+    )
 }
 
-fn run_inline<T>(
+/// Returns the chosen settings on `Enter`, for the caller to save.
+fn run_config_picker(app: App) -> io::Result<Option<(BrowseDefaults, DisplaySettings)>> {
+    let picker = SettingsPicker::new(app.display_settings());
+    run_inline(
+        app,
+        picker,
+        CONFIG_PICKER_MIN_HEIGHT,
+        render_config_picker,
+        |app, picker, key, _| handle_config_key(app, picker, key),
+    )
+}
+
+/// Drive an inline view. `state` is extra per-view data shared by `draw` and
+/// `handle`; `min_height` keeps views whose content is not the entry list
+/// from being sized to a short directory.
+fn run_inline<S, T>(
     mut app: App,
-    mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App),
-    mut handle: impl FnMut(&mut App, KeyEvent, usize) -> InlineResult<T>,
+    mut state: S,
+    min_height: u16,
+    mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App, &S),
+    mut handle: impl FnMut(&mut App, &mut S, KeyEvent, usize) -> InlineResult<T>,
 ) -> io::Result<Option<T>> {
     enable_raw_mode()?;
     let mut raw_mode = RawModeGuard {
@@ -302,23 +344,28 @@ fn run_inline<T>(
     execute!(io::stderr(), cursor::Hide)?;
 
     let (mut terminal_width, mut terminal_height) = terminal::size()?;
-    let mut viewport_height = desired_viewport_height(&app, terminal_width, terminal_height);
+    let mut viewport_height =
+        desired_viewport_height(&app, terminal_width, terminal_height, min_height);
     let backend = InlineBackend::new(io::stderr(), terminal_width, viewport_height)?;
     raw_mode.viewport_active = true;
     let mut terminal = Terminal::new(backend)?;
 
     let outcome: io::Result<Option<T>> = (|| {
         loop {
-            terminal.draw(|frame| draw(frame, &app))?;
+            terminal.draw(|frame| draw(frame, &app, &state))?;
             match event::read()? {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
                     let page_rows = visible_entry_rows(&app, terminal_width, viewport_height);
-                    match handle(&mut app, key, page_rows) {
+                    match handle(&mut app, &mut state, key, page_rows) {
                         InlineResult::Continue => {
-                            let desired =
-                                desired_viewport_height(&app, terminal_width, terminal_height);
+                            let desired = desired_viewport_height(
+                                &app,
+                                terminal_width,
+                                terminal_height,
+                                min_height,
+                            );
                             if desired != viewport_height {
                                 terminal
                                     .backend_mut()
@@ -335,7 +382,7 @@ fn run_inline<T>(
                     terminal_width = width;
                     terminal_height = height;
                     viewport_height =
-                        desired_viewport_height(&app, terminal_width, terminal_height);
+                        desired_viewport_height(&app, terminal_width, terminal_height, min_height);
                     terminal
                         .backend_mut()
                         .resize_viewport(width, viewport_height)?;
@@ -350,6 +397,29 @@ fn run_inline<T>(
     drop(terminal);
     cleanup?;
     outcome
+}
+
+fn handle_config_key(
+    app: &mut App,
+    picker: &mut SettingsPicker,
+    key: KeyEvent,
+) -> InlineResult<(BrowseDefaults, DisplaySettings)> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return InlineResult::Cancel;
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => picker.move_down(),
+        KeyCode::Left | KeyCode::Char('h') => picker.change(app, false),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => picker.change(app, true),
+        KeyCode::Enter => {
+            return InlineResult::Accept((app.browse_defaults(), app.display_settings().clone()));
+        }
+        KeyCode::Esc | KeyCode::Char('q') => return InlineResult::Cancel,
+        _ => {}
+    }
+    InlineResult::Continue
 }
 
 fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &Config) -> InlineResult<Theme> {
@@ -371,7 +441,12 @@ fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &Config) -> InlineRes
     InlineResult::Continue
 }
 
-fn desired_viewport_height(app: &App, terminal_width: u16, terminal_height: u16) -> u16 {
+fn desired_viewport_height(
+    app: &App,
+    terminal_width: u16,
+    terminal_height: u16,
+    min_height: u16,
+) -> u16 {
     let status_row = usize::from(app.status().is_some());
     let current_rows = app.entries().len().saturating_add(status_row);
     let body_rows = if terminal_width >= TWO_PANE_MIN_WIDTH {
@@ -387,7 +462,8 @@ fn desired_viewport_height(app: &App, terminal_width: u16, terminal_height: u16)
     let content_height = body_rows.saturating_add(2);
     let content_height = u16::try_from(content_height)
         .unwrap_or(u16::MAX)
-        .clamp(3, 14);
+        .clamp(3, 14)
+        .max(min_height);
     content_height.min(terminal_height.saturating_sub(1).max(1))
 }
 
@@ -606,12 +682,12 @@ mod tests {
     }
 
     #[test]
-    fn config_requires_a_subcommand() {
+    fn parses_config_and_its_subcommands() {
         let cli = Cli::try_parse_from(["de", "config", "path"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(CliCommand::Config {
-                command: ConfigCommand::Path
+                command: Some(ConfigCommand::Path)
             })
         ));
 
@@ -619,14 +695,15 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(CliCommand::Config {
-                command: ConfigCommand::Edit
+                command: Some(ConfigCommand::Edit)
             })
         ));
 
-        assert_eq!(
-            Cli::try_parse_from(["de", "config"]).unwrap_err().kind(),
-            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        );
+        let cli = Cli::try_parse_from(["de", "config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Config { command: None })
+        ));
     }
 
     #[test]

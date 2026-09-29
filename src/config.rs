@@ -30,6 +30,9 @@ pub struct DisplaySettings {
     date_format: DateFormat,
     time_format: TimeFormat,
     timezone: Timezone,
+    /// A valid `custom_format` from the file, kept even while another date
+    /// format is selected so the settings picker can switch back to it.
+    custom_format: Option<String>,
 }
 
 impl Default for DisplaySettings {
@@ -39,6 +42,7 @@ impl Default for DisplaySettings {
             date_format: DateFormat::Iso,
             time_format: TimeFormat::TwentyFourHour,
             timezone: Timezone::Local,
+            custom_format: None,
         }
     }
 }
@@ -91,11 +95,21 @@ impl DisplaySettings {
             }
         };
 
+        let custom_format = match &date_format {
+            DateFormat::Custom(format) => Some(format.clone()),
+            _ => table
+                .get("custom_format")
+                .and_then(TomlItem::as_str)
+                .filter(|format| validate_custom_format(format).is_ok())
+                .map(str::to_owned),
+        };
+
         Ok(Self {
             modified,
             date_format,
             time_format,
             timezone,
+            custom_format,
         })
     }
 
@@ -113,6 +127,86 @@ impl DisplaySettings {
 
     pub const fn timezone(&self) -> Timezone {
         self.timezone
+    }
+
+    pub fn custom_format(&self) -> Option<&str> {
+        self.custom_format.as_deref()
+    }
+
+    pub fn set_shows_modified(&mut self, modified: bool) {
+        self.modified = modified;
+    }
+
+    pub fn set_date_format(&mut self, date_format: DateFormat) {
+        if let DateFormat::Custom(format) = &date_format {
+            self.custom_format = Some(format.clone());
+        }
+        self.date_format = date_format;
+    }
+
+    pub fn set_time_format(&mut self, time_format: TimeFormat) {
+        self.time_format = time_format;
+    }
+
+    pub fn set_timezone(&mut self, timezone: Timezone) {
+        self.timezone = timezone;
+    }
+
+    /// Write these values into `[display]`, keeping any other keys and comments.
+    /// A custom date format keeps the file's `custom_format`, which is only
+    /// added when missing.
+    pub(crate) fn write_to(&self, document: &mut DocumentMut) -> io::Result<()> {
+        let table = section_mut(document, "display")?;
+        set_value(table, "modified", self.modified);
+        set_value(table, "date_format", date_format_name(&self.date_format));
+        set_value(table, "time_format", time_format_name(self.time_format));
+        set_value(table, "timezone", timezone_name(self.timezone));
+        if let DateFormat::Custom(format) = &self.date_format
+            && !table.contains_key("custom_format")
+        {
+            set_value(table, "custom_format", format.as_str());
+        }
+        Ok(())
+    }
+}
+
+/// The spellings used in config.toml, shared by parsing errors, saving, and
+/// the settings picker.
+pub const fn date_format_name(format: &DateFormat) -> &'static str {
+    match format {
+        DateFormat::Iso => "iso",
+        DateFormat::Us => "us",
+        DateFormat::European => "european",
+        DateFormat::Relative => "relative",
+        DateFormat::Custom(_) => "custom",
+    }
+}
+
+pub const fn time_format_name(format: TimeFormat) -> &'static str {
+    match format {
+        TimeFormat::TwelveHour => "12h",
+        TimeFormat::TwentyFourHour => "24h",
+    }
+}
+
+pub const fn timezone_name(timezone: Timezone) -> &'static str {
+    match timezone {
+        Timezone::Local => "local",
+        Timezone::Utc => "utc",
+    }
+}
+
+pub const fn sort_mode_name(mode: SortMode) -> &'static str {
+    match mode {
+        SortMode::Name => "name",
+        SortMode::Modified => "modified",
+    }
+}
+
+pub const fn sort_direction_name(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "ascending",
+        SortDirection::Descending => "descending",
     }
 }
 
@@ -173,22 +267,31 @@ impl BrowseDefaults {
 
     /// Write these values into `[defaults]`, keeping any other keys and comments.
     pub(crate) fn write_to(self, document: &mut DocumentMut) -> io::Result<()> {
-        if !document.contains_key("defaults") {
-            document["defaults"] = TomlItem::Table(Table::new());
-        }
-        let table = document["defaults"]
-            .as_table_mut()
-            .ok_or_else(|| invalid_data("defaults must be a table"))?;
-        table["hidden"] = value(self.show_hidden);
-        table["sort"] = value(match self.sort_mode {
-            SortMode::Name => "name",
-            SortMode::Modified => "modified",
-        });
-        table["order"] = value(match self.sort_direction {
-            SortDirection::Ascending => "ascending",
-            SortDirection::Descending => "descending",
-        });
+        let table = section_mut(document, "defaults")?;
+        set_value(table, "hidden", self.show_hidden);
+        set_value(table, "sort", sort_mode_name(self.sort_mode));
+        set_value(table, "order", sort_direction_name(self.sort_direction));
         Ok(())
+    }
+}
+
+fn section_mut<'a>(document: &'a mut DocumentMut, name: &str) -> io::Result<&'a mut Table> {
+    if !document.contains_key(name) {
+        document[name] = TomlItem::Table(Table::new());
+    }
+    document[name]
+        .as_table_mut()
+        .ok_or_else(|| invalid_data(format!("{name} must be a table")))
+}
+
+/// Replace a value while keeping any comment written beside it.
+fn set_value(table: &mut Table, key: &str, new: impl Into<toml_edit::Value>) {
+    let mut new = new.into();
+    if let Some(existing) = table.get_mut(key).and_then(TomlItem::as_value_mut) {
+        *new.decor_mut() = existing.decor().clone();
+        *existing = new;
+    } else {
+        table[key] = value(new);
     }
 }
 
@@ -335,6 +438,37 @@ mod tests {
         assert!(contents.contains("# mine"));
         assert!(contents.contains("# keep"));
         assert_eq!(parse_defaults(&contents).unwrap(), defaults);
+    }
+
+    #[test]
+    fn written_display_settings_parse_back_and_keep_custom_format_and_comments() {
+        let mut document = "[display]\ndate_format = \"custom\" # mine\ncustom_format = \"%Y\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut settings = parse(&document.to_string()).unwrap();
+        settings.set_date_format(DateFormat::Relative);
+        settings.set_time_format(TimeFormat::TwelveHour);
+        settings.set_timezone(Timezone::Utc);
+        settings.set_shows_modified(false);
+        settings.write_to(&mut document).unwrap();
+
+        let contents = document.to_string();
+        assert!(
+            contents.contains("date_format = \"relative\" # mine"),
+            "{contents}"
+        );
+        assert!(contents.contains("custom_format = \"%Y\""));
+        assert_eq!(parse(&contents).unwrap(), settings);
+    }
+
+    #[test]
+    fn keeps_a_valid_custom_format_while_another_format_is_selected() {
+        let settings = parse("[display]\ndate_format = \"iso\"\ncustom_format = \"%Y\"\n").unwrap();
+        assert_eq!(settings.date_format(), &DateFormat::Iso);
+        assert_eq!(settings.custom_format(), Some("%Y"));
+
+        let invalid = parse("[display]\ndate_format = \"iso\"\ncustom_format = \"%Q\"\n").unwrap();
+        assert_eq!(invalid.custom_format(), None);
     }
 
     #[test]

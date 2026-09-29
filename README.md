@@ -124,9 +124,19 @@ Settings live in one `config.toml`. On both Linux and macOS it is
 `~/Library/Application Support`.
 
 ```sh
+de config        # change settings with a live preview
 de config path   # print the file's location
 de config edit   # open it in $VISUAL or $EDITOR, creating it if needed
 ```
+
+`de config` lists hidden entries, sort, order, the modified column, date format,
+time format, and timezone beside the current directory, rendered with those
+settings as you change them. Use `Up`/`Down` to pick a setting and
+`Left`/`Right` to change it. `Enter` saves every setting shown, leaving other
+settings and comments untouched; `Escape` cancels without writing anything.
+A `custom_format` can only be written in the file itself, but once it exists
+the picker offers `custom` as a date format and never removes it. Themes are
+chosen with `de theme`.
 
 `de config edit` falls back to `vi` when neither variable is set, and checks the
 file after the editor exits so a typo is reported immediately rather than on the

@@ -1,16 +1,21 @@
 mod app;
 pub mod backend;
 mod config;
+mod settings;
 mod theme;
 mod ui;
 
 pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode};
 pub use config::{BrowseDefaults, DateFormat, DisplaySettings, TimeFormat, Timezone};
+pub use settings::{Setting, SettingsPicker};
 pub use theme::{
     Config, Palette, THEME_ENV, Theme, create_custom_theme, ensure_config_file, save_defaults,
-    save_theme, theme_config_path,
+    save_settings, save_theme, theme_config_path,
 };
-pub use ui::{TWO_PANE_MIN_WIDTH, render, render_theme_preview};
+pub use ui::{
+    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, render, render_config_picker,
+    render_theme_preview,
+};
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

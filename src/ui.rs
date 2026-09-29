@@ -1,4 +1,6 @@
-use crate::{App, DateFormat, DisplaySettings, Entry, Palette, TimeFormat, Timezone};
+use crate::{
+    App, DateFormat, DisplaySettings, Entry, Palette, Setting, SettingsPicker, TimeFormat, Timezone,
+};
 use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -9,6 +11,10 @@ use std::time::SystemTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const TWO_PANE_MIN_WIDTH: u16 = 58;
+/// Header, settings heading, one row per setting, and footer.
+pub const CONFIG_PICKER_MIN_HEIGHT: u16 = Setting::ALL.len() as u16 + 3;
+const SETTINGS_PANE_WIDTH: u16 = 30;
+const CONFIG_PREVIEW_MIN_WIDTH: u16 = 24;
 
 const MODIFIED_COLUMN_GAP: usize = 2;
 const MIN_NAME_COLUMN_WIDTH: usize = 12;
@@ -18,6 +24,98 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 
 pub fn render_theme_preview(frame: &mut Frame<'_>, app: &App) {
     render_picker(frame, app, true);
+}
+
+/// The `de config` picker: settings on the left, and the current directory
+/// rendered with those settings on the right when there is room.
+pub fn render_config_picker(frame: &mut Frame<'_>, app: &App, picker: &SettingsPicker) {
+    let area = frame.area();
+    let palette = app.theme().palette();
+    frame.render_widget(Clear, area);
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    render_header(frame, app, header, &palette, " de config ");
+    if area.width >= SETTINGS_PANE_WIDTH + 1 + CONFIG_PREVIEW_MIN_WIDTH {
+        let [left, divider, right] = Layout::horizontal([
+            Constraint::Length(SETTINGS_PANE_WIDTH),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        render_settings(frame, app, picker, left, &palette);
+        let divider_lines = (0..divider.height)
+            .map(|_| Line::styled("│", muted_style(&palette)))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(divider_lines), divider);
+        render_current_entries(frame, app, right, true, &palette, SystemTime::now());
+    } else {
+        render_settings(frame, app, picker, body, &palette);
+    }
+    render_config_footer(frame, footer, &palette);
+}
+
+fn render_settings(
+    frame: &mut Frame<'_>,
+    app: &App,
+    picker: &SettingsPicker,
+    area: Rect,
+    palette: &Palette,
+) {
+    let width = area.width as usize;
+    let mut lines = vec![Line::styled(
+        fill_row("", " settings", width),
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    )];
+    for setting in Setting::ALL {
+        let value = SettingsPicker::value(setting, app);
+        let line = if setting == picker.selected() {
+            Line::styled(
+                fill_row("› ", &format!("{:<12}‹ {value} ›", setting.label()), width),
+                emphasis_style(palette),
+            )
+        } else {
+            Line::from(vec![
+                Span::styled(format!("  {:<12}", setting.label()), muted_style(palette)),
+                Span::styled(format!("  {value}"), Style::default().fg(palette.text)),
+            ])
+        };
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_config_footer(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
+    let line = if area.width >= 48 {
+        Line::from(vec![
+            key(" ↑↓", palette),
+            hint(" setting  ", palette),
+            key("←→", palette),
+            hint(" change  ", palette),
+            key("enter", palette),
+            hint(" save  ", palette),
+            key("esc", palette),
+            hint(" cancel", palette),
+        ])
+    } else {
+        Line::from(vec![
+            key(" ↑↓ ←→", palette),
+            key("  ↵", palette),
+            hint(" save  ", palette),
+            key("esc", palette),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
@@ -52,7 +150,8 @@ fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
     ])
     .areas(area);
 
-    render_header(frame, app, header, &palette, theme_preview);
+    let badge = if theme_preview { " de theme " } else { " de " };
+    render_header(frame, app, header, &palette, badge);
     if area.width >= TWO_PANE_MIN_WIDTH {
         render_two_panes(frame, app, body, &palette, now);
     } else {
@@ -65,14 +164,7 @@ fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
     }
 }
 
-fn render_header(
-    frame: &mut Frame<'_>,
-    app: &App,
-    area: Rect,
-    palette: &Palette,
-    theme_preview: bool,
-) {
-    let badge = if theme_preview { " de theme " } else { " de " };
+fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette, badge: &str) {
     let badge_width = UnicodeWidthStr::width(badge);
     let path_width = (area.width as usize).saturating_sub(badge_width + 1);
     let path = shorten_left(&app.current_dir().to_string_lossy(), path_width);

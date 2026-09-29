@@ -226,6 +226,24 @@ pub fn save_defaults(defaults: BrowseDefaults) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Save everything the `de config` picker edits in one write.
+pub fn save_settings(defaults: BrowseDefaults, display: &DisplaySettings) -> io::Result<PathBuf> {
+    let path = theme_config_path()?;
+    save_settings_at(&path, defaults, display)?;
+    Ok(path)
+}
+
+fn save_settings_at(
+    path: &Path,
+    defaults: BrowseDefaults,
+    display: &DisplaySettings,
+) -> io::Result<()> {
+    let mut document = read_document_or_new(path)?;
+    defaults.write_to(&mut document)?;
+    display.write_to(&mut document)?;
+    write_document(path, &document)
+}
+
 fn save_defaults_at(path: &Path, defaults: BrowseDefaults) -> io::Result<()> {
     let mut document = read_document_or_new(path)?;
     defaults.write_to(&mut document)?;
@@ -807,6 +825,38 @@ dim_muted = true
 
         ensure_config_file_at(&path).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "# exactly this\n");
+    }
+
+    #[test]
+    fn saving_settings_writes_both_tables_and_keeps_the_rest() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("de/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# mine\ntheme = \"ocean\"\n\n[display]\ndate_format = \"custom\"\ncustom_format = \"%Y\"\n",
+        )
+        .unwrap();
+
+        let defaults = BrowseDefaults {
+            show_hidden: true,
+            ..BrowseDefaults::default()
+        };
+        let mut display = Config::from_toml(&fs::read_to_string(&path).unwrap())
+            .unwrap()
+            .display()
+            .clone();
+        display.set_date_format(crate::DateFormat::Us);
+        save_settings_at(&path, defaults, &display).unwrap();
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# mine"));
+        assert!(saved.contains("custom_format = \"%Y\""));
+        let config = Config::from_toml(&saved).unwrap();
+        assert_eq!(config.saved_theme(), Some("ocean"));
+        assert_eq!(config.defaults(), defaults);
+        assert_eq!(config.display(), &display);
+        assert_eq!(config.display().custom_format(), Some("%Y"));
     }
 
     #[test]
