@@ -6,15 +6,14 @@ directory only when you confirm.
 
 ![Navigating directories with de](demo/de.gif)
 
-At normal terminal widths, the left pane is the directory you are currently
-exploring and the right pane previews the highlighted destination. Below 58
-columns, `de` collapses to a single pane instead of squeezing the listings.
-Each pane shows local modification times when it is wide enough to keep the
-entry names readable.
+At normal terminal widths, the left pane lists the current directory. The right
+pane previews the highlighted directory or file. Below 58 columns, `de` shows
+one pane. Press `v` on a file to use the full-width inline viewer at any width.
+Directory listings show modification times when enough space is available.
 
-It is intentionally not a full file manager. Files stay visually secondary to
-directories, but `o` can hand the highlighted file to its default application.
-There are no delete, rename, copy, or built-in edit commands.
+It is intentionally not a full file manager. Press `o` to open the highlighted
+file in its default application. There are no delete, rename, copy, or built-in
+edit commands.
 
 ## Install
 
@@ -90,6 +89,8 @@ asks the parent shell to `cd` there.
 | `/` | Filter entries in the current directory |
 | `s` | Toggle sorting by name or modification time |
 | `Shift+S` | Toggle ascending or descending order |
+| `v` | View the highlighted file inline |
+| `m` (Markdown viewer) | Toggle source and rendered Markdown |
 | `o` | Open the highlighted file with its default application |
 | `Enter` | Change to the directory currently displayed |
 | `.` | Toggle hidden entries |
@@ -105,6 +106,44 @@ Press `o` on a file to open it with the operating system's default application.
 On Linux, `de` uses `xdg-open`; on macOS, it uses `open`. Opening a file exits
 the picker without changing the shell's working directory. Directories continue
 to use the navigation controls above.
+
+### File previews
+
+The right pane and inline viewer support these file types:
+
+- **Markdown:** Rendered headings, lists, emphasis, links, and code blocks.
+  Paragraphs reflow to the available width. Explicit line breaks and code lines
+  keep their line breaks.
+- **JSON:** Formatted, colorized text that preserves key order and number text.
+  Invalid JSON remains readable with an error notice.
+- **Plain text:** UTF-8 text with terminal control characters replaced.
+- **Images:** PNG, JPEG, GIF, WebP, and BMP in Kitty or Ghostty.
+  Animated images show their first frame.
+
+The full-width viewer has a thin border around its contents. Text and images
+use the space inside that border, including after a terminal resize.
+
+In the viewer, use arrows or `j`/`k` to scroll. Use `PageUp`/`PageDown` for pages
+and `Home`/`End` for the beginning or end. For Markdown, press `m` to switch
+between rendered text and source. The header shows the current mode. Press
+`Escape` or `q` to return to the same selection. Press `o` to open the file
+externally. During filter input, `v` and `m` remain query text.
+
+Image previews require the Kitty graphics protocol. They are unavailable in
+other terminals and inside tmux, GNU Screen, or Zellij. When `de` cannot show a
+file, it explains the reason and shows the external-open option. Video playback
+remains external.
+
+Text previews accept regular UTF-8 files up to 1 MiB and show at most 20,000
+lines. Image previews accept files up to 16 MiB and 16,777,216 pixels, with each
+dimension at most 16,384 pixels. Images use EXIF orientation and scale to at
+most 2,048 pixels per side before terminal transfer. Press `r` in the picker to
+reload a changed file.
+
+Image preparation runs in a background worker. A loading message appears while
+the image is prepared, and navigation remains available. New selections replace
+queued work, and results from old selections do not replace the current preview.
+The viewer sends compressed image data in bounded batches between input checks.
 
 Filtering uses a case-insensitive substring match. Type after pressing `/`, use
 the normal arrow and page keys to move through matches, and press `Backspace` to

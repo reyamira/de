@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::time::SystemTime;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -124,6 +124,11 @@ fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
     let now = SystemTime::now();
     frame.render_widget(Clear, area);
 
+    if app.is_viewing() && !theme_preview {
+        render_viewer(frame, app, area, &palette);
+        return;
+    }
+
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -190,12 +195,7 @@ fn render_two_panes(
     palette: &Palette,
     now: SystemTime,
 ) {
-    let [left, divider, right] = Layout::horizontal([
-        Constraint::Percentage(44),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    let [left, divider, right] = picker_panes(area);
 
     render_current_entries(frame, app, left, true, palette, now);
     let divider_lines = (0..divider.height)
@@ -306,32 +306,403 @@ fn render_preview(
         title,
     );
 
-    let mut lines = Vec::with_capacity(list.height as usize);
-    if let Some(message) = app.preview().message() {
-        lines.push(Line::styled(
-            shorten_right(&format!("  {message}"), list.width as usize),
-            muted_style(palette),
-        ));
+    if app.preview().document().is_some() || app.preview().message().is_some() {
+        let (lines, _) =
+            preview_text_lines(app, list.width, palette, 0, list.height as usize, false);
+        frame.render_widget(Paragraph::new(lines), list);
+        return;
     }
-    for entry in app
+    let lines = app
         .preview()
         .entries()
         .iter()
-        .take((list.height as usize).saturating_sub(lines.len()))
-    {
-        lines.push(Line::styled(
-            entry_row(
-                "  ",
-                entry,
-                list.width as usize,
-                modified_width,
-                app.display_settings(),
-                now,
-            ),
-            entry_style(entry, palette),
-        ));
-    }
+        .take(list.height as usize)
+        .map(|entry| {
+            Line::styled(
+                entry_row(
+                    "  ",
+                    entry,
+                    list.width as usize,
+                    modified_width,
+                    app.display_settings(),
+                    now,
+                ),
+                entry_style(entry, palette),
+            )
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), list);
+}
+
+fn picker_panes(area: Rect) -> [Rect; 3] {
+    Layout::horizontal([
+        Constraint::Percentage(44),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area)
+}
+
+fn viewer_outer(area: Rect) -> Rect {
+    if area.height < 3 {
+        area
+    } else {
+        let [_, body, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        body
+    }
+}
+
+fn viewer_body(area: Rect) -> Rect {
+    viewer_inner(viewer_outer(area))
+}
+
+fn viewer_inner(outer: Rect) -> Rect {
+    if outer.width >= 3 && outer.height >= 3 {
+        Rect::new(outer.x + 1, outer.y + 1, outer.width - 2, outer.height - 2)
+    } else {
+        outer
+    }
+}
+
+/// Number of text rows available to a full-width viewer.
+pub fn viewer_page_rows(area: Rect) -> usize {
+    viewer_body(area).height as usize
+}
+
+/// The image rectangle is derived from the same layout used by the renderer.
+pub fn preview_image_area(app: &App, area: Rect) -> Option<Rect> {
+    app.preview().image()?;
+    let image_area = if app.is_viewing() {
+        viewer_body(area)
+    } else {
+        if area.height < 3 || area.width < TWO_PANE_MIN_WIDTH {
+            return None;
+        }
+        let [_, body, _] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        let [_, _, right] = picker_panes(body);
+        let [_, content] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(right);
+        content
+    };
+    (image_area.width > 0 && image_area.height > 0).then_some(image_area)
+}
+
+fn preview_text_lines(
+    app: &App,
+    width: u16,
+    palette: &Palette,
+    offset: usize,
+    limit: usize,
+    count_all: bool,
+) -> (Vec<Line<'static>>, usize) {
+    if width == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut notices = Vec::new();
+    if let Some(message) = app.preview().message() {
+        notices.push(Line::styled(message.to_owned(), muted_style(palette)));
+    }
+    if let Some(notice) = app
+        .preview()
+        .document()
+        .and_then(|document| document.notice.as_ref())
+    {
+        notices.push(Line::styled(notice.clone(), muted_style(palette)));
+    }
+    let document_lines = app
+        .preview()
+        .document()
+        .map(|document| {
+            if app.is_viewing() && app.is_markdown_source() {
+                document.source_lines.as_deref().unwrap_or(&document.lines)
+            } else {
+                document.lines.as_slice()
+            }
+        })
+        .unwrap_or(&[]);
+    wrap_text_lines(
+        notices.iter().chain(document_lines.iter()),
+        width,
+        offset,
+        limit,
+        count_all,
+    )
+}
+
+// Keep only the current word and whitespace in memory, and stop after the
+// visible rows unless the caller needs a complete count.
+fn wrap_text_lines<'a>(
+    lines: impl Iterator<Item = &'a Line<'static>>,
+    width: u16,
+    offset: usize,
+    limit: usize,
+    count_all: bool,
+) -> (Vec<Line<'static>>, usize) {
+    if width == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut rows = WrappedRows {
+        width: width as usize,
+        offset,
+        end: offset.saturating_add(limit),
+        count_all,
+        count: 0,
+        used: 0,
+        spans: Vec::new(),
+        result: Vec::new(),
+    };
+    for line in lines {
+        let mut word = Vec::new();
+        let mut word_width = 0;
+        let mut spaces = Vec::new();
+        let mut space_width = 0;
+        let mut has_word = false;
+        for grapheme in line.styled_graphemes(line.style) {
+            let cells = UnicodeWidthStr::width(grapheme.symbol);
+            if cells > rows.width {
+                continue;
+            }
+            if grapheme.symbol.chars().all(char::is_whitespace) {
+                if !word.is_empty() {
+                    rows.word(&mut word, word_width, &mut spaces, space_width, has_word);
+                    word_width = 0;
+                    space_width = 0;
+                    has_word = true;
+                }
+                if rows.finished() {
+                    return (rows.result, rows.count);
+                }
+                if space_width + cells > rows.width {
+                    if has_word {
+                        continue;
+                    }
+                    rows.append(&mut spaces);
+                    space_width = 0;
+                }
+                spaces.push(grapheme);
+                space_width += cells;
+            } else {
+                if word_width + cells > rows.width {
+                    rows.word(&mut word, word_width, &mut spaces, space_width, has_word);
+                    word_width = 0;
+                    space_width = 0;
+                    has_word = true;
+                    if rows.finished() {
+                        return (rows.result, rows.count);
+                    }
+                }
+                word.push(grapheme);
+                word_width += cells;
+            }
+        }
+        if !word.is_empty() {
+            rows.word(&mut word, word_width, &mut spaces, space_width, has_word);
+        }
+        if has_word {
+            let mut remaining = rows.width.saturating_sub(rows.used);
+            let fitting = spaces
+                .iter()
+                .take_while(|grapheme| {
+                    let cells = UnicodeWidthStr::width(grapheme.symbol);
+                    if cells > remaining {
+                        false
+                    } else {
+                        remaining -= cells;
+                        true
+                    }
+                })
+                .count();
+            spaces.truncate(fitting);
+        }
+        rows.append(&mut spaces);
+        rows.emit();
+        if rows.finished() {
+            break;
+        }
+    }
+    (rows.result, rows.count)
+}
+
+struct WrappedRows {
+    width: usize,
+    offset: usize,
+    end: usize,
+    count_all: bool,
+    count: usize,
+    used: usize,
+    spans: Vec<Span<'static>>,
+    result: Vec<Line<'static>>,
+}
+
+impl WrappedRows {
+    fn finished(&self) -> bool {
+        !self.count_all && self.count >= self.end
+    }
+
+    fn emit(&mut self) {
+        if self.count >= self.offset && self.count < self.end {
+            self.result
+                .push(Line::from(std::mem::take(&mut self.spans)));
+        } else {
+            self.spans.clear();
+        }
+        self.count += 1;
+        self.used = 0;
+    }
+
+    fn append(&mut self, graphemes: &mut Vec<ratatui::text::StyledGrapheme<'_>>) {
+        for grapheme in graphemes.drain(..) {
+            let cells = UnicodeWidthStr::width(grapheme.symbol);
+            if self.used > 0 && self.used + cells > self.width {
+                self.emit();
+            }
+            if self.count >= self.offset && self.count < self.end {
+                if let Some(last) = self
+                    .spans
+                    .last_mut()
+                    .filter(|last| last.style == grapheme.style)
+                {
+                    last.content.to_mut().push_str(grapheme.symbol);
+                } else {
+                    self.spans
+                        .push(Span::styled(grapheme.symbol.to_owned(), grapheme.style));
+                }
+            }
+            self.used += cells;
+        }
+    }
+
+    fn word(
+        &mut self,
+        word: &mut Vec<ratatui::text::StyledGrapheme<'_>>,
+        word_width: usize,
+        spaces: &mut Vec<ratatui::text::StyledGrapheme<'_>>,
+        space_width: usize,
+        has_word: bool,
+    ) {
+        if has_word && self.used > 0 && self.used + space_width + word_width > self.width {
+            self.emit();
+            spaces.clear();
+        } else {
+            self.append(spaces);
+        }
+        self.append(word);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ViewerText {
+    width: u16,
+    source: bool,
+    rows: Vec<Line<'static>>,
+}
+
+fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Ref<'a, ViewerText> {
+    let source = app.is_viewing() && app.is_markdown_source();
+    let cache = app.viewer_text_cache();
+    let needs_rebuild = cache
+        .borrow()
+        .as_ref()
+        .is_none_or(|text| text.width != width || text.source != source);
+    if needs_rebuild {
+        let (rows, _) = preview_text_lines(app, width, palette, 0, usize::MAX, true);
+        *cache.borrow_mut() = Some(ViewerText {
+            width,
+            source,
+            rows,
+        });
+    }
+    std::cell::Ref::map(cache.borrow(), |cache| cache.as_ref().unwrap())
+}
+
+pub fn viewer_scroll_max(app: &App, area: Rect) -> usize {
+    let body = viewer_body(area);
+    viewer_text(app, body.width, &app.theme().palette())
+        .rows
+        .len()
+        .saturating_sub(body.height as usize)
+}
+
+fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let outer = viewer_outer(area);
+    let body = viewer_inner(outer);
+    if body != outer {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(muted_style(palette)),
+            outer,
+        );
+    }
+    let markdown = app
+        .preview()
+        .document()
+        .is_some_and(|document| document.source_lines.is_some());
+    if area.height >= 3 {
+        let [header, _, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        let heading = if markdown {
+            let mode = if app.is_markdown_source() {
+                "source"
+            } else {
+                "rendered"
+            };
+            format!(" {mode} · {}", app.preview().label())
+        } else {
+            format!(" view · {}", app.preview().label())
+        };
+        frame.render_widget(
+            Paragraph::new(shorten_right(&heading, header.width as usize)).style(
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            header,
+        );
+        frame.render_widget(
+            Paragraph::new(if markdown && footer.width >= 64 {
+                " m source/rendered  q/esc back  ↑↓/jk scroll  pg↑↓ page  o open"
+            } else if markdown && footer.width >= 32 {
+                " m mode  q/esc back  ↑↓  o open"
+            } else if markdown {
+                "m mode  q back  ↑↓  o"
+            } else if footer.width >= 55 {
+                " q/esc back  ↑↓/jk scroll  pg↑↓ page  home/end  o open"
+            } else if footer.width >= 30 {
+                " q/esc back  ↑↓ scroll  o open"
+            } else {
+                " q back  ↑↓  o open"
+            })
+            .style(muted_style(palette)),
+            footer,
+        );
+    }
+    let cached = viewer_text(app, body.width, palette);
+    let lines = cached
+        .rows
+        .iter()
+        .skip(app.viewer_scroll())
+        .take(body.height as usize)
+        .cloned()
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
@@ -360,11 +731,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
     let hidden = if app.show_hidden() { "on" } else { "off" };
     let sort = app.sort_mode().label();
     let direction = app.sort_direction().symbol();
-    let line = if area.width >= 94 {
+    let line = if area.width >= 99 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint(" select  ", palette),
-            key("pgup/dn", palette),
+            key("pg↑↓", palette),
             hint(" jump  ", palette),
             key("→", palette),
             hint(" folder  ", palette),
@@ -372,6 +743,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             hint(" parent  ", palette),
             key("/", palette),
             hint(" find  ", palette),
+            key("v", palette),
+            hint(" view  ", palette),
             key("o", palette),
             hint(" open  ", palette),
             key("↵", palette),
@@ -381,11 +754,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             key(".", palette),
             hint(format!(" hidden:{hidden}"), palette),
         ])
-    } else if area.width >= 80 {
+    } else if area.width >= 85 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint(" select  ", palette),
-            key("pgup/dn", palette),
+            key("pg↑↓", palette),
             hint(" jump  ", palette),
             key("→", palette),
             hint(" folder  ", palette),
@@ -393,6 +766,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             hint(" parent  ", palette),
             key("/", palette),
             hint(" find  ", palette),
+            key("v", palette),
+            hint(" view  ", palette),
             key("o", palette),
             hint(" open  ", palette),
             key("↵", palette),
@@ -400,7 +775,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             key("s", palette),
             hint(format!(" sort:{sort}{direction}"), palette),
         ])
-    } else if area.width >= 50 {
+    } else if area.width >= 57 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint("  ", palette),
@@ -412,6 +787,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             hint("back  ", palette),
             key("/", palette),
             hint("find  ", palette),
+            key("v", palette),
+            hint("view  ", palette),
             key("o", palette),
             hint("open  ", palette),
             key("s", palette),
@@ -419,7 +796,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             key("↵", palette),
             hint("go", palette),
         ])
-    } else if area.width >= 32 {
+    } else if area.width >= 38 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint(" ", palette),
@@ -427,6 +804,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             hint(" ", palette),
             key("/", palette),
             hint("find ", palette),
+            key("v", palette),
+            hint("view ", palette),
             key("o", palette),
             hint("open ", palette),
             key("s", palette),
@@ -434,10 +813,12 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             key("↵", palette),
             hint("go", palette),
         ])
-    } else {
+    } else if area.width >= 30 {
         Line::from(vec![
             key(" ↑↓", palette),
             hint(" ", palette),
+            key("v", palette),
+            hint("view ", palette),
             key("o", palette),
             hint("open ", palette),
             key("↵", palette),
@@ -446,6 +827,16 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             hint("dir ", palette),
             key("←", palette),
             hint("back", palette),
+        ])
+    } else {
+        Line::from(vec![
+            key(" ↑↓ ", palette),
+            key("v", palette),
+            hint("view ", palette),
+            key("o", palette),
+            hint("open ", palette),
+            key("↵", palette),
+            hint("go", palette),
         ])
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -733,6 +1124,159 @@ mod tests {
     fn display_settings(contents: &str) -> DisplaySettings {
         let document = contents.parse::<DocumentMut>().unwrap();
         DisplaySettings::from_document(&document).unwrap()
+    }
+
+    #[test]
+    fn viewer_wraps_and_scrolls_text_at_the_full_width() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "abcdefghij\nsecond\nlast").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let area = Rect::new(0, 0, 5, 4);
+        assert!(viewer_scroll_max(&app, area) >= 2);
+        app.set_viewer_scroll(viewer_scroll_max(&app, area));
+        let mut terminal = Terminal::new(TestBackend::new(5, 4)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(terminal.backend().to_string().contains("last"));
+        assert_eq!(viewer_scroll_max(&app, Rect::new(0, 0, 20, 10)), 0);
+    }
+
+    #[test]
+    fn wrapping_respects_words_styles_graphemes_and_indentation() {
+        let red = Style::default().fg(ratatui::style::Color::Red);
+        let input = [
+            Line::from(vec![Span::raw("one "), Span::styled("two café", red)]),
+            Line::raw("    indented"),
+            Line::raw("e\u{301}界 x"),
+        ];
+        let (rows, count) = wrap_text_lines(input.iter(), 7, 0, 20, true);
+        let text = rows
+            .iter()
+            .map(|row| {
+                row.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            ["one two", "café", "    ind", "ented", "e\u{301}界 x"]
+        );
+        assert_eq!(count, text.len());
+        assert_eq!(rows[0].spans.last().unwrap().style.fg, red.fg);
+        let (wide, _) = wrap_text_lines(input.iter(), 20, 0, 20, true);
+        assert_eq!(wide.len(), 3);
+        let (visible, total) = wrap_text_lines(input.iter(), 7, 1, 1, false);
+        assert_eq!(visible[0].spans[0].content, "café");
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn trailing_whitespace_does_not_add_wrapped_rows() {
+        let input = [Line::raw("abcd  "), Line::raw("abc "), Line::raw("ab   ")];
+        let (rows, count) = wrap_text_lines(input.iter(), 4, 0, 10, true);
+        let text = rows
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(count, 3);
+        assert_eq!(text, ["abcd", "abc ", "ab  "]);
+    }
+
+    #[test]
+    fn viewer_reuses_wrapped_rows_for_scrolling_and_rewraps_on_resize() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.txt"),
+            "one two three four five six seven eight nine",
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let area = Rect::new(0, 0, 10, 6);
+        assert!(viewer_scroll_max(&app, area) > 0);
+        let cached_rows = app
+            .viewer_text_cache()
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .rows
+            .as_ptr();
+        app.set_viewer_scroll(1);
+        let mut terminal = Terminal::new(TestBackend::new(10, 6)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(terminal.backend().to_string().contains("three"));
+        assert_eq!(
+            cached_rows,
+            app.viewer_text_cache()
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .rows
+                .as_ptr()
+        );
+        let narrow_count = app
+            .viewer_text_cache()
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .rows
+            .len();
+        viewer_scroll_max(&app, Rect::new(0, 0, 30, 6));
+        let cache = app.viewer_text_cache().borrow();
+        let cache = cache.as_ref().unwrap();
+        assert_eq!(cache.width, 28);
+        assert!(cache.rows.len() < narrow_count);
+    }
+
+    #[test]
+    fn viewer_border_and_page_rows_follow_terminal_size() {
+        let area = Rect::new(2, 3, 40, 12);
+        assert_eq!(viewer_body(area), Rect::new(3, 5, 38, 8));
+        assert_eq!(viewer_page_rows(area), 8);
+        assert_eq!(viewer_page_rows(Rect::new(0, 0, 2, 2)), 2);
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "hello").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains('┌'));
+        assert!(rendered.contains('┘'));
+        assert!(rendered.contains("│hello"));
+        assert_eq!(viewer_page_rows(Rect::new(0, 0, 40, 7)), 3);
+    }
+
+    #[test]
+    fn markdown_viewer_switches_mode_and_content() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.md"),
+            "# Heading\n\nSome **bold** text",
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("rendered"));
+        assert!(rendered.contains("m mode"));
+        assert!(rendered.contains("Some bold text"));
+        assert!(!rendered.contains("**bold**"));
+        app.toggle_markdown_source();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let source = terminal.backend().to_string();
+        assert!(source.contains("source"));
+        assert!(source.contains("# Heading"));
+        assert!(source.contains("Some **bold** text"));
     }
 
     #[test]

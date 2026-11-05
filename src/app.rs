@@ -1,4 +1,5 @@
 use crate::{BrowseDefaults, DisplaySettings, Theme};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -18,8 +19,11 @@ pub struct Entry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Preview {
     label: String,
+    path: Option<PathBuf>,
     entries: Vec<Entry>,
     message: Option<String>,
+    document: Option<crate::document::Document>,
+    image: Option<crate::media::ImagePreview>,
 }
 
 impl Preview {
@@ -33,6 +37,14 @@ impl Preview {
 
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    pub fn document(&self) -> Option<&crate::document::Document> {
+        self.document.as_ref()
+    }
+
+    pub fn image(&self) -> Option<&crate::media::ImagePreview> {
+        self.image.as_ref()
     }
 }
 
@@ -116,6 +128,12 @@ pub struct App {
     sort_direction: SortDirection,
     theme: Theme,
     display: DisplaySettings,
+    viewing: bool,
+    viewer_scroll: usize,
+    markdown_source: bool,
+    image_loader: Option<crate::image_loader::ImageLoader>,
+    image_request: Option<u64>,
+    viewer_text_cache: RefCell<Option<crate::ui::ViewerText>>,
 }
 
 impl App {
@@ -146,8 +164,11 @@ impl App {
             status: None,
             preview: Preview {
                 label: "preview".into(),
+                path: None,
                 entries: Vec::new(),
                 message: None,
+                document: None,
+                image: None,
             },
             filtering: false,
             filter: String::new(),
@@ -155,6 +176,12 @@ impl App {
             sort_direction,
             theme: Theme::auto(),
             display: DisplaySettings::default(),
+            viewing: false,
+            viewer_scroll: 0,
+            markdown_source: false,
+            image_loader: None,
+            image_request: None,
+            viewer_text_cache: RefCell::new(None),
         };
         app.refresh_preview();
         Ok(app)
@@ -205,6 +232,81 @@ impl App {
         &self.preview
     }
 
+    pub fn is_viewing(&self) -> bool {
+        self.viewing
+    }
+
+    pub fn is_markdown_source(&self) -> bool {
+        self.markdown_source
+    }
+
+    pub(crate) fn viewer_text_cache(&self) -> &RefCell<Option<crate::ui::ViewerText>> {
+        &self.viewer_text_cache
+    }
+
+    pub fn toggle_markdown_source(&mut self) {
+        if self.viewing
+            && self
+                .preview
+                .document
+                .as_ref()
+                .is_some_and(|document| document.source_lines.is_some())
+        {
+            self.markdown_source = !self.markdown_source;
+            self.viewer_scroll = 0;
+        }
+    }
+
+    /// Apply only the image prepared for the current selection and refresh.
+    pub fn poll_preview(&mut self) -> bool {
+        let Some((request, result)) = self.image_loader.as_mut().and_then(|loader| loader.poll())
+        else {
+            return false;
+        };
+        if self.image_request != Some(request) {
+            return false;
+        }
+        self.image_request = None;
+        self.viewer_text_cache.get_mut().take();
+        self.preview.message = None;
+        match result {
+            Ok(image) => self.preview.image = Some(image),
+            Err(error) => self.preview.message = Some(error),
+        }
+        true
+    }
+
+    pub fn image_pending(&self) -> bool {
+        self.image_loader
+            .as_ref()
+            .is_some_and(|loader| loader.is_pending())
+    }
+
+    pub fn viewer_scroll(&self) -> usize {
+        self.viewer_scroll
+    }
+
+    pub fn open_viewer(&mut self) {
+        match self.selected_entry() {
+            Some(entry) if !entry.is_dir => {
+                self.viewing = true;
+                self.viewer_scroll = 0;
+                self.markdown_source = false;
+                self.status = None;
+            }
+            _ => self.status = Some("select a file to view".into()),
+        }
+    }
+
+    pub fn close_viewer(&mut self) {
+        self.viewing = false;
+        self.viewer_scroll = 0;
+    }
+
+    pub fn set_viewer_scroll(&mut self, scroll: usize) {
+        self.viewer_scroll = scroll;
+    }
+
     pub fn is_filtering(&self) -> bool {
         self.filtering
     }
@@ -226,7 +328,11 @@ impl App {
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
+        if self.theme != theme && self.preview.document.is_some() {
+            self.preview.path = None;
+        }
         self.theme = theme;
+        self.refresh_preview();
     }
 
     pub fn display_settings(&self) -> &DisplaySettings {
@@ -351,6 +457,7 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
+        self.preview.path = None;
         self.reload_preserving_selection();
     }
 
@@ -438,45 +545,75 @@ impl App {
 
     fn refresh_preview(&mut self) {
         let Some(entry) = self.selected_entry() else {
+            self.cancel_image_request();
+            self.viewer_text_cache.get_mut().take();
+            self.markdown_source = false;
             self.preview = Preview {
                 label: "preview".into(),
+                path: None,
                 entries: Vec::new(),
                 message: Some("nothing selected".into()),
+                document: None,
+                image: None,
             };
             return;
         };
 
         let label = entry.display_name();
-        if !entry.is_dir {
-            self.preview = Preview {
-                label,
-                entries: Vec::new(),
-                message: Some("file · press o to open".into()),
-            };
+        let path = entry.path.clone();
+        let is_dir = entry.is_dir;
+        if !is_dir && self.preview.path.as_deref() == Some(path.as_path()) {
             return;
         }
-
-        match read_entries(
-            &entry.path,
-            self.show_hidden,
-            self.sort_mode,
-            self.sort_direction,
-        ) {
-            Ok(entries) => {
-                self.preview = Preview {
-                    label,
-                    message: entries.is_empty().then(|| "empty directory".into()),
-                    entries,
-                };
+        self.cancel_image_request();
+        self.viewer_text_cache.get_mut().take();
+        self.markdown_source = false;
+        let mut preview = Preview {
+            label,
+            path: Some(path.clone()),
+            entries: Vec::new(),
+            message: None,
+            document: None,
+            image: None,
+        };
+        if is_dir {
+            match read_entries(&path, self.show_hidden, self.sort_mode, self.sort_direction) {
+                Ok(entries) => {
+                    preview.message = entries.is_empty().then(|| "empty directory".into());
+                    preview.entries = entries;
+                }
+                Err(error) => preview.message = Some(format!("cannot preview: {error}")),
             }
-            Err(error) => {
-                self.preview = Preview {
-                    label,
-                    entries: Vec::new(),
-                    message: Some(format!("cannot preview: {error}")),
-                };
+        } else if crate::media::is_image_path(&path) {
+            let loader = self
+                .image_loader
+                .get_or_insert_with(crate::image_loader::ImageLoader::new);
+            self.image_request = Some(loader.request(path.clone()));
+            preview.message = Some("loading image…".into());
+        } else if path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
+            [
+                "mp4", "mkv", "webm", "mov", "avi", "m4v", "mpeg", "mpg", "wmv",
+            ]
+            .iter()
+            .any(|video| ext.eq_ignore_ascii_case(video))
+        }) {
+            preview.message = Some("video playback is external · press o to open".into());
+        } else {
+            match crate::document::load(&path, &self.theme.palette()) {
+                Ok(document) => preview.document = Some(document),
+                Err(error) => {
+                    preview.message = Some(format!("{error} · press o to open externally"))
+                }
             }
         }
+        self.preview = preview;
+    }
+
+    fn cancel_image_request(&mut self) {
+        if let Some(loader) = self.image_loader.as_mut() {
+            loader.cancel();
+        }
+        self.image_request = None;
     }
 }
 
@@ -700,7 +837,50 @@ mod tests {
 
         app.move_last();
         assert_eq!(app.preview().label(), "notes.txt");
-        assert_eq!(app.preview().message(), Some("file · press o to open"));
+        assert!(app.preview().document().is_some());
+    }
+
+    #[test]
+    fn unchanged_selection_keeps_document_until_explicit_refresh() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        fs::write(&path, "original").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let original = app.preview().document().unwrap().clone();
+        fs::write(&path, "changed").unwrap();
+
+        app.move_down();
+        app.cycle_sort();
+        app.begin_filter();
+        app.push_filter_char('n');
+        assert_eq!(app.preview().document(), Some(&original));
+
+        app.refresh();
+        assert_ne!(app.preview().document(), Some(&original));
+        assert_eq!(
+            app.preview().document(),
+            Some(&crate::document::load(&path, &app.theme().palette()).unwrap())
+        );
+    }
+
+    #[test]
+    fn leaving_an_image_cancels_its_pending_preview() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("a.png"), "invalid image").unwrap();
+        fs::write(temp.path().join("b.txt"), "selected text").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let first_request = app.image_request.unwrap();
+
+        app.move_down();
+        assert!(app.image_request.is_none());
+        assert!(!app.image_pending());
+        assert_eq!(
+            app.preview().document().unwrap().lines[0].to_string(),
+            "selected text"
+        );
+        app.move_up();
+        assert_ne!(app.image_request, Some(first_request));
+        assert!(app.preview().document().is_none());
     }
 
     #[test]

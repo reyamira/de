@@ -1,6 +1,9 @@
 mod app;
 pub mod backend;
 mod config;
+pub mod document;
+mod image_loader;
+pub mod media;
 mod settings;
 mod theme;
 mod ui;
@@ -13,8 +16,8 @@ pub use theme::{
     save_settings, save_theme, theme_config_path,
 };
 pub use ui::{
-    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, render, render_config_picker,
-    render_theme_preview,
+    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, preview_image_area, render, render_config_picker,
+    render_theme_preview, viewer_page_rows, viewer_scroll_max,
 };
 
 use std::ffi::OsStr;

@@ -20,10 +20,14 @@ name = "de"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.29.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 toml_edit = "0.23"
 unicode-width = "0.2.2"
 

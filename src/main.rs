@@ -8,8 +8,9 @@ use de::backend::InlineBackend;
 use de::{
     App, BrowseDefaults, CONFIG_PICKER_MIN_HEIGHT, Config, DisplaySettings, NavigationResult,
     SettingsPicker, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme, ensure_config_file,
-    render, render_config_picker, render_theme_preview, resolve_start_path, save_defaults,
-    save_settings, save_theme, shell_init, theme_config_path,
+    preview_image_area, render, render_config_picker, render_theme_preview, resolve_start_path,
+    save_defaults, save_settings, save_theme, shell_init, theme_config_path, viewer_page_rows,
+    viewer_scroll_max,
 };
 use ratatui::Terminal;
 use ratatui::layout::Rect;
@@ -18,12 +19,15 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
+use std::time::Duration;
 
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
   → or l/Tab         Open folder     ← or h/Backspace  Go to parent
   /                  Filter          s                  Name / modified
   Shift+S            Ascending / descending
+  v                  View file inline   Esc / q           Return to picker
+  m                  Toggle Markdown source / rendered inside the viewer
   o                  Open file with its default application
   . / r              Hidden / refresh
   w                  Save hidden and sort settings as defaults
@@ -293,6 +297,7 @@ fn run_picker(app: App) -> io::Result<Option<PickerAction>> {
         app,
         (),
         0,
+        true,
         |frame, app, ()| render(frame, app),
         |app, (), key, page_rows| match handle_key(app, key, page_rows) {
             NavigationResult::Continue => InlineResult::Continue,
@@ -310,6 +315,7 @@ fn run_theme_picker(app: App, catalog: &Config) -> io::Result<Option<Theme>> {
         app,
         (),
         0,
+        true,
         |frame, app, ()| render_theme_preview(frame, app),
         |app, (), key, _| handle_theme_key(app, key, catalog),
     )
@@ -322,6 +328,7 @@ fn run_config_picker(app: App) -> io::Result<Option<(BrowseDefaults, DisplaySett
         app,
         picker,
         CONFIG_PICKER_MIN_HEIGHT,
+        false,
         render_config_picker,
         |app, picker, key, _| handle_config_key(app, picker, key),
     )
@@ -334,6 +341,7 @@ fn run_inline<S, T>(
     mut app: App,
     mut state: S,
     min_height: u16,
+    images: bool,
     mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App, &S),
     mut handle: impl FnMut(&mut App, &mut S, KeyEvent, usize) -> InlineResult<T>,
 ) -> io::Result<Option<T>> {
@@ -351,29 +359,53 @@ fn run_inline<S, T>(
     let mut terminal = Terminal::new(backend)?;
 
     let outcome: io::Result<Option<T>> = (|| {
+        let mut redraw = true;
         loop {
-            terminal.draw(|frame| draw(frame, &app, &state))?;
+            redraw |= app.poll_preview();
+            if redraw {
+                let desired =
+                    desired_viewport_height(&app, terminal_width, terminal_height, min_height);
+                if desired != viewport_height {
+                    terminal
+                        .backend_mut()
+                        .resize_viewport(terminal_width, desired)?;
+                    terminal.resize(Rect::new(0, 0, terminal_width, desired))?;
+                    viewport_height = desired;
+                }
+                let area = Rect::new(0, 0, terminal_width, viewport_height);
+                if app.is_viewing() {
+                    app.set_viewer_scroll(app.viewer_scroll().min(viewer_scroll_max(&app, area)));
+                }
+                terminal.draw(|frame| draw(frame, &app, &state))?;
+                redraw = false;
+            }
+            let area = Rect::new(0, 0, terminal_width, viewport_height);
+            let image = if images {
+                app.preview().image().zip(preview_image_area(&app, area))
+            } else {
+                None
+            };
+            terminal.backend_mut().draw_image(image)?;
+
+            // Read input between transfer batches, and wake for prepared images.
+            if terminal.backend().image_pending() {
+                if !event::poll(Duration::ZERO)? {
+                    continue;
+                }
+            } else if app.image_pending() && !event::poll(Duration::from_millis(16))? {
+                continue;
+            }
             match event::read()? {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    let page_rows = visible_entry_rows(&app, terminal_width, viewport_height);
+                    let page_rows = if app.is_viewing() {
+                        viewer_page_rows(area)
+                    } else {
+                        visible_entry_rows(&app, terminal_width, viewport_height)
+                    };
                     match handle(&mut app, &mut state, key, page_rows) {
-                        InlineResult::Continue => {
-                            let desired = desired_viewport_height(
-                                &app,
-                                terminal_width,
-                                terminal_height,
-                                min_height,
-                            );
-                            if desired != viewport_height {
-                                terminal
-                                    .backend_mut()
-                                    .resize_viewport(terminal_width, desired)?;
-                                terminal.resize(Rect::new(0, 0, terminal_width, desired))?;
-                                viewport_height = desired;
-                            }
-                        }
+                        InlineResult::Continue => redraw = true,
                         InlineResult::Accept(value) => break Ok(Some(value)),
                         InlineResult::Cancel => break Ok(None),
                     }
@@ -381,12 +413,12 @@ fn run_inline<S, T>(
                 Event::Resize(width, height) => {
                     terminal_width = width;
                     terminal_height = height;
-                    viewport_height =
-                        desired_viewport_height(&app, terminal_width, terminal_height, min_height);
+                    viewport_height = desired_viewport_height(&app, width, height, min_height);
                     terminal
                         .backend_mut()
                         .resize_viewport(width, viewport_height)?;
                     terminal.resize(Rect::new(0, 0, width, viewport_height))?;
+                    redraw = true;
                 }
                 _ => {}
             }
@@ -447,14 +479,24 @@ fn desired_viewport_height(
     terminal_height: u16,
     min_height: u16,
 ) -> u16 {
+    if app.is_viewing() {
+        return terminal_height.saturating_sub(1).clamp(1, 30);
+    }
     let status_row = usize::from(app.status().is_some());
     let current_rows = app.entries().len().saturating_add(status_row);
     let body_rows = if terminal_width >= TWO_PANE_MIN_WIDTH {
-        let preview_rows = app
-            .preview()
-            .entries()
-            .len()
-            .saturating_add(usize::from(app.preview().message().is_some()));
+        let preview_rows = if let Some(document) = app.preview().document() {
+            document
+                .lines
+                .len()
+                .saturating_add(usize::from(document.notice.is_some()))
+        } else if app.preview().image().is_some() {
+            8
+        } else if app.preview().message().is_some() {
+            3
+        } else {
+            app.preview().entries().len()
+        };
         current_rows.max(preview_rows).saturating_add(1)
     } else {
         current_rows
@@ -481,6 +523,23 @@ fn visible_entry_rows(app: &App, terminal_width: u16, viewport_height: u16) -> u
 fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResult {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return NavigationResult::Cancel;
+    }
+
+    if app.is_viewing() {
+        let scroll = app.viewer_scroll();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.close_viewer(),
+            KeyCode::Up | KeyCode::Char('k') => app.set_viewer_scroll(scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => app.set_viewer_scroll(scroll.saturating_add(1)),
+            KeyCode::PageUp => app.set_viewer_scroll(scroll.saturating_sub(page_rows)),
+            KeyCode::PageDown => app.set_viewer_scroll(scroll.saturating_add(page_rows)),
+            KeyCode::Home => app.set_viewer_scroll(0),
+            KeyCode::End => app.set_viewer_scroll(usize::MAX),
+            KeyCode::Char('o') => return app.open_selected(),
+            KeyCode::Char('m') => app.toggle_markdown_source(),
+            _ => {}
+        }
+        return NavigationResult::Continue;
     }
 
     if app.is_filtering() {
@@ -521,6 +580,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
         KeyCode::Char('.') => app.toggle_hidden(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('w') => save_current_defaults(app),
+        KeyCode::Char('v') => app.open_viewer(),
         KeyCode::Char('o') => return app.open_selected(),
         KeyCode::Enter => return app.accept(),
         KeyCode::Esc | KeyCode::Char('q') => return NavigationResult::Cancel,
@@ -849,6 +909,69 @@ mod tests {
         let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, open, 5), NavigationResult::Continue);
         assert_eq!(app.filter_query(), "o");
+    }
+
+    #[test]
+    fn viewer_keys_keep_selection_and_scroll_without_navigating() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.txt"),
+            "one\ntwo\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(&mut app, key(KeyCode::Char('v')), 2);
+        assert!(app.is_viewing());
+        handle_key(&mut app, key(KeyCode::PageDown), 2);
+        assert_eq!(app.viewer_scroll(), 2);
+        handle_key(&mut app, key(KeyCode::Char('k')), 2);
+        assert_eq!(app.viewer_scroll(), 1);
+        handle_key(&mut app, key(KeyCode::End), 2);
+        assert_eq!(app.viewer_scroll(), usize::MAX);
+        handle_key(&mut app, key(KeyCode::Home), 2);
+        assert_eq!(app.viewer_scroll(), 0);
+        handle_key(&mut app, key(KeyCode::Char('q')), 2);
+        assert!(!app.is_viewing());
+        assert_eq!(app.current_dir(), temp.path());
+        assert_eq!(app.selected_entry().unwrap().name, "notes.txt");
+    }
+
+    #[test]
+    fn v_is_filter_text_during_filter_input() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("view.txt"), "text").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_filter();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            3,
+        );
+        assert_eq!(app.filter_query(), "v");
+        assert!(!app.is_viewing());
+    }
+
+    #[test]
+    fn markdown_mode_is_viewer_only_and_resets_scroll() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("manual.md"), "# Title\n\nfirst\nsecond\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let key = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+        handle_key(&mut app, key('m'), 2);
+        assert!(!app.is_markdown_source());
+        handle_key(&mut app, key('v'), 2);
+        app.set_viewer_scroll(5);
+        handle_key(&mut app, key('m'), 2);
+        assert!(app.is_markdown_source());
+        assert_eq!(app.viewer_scroll(), 0);
+        handle_key(&mut app, key('m'), 2);
+        assert!(!app.is_markdown_source());
+        handle_key(&mut app, key('q'), 2);
+        app.begin_filter();
+        handle_key(&mut app, key('m'), 2);
+        assert_eq!(app.filter_query(), "m");
+        assert!(!app.is_viewing());
     }
 
     #[test]
