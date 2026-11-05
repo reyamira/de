@@ -113,6 +113,13 @@ impl<W: Write> InlineBackend<W> {
         Ok(())
     }
 
+    /// Request the screen position of the viewport origin on the UI stream.
+    pub fn request_origin(&mut self) -> io::Result<()> {
+        self.move_to(Position::ORIGIN)?;
+        self.writer.write_all(b"\x1b[6n")?;
+        self.writer.flush()
+    }
+
     pub fn finish(&mut self) -> io::Result<()> {
         self.clear_image()?;
         self.clear_viewport()

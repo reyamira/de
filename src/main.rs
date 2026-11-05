@@ -1,7 +1,7 @@
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use de::backend::InlineBackend;
@@ -10,7 +10,7 @@ use de::{
     SettingsPicker, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme, ensure_config_file,
     preview_image_area, render, render_config_picker, render_theme_preview, resolve_start_path,
     save_defaults, save_settings, save_theme, shell_init, theme_config_path, viewer_body,
-    viewer_page_rows, viewer_scroll_max,
+    viewer_page_rows, viewer_scroll_max, viewer_scrollbar,
 };
 use ratatui::Terminal;
 use ratatui::layout::Rect;
@@ -20,6 +20,12 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
+use termina::escape::csi::{Csi, Cursor};
+use termina::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, Modifiers as KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use termina::{EventReader, PlatformTerminal, Terminal as _};
 
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
@@ -345,9 +351,12 @@ fn run_inline<S, T>(
     mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App, &S),
     mut handle: impl FnMut(&mut App, &mut S, KeyEvent, usize) -> InlineResult<T>,
 ) -> io::Result<Option<T>> {
+    let input_terminal = PlatformTerminal::new()?;
+    let reader = input_terminal.event_reader();
     enable_raw_mode()?;
     let mut raw_mode = RawModeGuard {
         viewport_active: false,
+        mouse_capture: false,
     };
     execute!(io::stderr(), cursor::Hide)?;
 
@@ -360,27 +369,56 @@ fn run_inline<S, T>(
 
     let outcome: io::Result<Option<T>> = (|| {
         let mut redraw = true;
+        let mut viewer_active = false;
+        let mut drag = None;
+        let mut origin = None;
+        let mut origin_supported = true;
         loop {
             redraw |= app.poll_preview();
-            redraw |= app.poll_browser();
+            redraw |= app.poll_markdown();
             if redraw {
+                let viewing = app.is_viewing();
+                if viewer_active && !viewing {
+                    drag = None;
+                    set_mouse_capture(&mut raw_mode.mouse_capture, false, &mut io::stderr())?;
+                    viewer_active = false;
+                }
                 let desired =
                     desired_viewport_height(&app, terminal_width, terminal_height, min_height);
+                let mut measure_origin = viewing && !viewer_active;
                 if desired != viewport_height {
                     terminal
                         .backend_mut()
                         .resize_viewport(terminal_width, desired)?;
                     terminal.resize(Rect::new(0, 0, terminal_width, desired))?;
                     viewport_height = desired;
+                    drag = None;
+                    measure_origin |= viewing;
                 }
+                if measure_origin {
+                    origin = if origin_supported {
+                        terminal.backend_mut().request_origin()?;
+                        let result =
+                            read_origin(&reader, terminal_width, terminal_height, viewport_height)?;
+                        resolve_origin(result, &mut origin_supported)
+                    } else {
+                        None
+                    };
+                }
+                set_mouse_capture(
+                    &mut raw_mode.mouse_capture,
+                    viewing && origin.is_some(),
+                    &mut io::stderr(),
+                )?;
+                viewer_active = viewing;
                 let area = Rect::new(0, 0, terminal_width, viewport_height);
                 if app.is_viewing() {
                     app.set_viewer_scroll(app.viewer_scroll().min(viewer_scroll_max(&app, area)));
                 }
-                if app.is_browser_view() {
+                if app.is_rendered_markdown_view() {
                     let body = viewer_body(area);
                     let (cell_width, cell_height) = terminal_cell_pixels();
-                    app.update_browser_view(
+                    app.update_markdown_view(
                         u32::from(body.width) * cell_width,
                         u32::from(body.height) * cell_height,
                         cell_height,
@@ -391,9 +429,9 @@ fn run_inline<S, T>(
             }
             let area = Rect::new(0, 0, terminal_width, viewport_height);
             let image = if images {
-                app.browser_image()
+                app.markdown_image()
                     .or_else(|| {
-                        (!app.is_browser_view())
+                        (!app.is_rendered_markdown_view())
                             .then(|| app.preview().image())
                             .flatten()
                     })
@@ -405,15 +443,15 @@ fn run_inline<S, T>(
 
             // Read input between transfer batches, and wake for prepared images.
             if terminal.backend().image_pending() {
-                if !event::poll(Duration::ZERO)? {
+                if !reader.poll(Some(Duration::ZERO), |_| true)? {
                     continue;
                 }
-            } else if (app.image_pending() || app.browser_pending())
-                && !event::poll(Duration::from_millis(16))?
+            } else if (app.image_pending() || app.markdown_pending())
+                && !reader.poll(Some(Duration::from_millis(16)), |_| true)?
             {
                 continue;
             }
-            match event::read()? {
+            match reader.read(|_| true)? {
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
@@ -423,12 +461,23 @@ fn run_inline<S, T>(
                         visible_entry_rows(&app, terminal_width, viewport_height)
                     };
                     match handle(&mut app, &mut state, key, page_rows) {
-                        InlineResult::Continue => redraw = true,
+                        InlineResult::Continue => {
+                            if !app.is_viewing() || key.code == KeyCode::Char('m') {
+                                drag = None;
+                            }
+                            redraw = true;
+                        }
                         InlineResult::Accept(value) => break Ok(Some(value)),
                         InlineResult::Cancel => break Ok(None),
                     }
                 }
-                Event::Resize(width, height) => {
+                Event::Mouse(mouse) if viewer_active => {
+                    redraw |= handle_viewer_mouse(&mut app, area, origin, mouse, &mut drag);
+                }
+                Event::WindowResized(size) => {
+                    let (width, height) = (size.cols, size.rows);
+                    set_mouse_capture(&mut raw_mode.mouse_capture, false, &mut io::stderr())?;
+                    drag = None;
                     terminal_width = width;
                     terminal_height = height;
                     viewport_height = desired_viewport_height(&app, width, height, min_height);
@@ -436,6 +485,17 @@ fn run_inline<S, T>(
                         .backend_mut()
                         .resize_viewport(width, viewport_height)?;
                     terminal.resize(Rect::new(0, 0, width, viewport_height))?;
+                    origin = None;
+                    if app.is_viewing() && origin_supported {
+                        terminal.backend_mut().request_origin()?;
+                        let result = read_origin(&reader, width, height, viewport_height)?;
+                        origin = resolve_origin(result, &mut origin_supported);
+                    }
+                    set_mouse_capture(
+                        &mut raw_mode.mouse_capture,
+                        app.is_viewing() && origin.is_some(),
+                        &mut io::stderr(),
+                    )?;
                     redraw = true;
                 }
                 _ => {}
@@ -447,6 +507,141 @@ fn run_inline<S, T>(
     drop(terminal);
     cleanup?;
     outcome
+}
+
+/// Wait briefly for a cursor report without consuming unrelated input.
+fn read_origin(
+    reader: &EventReader,
+    width: u16,
+    height: u16,
+    viewport_height: u16,
+) -> io::Result<Option<Option<u16>>> {
+    let is_report = |event: &Event| {
+        matches!(
+            event,
+            Event::Csi(Csi::Cursor(Cursor::ActivePositionReport { .. }))
+        )
+    };
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if reader.poll(Some(remaining), is_report)?
+            && let Event::Csi(Csi::Cursor(Cursor::ActivePositionReport { line, col })) =
+                reader.read(is_report)?
+        {
+            let row = line.get_zero_based();
+            return Ok(Some(
+                (col.get_zero_based() == 0
+                    && width > 0
+                    && viewport_height <= height
+                    && row <= height - viewport_height)
+                    .then_some(row),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+// An invalid report can result from a queued resize; only a timeout disables
+// future queries, because a late reply could otherwise be mistaken for a new one.
+fn resolve_origin(report: Option<Option<u16>>, supported: &mut bool) -> Option<u16> {
+    match report {
+        Some(origin) => origin,
+        None => {
+            *supported = false;
+            None
+        }
+    }
+}
+
+fn set_mouse_capture(active: &mut bool, wanted: bool, writer: &mut impl Write) -> io::Result<()> {
+    if wanted && !*active {
+        *active = true;
+        execute!(writer, EnableMouseCapture)?;
+    } else if !wanted && *active {
+        execute!(writer, DisableMouseCapture)?;
+        *active = false;
+    }
+    Ok(())
+}
+
+fn handle_viewer_mouse(
+    app: &mut App,
+    area: Rect,
+    origin: Option<u16>,
+    mouse: MouseEvent,
+    drag: &mut Option<u16>,
+) -> bool {
+    if !app.is_viewing() {
+        *drag = None;
+        return false;
+    }
+    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+        *drag = None;
+        return false;
+    }
+    let Some(origin) = origin else {
+        *drag = None;
+        return false;
+    };
+    let row = mouse.row.saturating_sub(origin);
+    let inside = mouse.row >= origin && row < area.height && mouse.column < area.width;
+    let container = if area.height < 3 {
+        area
+    } else {
+        Rect::new(area.x, area.y + 1, area.width, area.height - 2)
+    };
+    let point = ratatui::layout::Position::new(mouse.column, row);
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if inside && container.contains(point) =>
+        {
+            let step = if app.is_rendered_markdown_view() {
+                app.markdown_scroll_step()
+            } else {
+                1
+            }
+            .saturating_mul(3);
+            let current = app.viewer_scroll();
+            let maximum = viewer_scroll_max(app, area);
+            let next = if mouse.kind == MouseEventKind::ScrollUp {
+                current.saturating_sub(step)
+            } else {
+                current.saturating_add(step)
+            }
+            .min(maximum);
+            app.set_viewer_scroll(next);
+            next != current
+        }
+        MouseEventKind::Down(MouseButton::Left) if inside => {
+            if let Some(bar) = viewer_scrollbar(app, area)
+                && bar.track.contains(point)
+            {
+                if bar.thumb.contains(point) {
+                    *drag = Some(row - bar.thumb.y);
+                    return false;
+                }
+                let grab = bar.thumb.height / 2;
+                *drag = Some(grab);
+                let next = bar.scroll_at(row, grab);
+                let changed = next != app.viewer_scroll();
+                app.set_viewer_scroll(next);
+                return changed;
+            }
+            false
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(grab) = *drag
+                && let Some(bar) = viewer_scrollbar(app, area)
+            {
+                let next = bar.scroll_at(row, grab);
+                let changed = next != app.viewer_scroll();
+                app.set_viewer_scroll(next);
+                return changed;
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 fn terminal_cell_pixels() -> (u32, u32) {
@@ -483,7 +678,7 @@ fn handle_config_key(
         KeyCode::Enter => {
             return InlineResult::Accept((app.browse_defaults(), app.display_settings().clone()));
         }
-        KeyCode::Esc | KeyCode::Char('q') => return InlineResult::Cancel,
+        KeyCode::Escape | KeyCode::Char('q') => return InlineResult::Cancel,
         _ => {}
     }
     InlineResult::Continue
@@ -502,7 +697,7 @@ fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &Config) -> InlineRes
             app.set_theme(catalog.next(app.theme().name()))
         }
         KeyCode::Enter => return InlineResult::Accept(app.theme().clone()),
-        KeyCode::Esc | KeyCode::Char('q') => return InlineResult::Cancel,
+        KeyCode::Escape | KeyCode::Char('q') => return InlineResult::Cancel,
         _ => {}
     }
     InlineResult::Continue
@@ -562,14 +757,14 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
 
     if app.is_viewing() {
         let scroll = app.viewer_scroll();
-        let step = if app.is_browser_view() {
-            app.browser_scroll_step()
+        let step = if app.is_rendered_markdown_view() {
+            app.markdown_scroll_step()
         } else {
             1
         };
         let page = page_rows.saturating_mul(step);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => app.close_viewer(),
+            KeyCode::Escape | KeyCode::Char('q') => app.close_viewer(),
             KeyCode::Up | KeyCode::Char('k') => app.set_viewer_scroll(scroll.saturating_sub(step)),
             KeyCode::Down | KeyCode::Char('j') => {
                 app.set_viewer_scroll(scroll.saturating_add(step))
@@ -597,7 +792,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::Left => app.go_parent(),
             KeyCode::Backspace => app.pop_filter_char(),
             KeyCode::Enter => return app.accept(),
-            KeyCode::Esc => app.clear_filter(),
+            KeyCode::Escape => app.clear_filter(),
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
@@ -626,7 +821,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
         KeyCode::Char('v') => app.open_viewer(),
         KeyCode::Char('o') => return app.open_selected(),
         KeyCode::Enter => return app.accept(),
-        KeyCode::Esc | KeyCode::Char('q') => return NavigationResult::Cancel,
+        KeyCode::Escape | KeyCode::Char('q') => return NavigationResult::Cancel,
         _ => {}
     }
     NavigationResult::Continue
@@ -714,10 +909,14 @@ fn default_open_command(_path: &Path) -> io::Result<Command> {
 
 struct RawModeGuard {
     viewport_active: bool,
+    mouse_capture: bool,
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if self.mouse_capture {
+            let _ = execute!(io::stderr(), DisableMouseCapture);
+        }
         let _ = disable_raw_mode();
         if self.viewport_active {
             let _ = execute!(
@@ -754,6 +953,33 @@ mod tests {
     use clap::error::ErrorKind;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn mouse_capture_follows_valid_origin_and_restores_terminal_modes() {
+        let mut active = false;
+        let mut output = Vec::new();
+        set_mouse_capture(&mut active, false, &mut output).unwrap();
+        assert!(output.is_empty());
+        set_mouse_capture(&mut active, true, &mut output).unwrap();
+        assert!(active);
+        let enabled_len = output.len();
+        set_mouse_capture(&mut active, true, &mut output).unwrap();
+        assert_eq!(output.len(), enabled_len);
+        set_mouse_capture(&mut active, false, &mut output).unwrap();
+        assert!(!active);
+        assert!(output.len() > enabled_len);
+    }
+
+    #[test]
+    fn invalid_origin_allows_resize_retry_but_timeout_does_not() {
+        let mut supported = true;
+        assert_eq!(resolve_origin(Some(None), &mut supported), None);
+        assert!(supported);
+        assert_eq!(resolve_origin(Some(Some(3)), &mut supported), Some(3));
+        assert!(supported);
+        assert_eq!(resolve_origin(None, &mut supported), None);
+        assert!(!supported);
+    }
 
     #[test]
     fn parses_a_start_directory() {
@@ -889,7 +1115,7 @@ mod tests {
         assert_eq!(app.filter_query(), "s");
         assert_eq!(app.entries().len(), 2);
 
-        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let escape = KeyEvent::new(KeyCode::Escape, KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, escape, 5), NavigationResult::Continue);
         assert!(!app.is_filtering());
         assert!(app.filter_query().is_empty());
@@ -952,6 +1178,108 @@ mod tests {
         let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, open, 5), NavigationResult::Continue);
         assert_eq!(app.filter_query(), "o");
+    }
+
+    #[test]
+    fn mouse_scroll_hits_and_drag_clamps_at_measured_origin() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "line\n".repeat(100)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let area = Rect::new(0, 0, 40, 10);
+        let mut drag = None;
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = MouseEventKind::ScrollDown;
+        assert!(!handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(down, 2, 16),
+            &mut drag
+        ));
+        app.open_viewer();
+        assert!(!handle_viewer_mouse(
+            &mut app,
+            area,
+            None,
+            event(down, 2, 16),
+            &mut drag,
+        ));
+        assert!(!handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(down, 2, 13),
+            &mut drag
+        ));
+        assert!(!handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(down, 2, 14),
+            &mut drag
+        ));
+        assert!(handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(down, 2, 16),
+            &mut drag
+        ));
+        assert_eq!(app.viewer_scroll(), 3);
+        let bar = viewer_scrollbar(&app, area).unwrap();
+        let x = bar.track.x;
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(MouseEventKind::Down(MouseButton::Left), x, 14 + bar.thumb.y),
+            &mut drag,
+        );
+        assert!(drag.is_some());
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(MouseEventKind::Drag(MouseButton::Left), 0, 23),
+            &mut drag,
+        );
+        assert_eq!(app.viewer_scroll(), bar.maximum);
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut drag,
+        );
+        assert_eq!(app.viewer_scroll(), 0);
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut drag,
+        );
+        assert!(drag.is_none());
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(14),
+            event(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                14 + bar.track.bottom() - 1,
+            ),
+            &mut drag,
+        );
+        assert_eq!(app.viewer_scroll(), bar.maximum);
+        app.close_viewer();
+        handle_viewer_mouse(&mut app, area, Some(14), event(down, 2, 16), &mut drag);
+        assert!(drag.is_none());
     }
 
     #[test]
@@ -1018,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_navigation_uses_browser_pixels_and_source_rows() {
+    fn markdown_navigation_uses_rendered_pixels_and_source_rows() {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("manual.md"), "# Title\n\nText").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();

@@ -2,8 +2,10 @@ mod app;
 pub mod backend;
 mod config;
 pub mod document;
+mod fmd_assets;
+mod fmd_diagram;
 mod image_loader;
-mod markdown_browser;
+mod markdown_renderer;
 pub mod media;
 mod settings;
 mod theme;
@@ -17,8 +19,9 @@ pub use theme::{
     save_settings, save_theme, theme_config_path,
 };
 pub use ui::{
-    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, preview_image_area, render, render_config_picker,
-    render_theme_preview, viewer_body, viewer_page_rows, viewer_scroll_max,
+    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, ViewerScrollBar, preview_image_area, render,
+    render_config_picker, render_theme_preview, viewer_body, viewer_page_rows, viewer_scroll_max,
+    viewer_scrollbar,
 };
 
 use std::ffi::OsStr;

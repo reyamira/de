@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_retains_original_source_for_browser() {
+    fn markdown_retains_original_source_for_renderer() {
         let input = "# Heading\r\n\tText \u{1b}";
         let doc = markdown_document(input, &palette());
         assert_eq!(doc.markdown_source.as_deref(), Some(input));

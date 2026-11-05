@@ -358,7 +358,94 @@ fn viewer_outer(area: Rect) -> Rect {
 }
 
 pub fn viewer_body(area: Rect) -> Rect {
-    viewer_inner(viewer_outer(area))
+    let mut inner = viewer_inner(viewer_outer(area));
+    if inner.width >= 2 && inner.height > 0 {
+        inner.width -= 1;
+    }
+    inner
+}
+
+fn viewer_track(area: Rect) -> Option<Rect> {
+    let inner = viewer_inner(viewer_outer(area));
+    (inner.width >= 2 && inner.height > 0)
+        .then(|| Rect::new(inner.x + inner.width - 1, inner.y, 1, inner.height))
+}
+
+/// Scrollbar geometry and scroll units for the current viewer mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewerScrollBar {
+    pub track: Rect,
+    pub thumb: Rect,
+    pub offset: usize,
+    pub maximum: usize,
+    pub viewport: usize,
+}
+
+impl ViewerScrollBar {
+    /// Map an inline-local row and the grabbed point within the thumb to a scroll offset.
+    pub fn scroll_at(&self, terminal_local_row: u16, grab_offset: u16) -> usize {
+        let travel = self.track.height.saturating_sub(self.thumb.height);
+        if travel == 0 || self.maximum == 0 {
+            return 0;
+        }
+        let position = terminal_local_row
+            .saturating_sub(self.track.y)
+            .saturating_sub(grab_offset)
+            .min(travel);
+        ((position as u128 * self.maximum as u128) / travel as u128) as usize
+    }
+}
+
+fn scrollbar_geometry(
+    track: Rect,
+    offset: usize,
+    maximum: usize,
+    viewport: usize,
+) -> ViewerScrollBar {
+    let offset = offset.min(maximum);
+    let length = if maximum == 0 {
+        track.height
+    } else {
+        ((track.height as u128 * viewport as u128) / (viewport as u128 + maximum as u128)).max(1)
+            as u16
+    };
+    let travel = track.height - length;
+    let top = if maximum == 0 {
+        0
+    } else {
+        ((travel as u128 * offset as u128) / maximum as u128) as u16
+    };
+    ViewerScrollBar {
+        track,
+        thumb: Rect::new(track.x, track.y + top, 1, length),
+        offset,
+        maximum,
+        viewport,
+    }
+}
+
+/// Return the interactive scrollbar for an open viewer with a known scroll range.
+pub fn viewer_scrollbar(app: &App, area: Rect) -> Option<ViewerScrollBar> {
+    if !app.is_viewing() {
+        return None;
+    }
+    let track = viewer_track(area)?;
+    let maximum = viewer_scroll_max(app, area);
+    if maximum == usize::MAX {
+        return None;
+    }
+    let rows = viewer_body(area).height as usize;
+    let viewport = if app.is_rendered_markdown_view() {
+        rows.saturating_mul(app.markdown_scroll_step())
+    } else {
+        rows
+    };
+    Some(scrollbar_geometry(
+        track,
+        app.viewer_scroll(),
+        maximum,
+        viewport,
+    ))
 }
 
 fn viewer_inner(outer: Rect) -> Rect {
@@ -376,8 +463,8 @@ pub fn viewer_page_rows(area: Rect) -> usize {
 
 /// The image rectangle is derived from the same layout used by the renderer.
 pub fn preview_image_area(app: &App, area: Rect) -> Option<Rect> {
-    if app.is_browser_view() {
-        app.browser_image()?;
+    if app.is_rendered_markdown_view() {
+        app.markdown_image()?;
         let body = viewer_body(area);
         return (body.width > 0 && body.height > 0).then_some(body);
     }
@@ -631,8 +718,8 @@ fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Re
 }
 
 pub fn viewer_scroll_max(app: &App, area: Rect) -> usize {
-    if app.is_browser_view() {
-        return app.browser_scroll_max();
+    if app.is_rendered_markdown_view() {
+        return app.markdown_scroll_max();
     }
     let body = viewer_body(area);
     viewer_text(app, body.width, &app.theme().palette())
@@ -646,8 +733,9 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         return;
     }
     let outer = viewer_outer(area);
-    let body = viewer_inner(outer);
-    if body != outer {
+    let inner = viewer_inner(outer);
+    let body = viewer_body(area);
+    if inner != outer {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
@@ -670,7 +758,7 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             let mode = if app.is_markdown_source() {
                 "source"
             } else {
-                "browser rendered"
+                "FMD rendered"
             };
             format!(" {mode} · {}", app.preview().label())
         } else {
@@ -702,8 +790,22 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             footer,
         );
     }
-    if app.is_browser_view() {
-        if let Some(message) = app.browser_message() {
+    if let Some(track) = viewer_track(area) {
+        let scrollbar = viewer_scrollbar(app, area);
+        let lines = (0..track.height)
+            .map(|row| {
+                let y = track.y + row;
+                if scrollbar.is_some_and(|bar| y >= bar.thumb.y && y < bar.thumb.bottom()) {
+                    Line::styled("┃", Style::default().fg(palette.accent))
+                } else {
+                    Line::styled("│", muted_style(palette))
+                }
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), track);
+    }
+    if app.is_rendered_markdown_view() {
+        if let Some(message) = app.markdown_message() {
             frame.render_widget(
                 Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: false }),
                 body,
@@ -1248,14 +1350,14 @@ mod tests {
         viewer_scroll_max(&app, Rect::new(0, 0, 30, 6));
         let cache = app.viewer_text_cache().borrow();
         let cache = cache.as_ref().unwrap();
-        assert_eq!(cache.width, 28);
+        assert_eq!(cache.width, 27);
         assert!(cache.rows.len() < narrow_count);
     }
 
     #[test]
     fn viewer_border_and_page_rows_follow_terminal_size() {
         let area = Rect::new(2, 3, 40, 12);
-        assert_eq!(viewer_body(area), Rect::new(3, 5, 38, 8));
+        assert_eq!(viewer_body(area), Rect::new(3, 5, 37, 8));
         assert_eq!(viewer_page_rows(area), 8);
         assert_eq!(viewer_page_rows(Rect::new(0, 0, 2, 2)), 2);
         let temp = tempdir().unwrap();
@@ -1269,6 +1371,81 @@ mod tests {
         assert!(rendered.contains('┘'));
         assert!(rendered.contains("│hello"));
         assert_eq!(viewer_page_rows(Rect::new(0, 0, 40, 7)), 3);
+    }
+
+    #[test]
+    fn scrollbar_geometry_preserves_endpoints_and_grab_offset() {
+        let track = Rect::new(8, 4, 1, 10);
+        let bar = scrollbar_geometry(track, 45, 90, 10);
+        assert_eq!(bar.thumb, Rect::new(8, 8, 1, 1));
+        assert_eq!(bar.scroll_at(0, 0), 0);
+        assert_eq!(bar.scroll_at(13, 0), 90);
+        assert_eq!(bar.scroll_at(u16::MAX, 0), 90);
+        let large_thumb = scrollbar_geometry(track, 0, 10, 10);
+        assert_eq!(large_thumb.thumb.height, 5);
+        assert_eq!(large_thumb.scroll_at(9, 2), 6);
+        assert_eq!(large_thumb.scroll_at(13, 2), 10);
+        let clamped = scrollbar_geometry(track, usize::MAX, 90, 10);
+        assert_eq!(clamped.offset, 90);
+        assert_eq!(clamped.thumb.bottom(), track.bottom());
+        let disabled = scrollbar_geometry(track, 20, 0, 10);
+        assert_eq!(disabled.thumb, track);
+        assert_eq!(disabled.offset, 0);
+        assert_eq!(disabled.scroll_at(13, 0), 0);
+    }
+
+    #[test]
+    fn scrollbar_handles_large_pixel_ranges_without_overflow() {
+        let track = Rect::new(1, 2, 1, 100);
+        let maximum = usize::MAX - 1;
+        let bar = scrollbar_geometry(track, maximum, maximum, usize::MAX);
+        assert_eq!(bar.thumb.height, 50);
+        assert_eq!(bar.thumb.bottom(), track.bottom());
+        assert_eq!(bar.scroll_at(track.bottom() - 1, 0), maximum);
+        let long_page = scrollbar_geometry(track, 500_000, 1_000_000, 1_600);
+        assert_eq!(long_page.thumb.height, 1);
+        assert_eq!(long_page.thumb.y, track.y + 49);
+    }
+
+    #[test]
+    fn scrollbar_and_body_share_tiny_area_boundaries() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "a\nb\nc").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let one_column = Rect::new(0, 0, 1, 2);
+        assert_eq!(viewer_body(one_column), one_column);
+        assert!(viewer_scrollbar(&app, one_column).is_none());
+        let no_rows = Rect::new(0, 0, 5, 0);
+        assert!(viewer_scrollbar(&app, no_rows).is_none());
+        let two_columns = Rect::new(0, 0, 2, 2);
+        assert_eq!(viewer_body(two_columns), Rect::new(0, 0, 1, 2));
+        assert_eq!(
+            viewer_scrollbar(&app, two_columns).unwrap().track,
+            Rect::new(1, 0, 1, 2)
+        );
+    }
+
+    #[test]
+    fn scrollbar_width_controls_text_and_markdown_source_wrapping() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.md"), "abcdefghij").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let area = Rect::new(0, 0, 8, 5);
+        assert!(viewer_scrollbar(&app, area).is_none());
+        app.toggle_markdown_source();
+        let bar = viewer_scrollbar(&app, area).unwrap();
+        assert_eq!(viewer_body(area).width, 5);
+        assert_eq!(bar.maximum, 1);
+        assert_eq!(bar.viewport, 1);
+        let mut terminal = Terminal::new(TestBackend::new(8, 5)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let screen = terminal.backend().to_string();
+        assert!(screen.contains("abcde┃"));
+        app.set_viewer_scroll(1);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(terminal.backend().to_string().contains("fghij┃"));
     }
 
     #[test]

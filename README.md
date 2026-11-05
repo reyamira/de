@@ -112,7 +112,7 @@ to use the navigation controls above.
 The right pane and inline viewer support these file types:
 
 - **Markdown:** The right pane shows a styled text excerpt. The full-width
-  viewer renders Markdown with a browser, including tables and local images.
+  viewer uses native FMD rendering, including tables and supported local images.
 - **JSON:** Formatted, colorized text that preserves key order and number text.
   Invalid JSON remains readable with an error notice.
 - **Plain text:** UTF-8 text with terminal control characters replaced.
@@ -120,28 +120,44 @@ The right pane and inline viewer support these file types:
   Animated images show their first frame.
 
 The full-width viewer has a thin border around its contents. Text and images
-use the space inside that border, including after a terminal resize.
+use the space inside that border, including after a terminal resize. A scrollbar
+uses the rightmost content column when there is enough space.
 
 In the viewer, use arrows or `j`/`k` to scroll. Use `PageUp`/`PageDown` for pages
 and `Home`/`End` for the beginning or end. For Markdown, press `m` to switch
-between the browser-rendered page and source. The header shows the current mode.
+between the rendered page and source. The header shows the current mode.
 Press `Escape` or `q` to return to the same selection. Press `o` to open the
 file externally. During filter input, `v` and `m` remain query text.
+
+Use the mouse wheel over the viewer to scroll three rows per notch. Click the
+scrollbar track to jump, or drag the thumb to scroll. Mouse capture is active
+only while the viewer is open. The viewer stays next to the prompt, subject to
+normal terminal scrolling when it needs more rows. Mouse controls require a
+terminal that answers cursor-position queries. If it does not answer promptly,
+mouse capture stays off for that session; keyboard controls remain available.
+After the terminal width shrinks, reflow can leave a fragment of the old frame
+above the viewer.
 
 Image previews require the Kitty graphics protocol. They are unavailable in
 other terminals and inside tmux, GNU Screen, or Zellij. When `de` cannot show a
 file, it explains the reason and shows the external-open option. Video playback
 remains external.
 
-The Markdown browser view requires Chromium or Chrome on `PATH` and Kitty or
-Ghostty without a terminal multiplexer. The page is a raster image, so text
+The native FMD Markdown view requires Kitty or Ghostty without a terminal
+multiplexer. It does not require a browser. The page is a raster image, so text
 selection and clickable links are not available. Source mode does not require
-the browser or terminal graphics support.
+terminal graphics support.
 
-Local Markdown images must be inside the document folder or its subfolders.
-Remote assets are blocked, and raw HTML is not executed. Browser rendering runs
-in the background. The viewer reuses its browser and keeps the last viewport
-while it prepares a new one. New requests replace queued work.
+Markdown images must be local PNG, JPEG, GIF, WebP, or BMP files inside the
+document folder or its subfolders. Remote assets are not loaded. Raw HTML is
+inert. Animated GIFs show their first frame. Images are resized to at most 2,048
+pixels per side. Each file is limited to 16 MiB and 16,777,216 pixels. Each
+document is limited to 128 image occurrences, 32 MiB of image source data, and
+33,554,432 decoded or rendered pixels in total.
+
+FMD supports some Mermaid diagrams. Unsupported diagrams remain as source.
+Rendering runs in the background. The viewer keeps the last viewport while it
+prepares a new one. New requests replace queued work.
 
 Text previews accept regular UTF-8 files up to 1 MiB. Styled text and source
 previews show at most 20,000 lines. Image previews accept files up to 16 MiB

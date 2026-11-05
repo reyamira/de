@@ -134,10 +134,10 @@ pub struct App {
     image_loader: Option<crate::image_loader::ImageLoader>,
     image_request: Option<u64>,
     viewer_text_cache: RefCell<Option<crate::ui::ViewerText>>,
-    markdown_renderer: Option<crate::markdown_browser::MarkdownRenderer>,
+    markdown_renderer: Option<crate::markdown_renderer::MarkdownRenderer>,
     markdown_request: Option<u64>,
     markdown_key: Option<(u32, u32, u32, bool)>,
-    markdown_page: Option<crate::markdown_browser::RenderedPage>,
+    markdown_page: Option<crate::markdown_renderer::RenderedPage>,
     markdown_error: Option<String>,
     markdown_cell_height: usize,
 }
@@ -295,7 +295,7 @@ impl App {
             .is_some_and(|loader| loader.is_pending())
     }
 
-    pub fn is_browser_view(&self) -> bool {
+    pub fn is_rendered_markdown_view(&self) -> bool {
         self.viewing
             && !self.markdown_source
             && self
@@ -305,39 +305,39 @@ impl App {
                 .is_some_and(|d| d.markdown_source.is_some())
     }
 
-    pub fn browser_image(&self) -> Option<&crate::media::ImagePreview> {
-        self.is_browser_view()
+    pub fn markdown_image(&self) -> Option<&crate::media::ImagePreview> {
+        self.is_rendered_markdown_view()
             .then_some(self.markdown_page.as_ref())
             .flatten()
             .map(|page| &page.image)
     }
 
-    pub fn browser_message(&self) -> Option<&str> {
+    pub fn markdown_message(&self) -> Option<&str> {
         self.markdown_error.as_deref().or_else(|| {
             self.markdown_page
                 .is_none()
-                .then_some("Rendering Markdown in browser…")
+                .then_some("Rendering Markdown with FMD…")
         })
     }
 
-    pub fn browser_pending(&self) -> bool {
+    pub fn markdown_pending(&self) -> bool {
         self.markdown_renderer
             .as_ref()
             .is_some_and(|renderer| renderer.is_pending())
     }
 
-    pub fn browser_scroll_step(&self) -> usize {
+    pub fn markdown_scroll_step(&self) -> usize {
         self.markdown_cell_height
     }
 
-    pub fn browser_scroll_max(&self) -> usize {
+    pub fn markdown_scroll_max(&self) -> usize {
         self.markdown_page
             .as_ref()
             .map_or(usize::MAX, |page| page.max_scroll as usize)
     }
 
-    pub fn update_browser_view(&mut self, width: u32, height: u32, cell_height: u32) {
-        if !self.is_browser_view() || width == 0 || height == 0 {
+    pub fn update_markdown_view(&mut self, width: u32, height: u32, cell_height: u32) {
+        if !self.is_rendered_markdown_view() || width == 0 || height == 0 {
             return;
         }
         self.markdown_cell_height = cell_height.max(1) as usize;
@@ -366,8 +366,8 @@ impl App {
         };
         let renderer = self
             .markdown_renderer
-            .get_or_insert_with(crate::markdown_browser::MarkdownRenderer::new);
-        self.markdown_request = Some(renderer.request(crate::markdown_browser::RenderRequest {
+            .get_or_insert_with(crate::markdown_renderer::MarkdownRenderer::new);
+        self.markdown_request = Some(renderer.request(crate::markdown_renderer::RenderRequest {
             path,
             source,
             width,
@@ -379,7 +379,7 @@ impl App {
         self.markdown_error = None;
     }
 
-    pub fn poll_browser(&mut self) -> bool {
+    pub fn poll_markdown(&mut self) -> bool {
         let Some((generation, result)) = self
             .markdown_renderer
             .as_mut()
@@ -387,7 +387,7 @@ impl App {
         else {
             return false;
         };
-        if self.markdown_request != Some(generation) || !self.is_browser_view() {
+        if self.markdown_request != Some(generation) || !self.is_rendered_markdown_view() {
             return false;
         }
         self.markdown_request = None;
@@ -441,7 +441,7 @@ impl App {
     }
 
     pub fn set_viewer_scroll(&mut self, scroll: usize) {
-        if self.is_browser_view() && self.viewer_scroll != scroll {
+        if self.is_rendered_markdown_view() && self.viewer_scroll != scroll {
             if let Some(renderer) = self.markdown_renderer.as_mut() {
                 renderer.cancel();
             }
@@ -876,7 +876,7 @@ mod tests {
         fs::write(temp.path().join("b.md"), "# B").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         app.open_viewer();
-        app.markdown_page = Some(crate::markdown_browser::RenderedPage {
+        app.markdown_page = Some(crate::markdown_renderer::RenderedPage {
             image: crate::media::ImagePreview {
                 width: 10,
                 height: 20,
@@ -885,15 +885,15 @@ mod tests {
             scroll_y: 0,
             max_scroll: 250,
         });
-        assert_eq!(app.browser_scroll_max(), 250);
-        assert!(app.browser_image().is_some());
+        assert_eq!(app.markdown_scroll_max(), 250);
+        assert!(app.markdown_image().is_some());
         app.toggle_markdown_source();
-        assert!(app.browser_image().is_none());
+        assert!(app.markdown_image().is_none());
         app.toggle_markdown_source();
-        assert!(app.browser_image().is_none());
+        assert!(app.markdown_image().is_none());
         app.move_down();
-        assert!(app.browser_image().is_none());
-        assert_eq!(app.browser_scroll_max(), usize::MAX);
+        assert!(app.markdown_image().is_none());
+        assert_eq!(app.markdown_scroll_max(), usize::MAX);
     }
 
     #[test]
