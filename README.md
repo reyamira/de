@@ -111,9 +111,8 @@ to use the navigation controls above.
 
 The right pane and inline viewer support these file types:
 
-- **Markdown:** Rendered headings, lists, emphasis, links, and code blocks.
-  Paragraphs reflow to the available width. Explicit line breaks and code lines
-  keep their line breaks.
+- **Markdown:** The right pane shows a styled text excerpt. The full-width
+  viewer renders Markdown with a browser, including tables and local images.
 - **JSON:** Formatted, colorized text that preserves key order and number text.
   Invalid JSON remains readable with an error notice.
 - **Plain text:** UTF-8 text with terminal control characters replaced.
@@ -125,18 +124,29 @@ use the space inside that border, including after a terminal resize.
 
 In the viewer, use arrows or `j`/`k` to scroll. Use `PageUp`/`PageDown` for pages
 and `Home`/`End` for the beginning or end. For Markdown, press `m` to switch
-between rendered text and source. The header shows the current mode. Press
-`Escape` or `q` to return to the same selection. Press `o` to open the file
-externally. During filter input, `v` and `m` remain query text.
+between the browser-rendered page and source. The header shows the current mode.
+Press `Escape` or `q` to return to the same selection. Press `o` to open the
+file externally. During filter input, `v` and `m` remain query text.
 
 Image previews require the Kitty graphics protocol. They are unavailable in
 other terminals and inside tmux, GNU Screen, or Zellij. When `de` cannot show a
 file, it explains the reason and shows the external-open option. Video playback
 remains external.
 
-Text previews accept regular UTF-8 files up to 1 MiB and show at most 20,000
-lines. Image previews accept files up to 16 MiB and 16,777,216 pixels, with each
-dimension at most 16,384 pixels. Images use EXIF orientation and scale to at
+The Markdown browser view requires Chromium or Chrome on `PATH` and Kitty or
+Ghostty without a terminal multiplexer. The page is a raster image, so text
+selection and clickable links are not available. Source mode does not require
+the browser or terminal graphics support.
+
+Local Markdown images must be inside the document folder or its subfolders.
+Remote assets are blocked, and raw HTML is not executed. Browser rendering runs
+in the background. The viewer reuses its browser and keeps the last viewport
+while it prepares a new one. New requests replace queued work.
+
+Text previews accept regular UTF-8 files up to 1 MiB. Styled text and source
+previews show at most 20,000 lines. Image previews accept files up to 16 MiB
+and 16,777,216 pixels, with each dimension at most 16,384 pixels.
+Images use EXIF orientation and scale to at
 most 2,048 pixels per side before terminal transfer. Press `r` in the picker to
 reload a changed file.
 

@@ -3,6 +3,7 @@ pub mod backend;
 mod config;
 pub mod document;
 mod image_loader;
+mod markdown_browser;
 pub mod media;
 mod settings;
 mod theme;
@@ -17,7 +18,7 @@ pub use theme::{
 };
 pub use ui::{
     CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, preview_image_area, render, render_config_picker,
-    render_theme_preview, viewer_page_rows, viewer_scroll_max,
+    render_theme_preview, viewer_body, viewer_page_rows, viewer_scroll_max,
 };
 
 use std::ffi::OsStr;

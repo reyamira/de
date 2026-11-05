@@ -47,15 +47,39 @@ fn terminal_support(
     }
 }
 
-pub fn load_image(path: &Path) -> Result<ImagePreview, String> {
+pub(crate) fn ensure_terminal_support() -> Result<(), String> {
     terminal_support(
         &std::env::var("TERM").unwrap_or_default(),
         &std::env::var("TERM_PROGRAM").unwrap_or_default(),
         std::env::var_os("TMUX").is_some(),
         std::env::var_os("STY").is_some(),
         std::env::var_os("ZELLIJ").is_some(),
-    )?;
+    )
+}
+
+pub fn load_image(path: &Path) -> Result<ImagePreview, String> {
+    ensure_terminal_support()?;
     decode_image(path)
+}
+
+pub(crate) fn image_from_png(bytes: Vec<u8>) -> Result<ImagePreview, String> {
+    let (width, height) = ImageReader::with_format(Cursor::new(&bytes), image::ImageFormat::Png)
+        .into_dimensions()
+        .map_err(|error| format!("Cannot read rendered document image: {error}"))?;
+    if width == 0
+        || height == 0
+        || width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_PIXELS
+    {
+        return Err("Rendered document viewport exceeds the image size limit.".into());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(ImagePreview {
+        width,
+        height,
+        encoded: Arc::from(encoded.into_boxed_str()),
+    })
 }
 
 fn decode_image(path: &Path) -> Result<ImagePreview, String> {

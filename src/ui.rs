@@ -357,7 +357,7 @@ fn viewer_outer(area: Rect) -> Rect {
     }
 }
 
-fn viewer_body(area: Rect) -> Rect {
+pub fn viewer_body(area: Rect) -> Rect {
     viewer_inner(viewer_outer(area))
 }
 
@@ -376,6 +376,11 @@ pub fn viewer_page_rows(area: Rect) -> usize {
 
 /// The image rectangle is derived from the same layout used by the renderer.
 pub fn preview_image_area(app: &App, area: Rect) -> Option<Rect> {
+    if app.is_browser_view() {
+        app.browser_image()?;
+        let body = viewer_body(area);
+        return (body.width > 0 && body.height > 0).then_some(body);
+    }
     app.preview().image()?;
     let image_area = if app.is_viewing() {
         viewer_body(area)
@@ -626,6 +631,9 @@ fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Re
 }
 
 pub fn viewer_scroll_max(app: &App, area: Rect) -> usize {
+    if app.is_browser_view() {
+        return app.browser_scroll_max();
+    }
     let body = viewer_body(area);
     viewer_text(app, body.width, &app.theme().palette())
         .rows
@@ -662,7 +670,7 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             let mode = if app.is_markdown_source() {
                 "source"
             } else {
-                "rendered"
+                "browser rendered"
             };
             format!(" {mode} · {}", app.preview().label())
         } else {
@@ -693,6 +701,15 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             .style(muted_style(palette)),
             footer,
         );
+    }
+    if app.is_browser_view() {
+        if let Some(message) = app.browser_message() {
+            frame.render_widget(
+                Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: false }),
+                body,
+            );
+        }
+        return;
     }
     let cached = viewer_text(app, body.width, palette);
     let lines = cached
@@ -1269,7 +1286,7 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("rendered"));
         assert!(rendered.contains("m mode"));
-        assert!(rendered.contains("Some bold text"));
+        assert!(!rendered.contains("Some bold text"));
         assert!(!rendered.contains("**bold**"));
         app.toggle_markdown_source();
         terminal.draw(|frame| render(frame, &app)).unwrap();

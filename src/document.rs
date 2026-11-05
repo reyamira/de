@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -13,6 +14,7 @@ use crate::Palette;
 pub struct Document {
     pub lines: Vec<Line<'static>>,
     pub source_lines: Option<Vec<Line<'static>>>,
+    pub markdown_source: Option<Arc<str>>,
     pub notice: Option<String>,
 }
 
@@ -62,6 +64,7 @@ pub fn load(path: &Path, palette: &Palette) -> Result<Document, String> {
             lines: vec![Line::default()],
             source_lines: is_markdown.then(|| vec![Line::default()]),
             notice: Some("Empty file.".into()),
+            markdown_source: is_markdown.then(|| Arc::from(text)),
         });
     }
     if extension.eq_ignore_ascii_case("json") {
@@ -162,12 +165,14 @@ impl Lines {
         Document {
             lines: self.lines,
             source_lines: None,
+            markdown_source: None,
             notice,
         }
     }
 }
 
 fn markdown_document(text: &str, palette: &Palette) -> Document {
+    let original = Arc::from(text);
     let text = sanitize(text);
     let mut source = text.split('\n');
     let source_lines: Vec<_> = source
@@ -283,6 +288,7 @@ fn markdown_document(text: &str, palette: &Palette) -> Document {
         doc.notice = Some(format!("Preview is limited to {MAX_LINES} lines."));
     }
     doc.source_lines = Some(source_lines);
+    doc.markdown_source = Some(original);
     doc
 }
 
@@ -417,6 +423,14 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn markdown_retains_original_source_for_browser() {
+        let input = "# Heading\r\n\tText \u{1b}";
+        let doc = markdown_document(input, &palette());
+        assert_eq!(doc.markdown_source.as_deref(), Some(input));
+        assert!(!lines_text(doc.source_lines.as_ref().unwrap()).contains('\u{1b}'));
     }
 
     #[test]

@@ -134,6 +134,12 @@ pub struct App {
     image_loader: Option<crate::image_loader::ImageLoader>,
     image_request: Option<u64>,
     viewer_text_cache: RefCell<Option<crate::ui::ViewerText>>,
+    markdown_renderer: Option<crate::markdown_browser::MarkdownRenderer>,
+    markdown_request: Option<u64>,
+    markdown_key: Option<(u32, u32, u32, bool)>,
+    markdown_page: Option<crate::markdown_browser::RenderedPage>,
+    markdown_error: Option<String>,
+    markdown_cell_height: usize,
 }
 
 impl App {
@@ -182,6 +188,12 @@ impl App {
             image_loader: None,
             image_request: None,
             viewer_text_cache: RefCell::new(None),
+            markdown_renderer: None,
+            markdown_request: None,
+            markdown_key: None,
+            markdown_page: None,
+            markdown_error: None,
+            markdown_cell_height: 16,
         };
         app.refresh_preview();
         Ok(app)
@@ -254,6 +266,7 @@ impl App {
         {
             self.markdown_source = !self.markdown_source;
             self.viewer_scroll = 0;
+            self.cancel_markdown();
         }
     }
 
@@ -282,6 +295,129 @@ impl App {
             .is_some_and(|loader| loader.is_pending())
     }
 
+    pub fn is_browser_view(&self) -> bool {
+        self.viewing
+            && !self.markdown_source
+            && self
+                .preview
+                .document
+                .as_ref()
+                .is_some_and(|d| d.markdown_source.is_some())
+    }
+
+    pub fn browser_image(&self) -> Option<&crate::media::ImagePreview> {
+        self.is_browser_view()
+            .then_some(self.markdown_page.as_ref())
+            .flatten()
+            .map(|page| &page.image)
+    }
+
+    pub fn browser_message(&self) -> Option<&str> {
+        self.markdown_error.as_deref().or_else(|| {
+            self.markdown_page
+                .is_none()
+                .then_some("Rendering Markdown in browser…")
+        })
+    }
+
+    pub fn browser_pending(&self) -> bool {
+        self.markdown_renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.is_pending())
+    }
+
+    pub fn browser_scroll_step(&self) -> usize {
+        self.markdown_cell_height
+    }
+
+    pub fn browser_scroll_max(&self) -> usize {
+        self.markdown_page
+            .as_ref()
+            .map_or(usize::MAX, |page| page.max_scroll as usize)
+    }
+
+    pub fn update_browser_view(&mut self, width: u32, height: u32, cell_height: u32) {
+        if !self.is_browser_view() || width == 0 || height == 0 {
+            return;
+        }
+        self.markdown_cell_height = cell_height.max(1) as usize;
+        let scroll = self.viewer_scroll.min(u32::MAX as usize) as u32;
+        let dark = self.theme.name() != "light";
+        let key = (width, height, scroll, dark);
+        if self.markdown_key == Some(key) {
+            return;
+        }
+        if self
+            .markdown_key
+            .is_some_and(|old| old.0 != width || old.1 != height || old.3 != dark)
+        {
+            self.markdown_page = None;
+        }
+        let Some(path) = self.preview.path.clone() else {
+            return;
+        };
+        let Some(source) = self
+            .preview
+            .document
+            .as_ref()
+            .and_then(|d| d.markdown_source.clone())
+        else {
+            return;
+        };
+        let renderer = self
+            .markdown_renderer
+            .get_or_insert_with(crate::markdown_browser::MarkdownRenderer::new);
+        self.markdown_request = Some(renderer.request(crate::markdown_browser::RenderRequest {
+            path,
+            source,
+            width,
+            height,
+            scroll_y: scroll,
+            dark,
+        }));
+        self.markdown_key = Some(key);
+        self.markdown_error = None;
+    }
+
+    pub fn poll_browser(&mut self) -> bool {
+        let Some((generation, result)) = self
+            .markdown_renderer
+            .as_mut()
+            .and_then(|renderer| renderer.poll())
+        else {
+            return false;
+        };
+        if self.markdown_request != Some(generation) || !self.is_browser_view() {
+            return false;
+        }
+        self.markdown_request = None;
+        match result {
+            Ok(page) => {
+                self.viewer_scroll = page.scroll_y as usize;
+                if let Some(key) = &mut self.markdown_key {
+                    key.2 = page.scroll_y;
+                }
+                self.markdown_error = None;
+                self.markdown_page = Some(page);
+            }
+            Err(error) => {
+                self.markdown_page = None;
+                self.markdown_error = Some(error);
+            }
+        }
+        true
+    }
+
+    fn cancel_markdown(&mut self) {
+        if let Some(renderer) = self.markdown_renderer.as_mut() {
+            renderer.cancel();
+        }
+        self.markdown_request = None;
+        self.markdown_key = None;
+        self.markdown_page = None;
+        self.markdown_error = None;
+    }
+
     pub fn viewer_scroll(&self) -> usize {
         self.viewer_scroll
     }
@@ -301,9 +437,17 @@ impl App {
     pub fn close_viewer(&mut self) {
         self.viewing = false;
         self.viewer_scroll = 0;
+        self.cancel_markdown();
     }
 
     pub fn set_viewer_scroll(&mut self, scroll: usize) {
+        if self.is_browser_view() && self.viewer_scroll != scroll {
+            if let Some(renderer) = self.markdown_renderer.as_mut() {
+                renderer.cancel();
+            }
+            self.markdown_request = None;
+            self.markdown_key = None;
+        }
         self.viewer_scroll = scroll;
     }
 
@@ -546,6 +690,7 @@ impl App {
     fn refresh_preview(&mut self) {
         let Some(entry) = self.selected_entry() else {
             self.cancel_image_request();
+            self.cancel_markdown();
             self.viewer_text_cache.get_mut().take();
             self.markdown_source = false;
             self.preview = Preview {
@@ -566,6 +711,7 @@ impl App {
             return;
         }
         self.cancel_image_request();
+        self.cancel_markdown();
         self.viewer_text_cache.get_mut().take();
         self.markdown_source = false;
         let mut preview = Preview {
@@ -721,6 +867,33 @@ mod tests {
         File::create(temp.path().join("notes.txt")).unwrap();
         let app = App::new(temp.path().to_path_buf()).unwrap();
         (temp, app)
+    }
+
+    #[test]
+    fn markdown_page_is_discarded_when_mode_or_selection_changes() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("a.md"), "# A").unwrap();
+        fs::write(temp.path().join("b.md"), "# B").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        app.markdown_page = Some(crate::markdown_browser::RenderedPage {
+            image: crate::media::ImagePreview {
+                width: 10,
+                height: 20,
+                encoded: "image".into(),
+            },
+            scroll_y: 0,
+            max_scroll: 250,
+        });
+        assert_eq!(app.browser_scroll_max(), 250);
+        assert!(app.browser_image().is_some());
+        app.toggle_markdown_source();
+        assert!(app.browser_image().is_none());
+        app.toggle_markdown_source();
+        assert!(app.browser_image().is_none());
+        app.move_down();
+        assert!(app.browser_image().is_none());
+        assert_eq!(app.browser_scroll_max(), usize::MAX);
     }
 
     #[test]
