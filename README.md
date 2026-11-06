@@ -15,19 +15,16 @@ It is intentionally not a full file manager. Press `o` to open the highlighted
 file in its default application. There are no delete, rename, copy, or built-in
 edit commands.
 
-## What's new in v0.4.0
+## What's new in v0.4.1
 
-- Native rendered Markdown replaces Chromium, with tables, local images, and
-  supported Mermaid diagrams. Press `m` to switch between rendered Markdown and source.
-- Syntax highlighting covers more file types, including TypeScript, TSX, JSX,
-  TOML, JSONC, JSON5, Dockerfiles, Vue, Svelte, GraphQL, Prisma, and Terraform/HCL.
-  Run `de languages` for the full list.
-- The inline viewer has a border, uses the available width, and supports mouse
-  scrolling and a clickable, draggable scrollbar in compatible terminals.
-- Plain text keeps its original line breaks by default.
-  Press uppercase `R` to switch to a reading layout that reflows paragraphs.
+- The right preview and full-width source viewer share richer Markdown colors
+  and text styles while preserving the original source.
+- Markdown code fences use the loaded syntax grammars and common language aliases,
+  including shell, JSON, Go, Java, SQL, and YAML.
+- Detailed viewer, configuration, development, and release guides now live in
+  `docs/` and accompany release archives.
 
-See the [v0.4.0 release notes](https://github.com/reyamira/de/releases/tag/v0.4.0)
+See the [v0.4.1 release notes](https://github.com/reyamira/de/releases/tag/v0.4.1)
 and [release history](https://github.com/reyamira/de/releases) for changes between versions.
 
 ## Install
