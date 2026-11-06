@@ -15,16 +15,18 @@ It is intentionally not a full file manager. Press `o` to open the highlighted
 file in its default application. There are no delete, rename, copy, or built-in
 edit commands.
 
-## What's new in v0.4.1
+## What's new in v0.5.0
 
-- The right preview and full-width source viewer share richer Markdown colors
-  and text styles while preserving the original source.
-- Markdown code fences use the loaded syntax grammars and common language aliases,
-  including shell, JSON, Go, Java, SQL, and YAML.
-- Detailed viewer, configuration, development, and release guides now live in
-  `docs/` and accompany release archives.
+- `de theme edit` provides interactive editing, inherited values, input guidance,
+  and safe save/cancel behavior. Built-in themes save as named custom copies.
+- Separate palettes control interface, syntax, Markdown source, and rendered colors.
+- Rendered Markdown supports local body, heading, and code fonts, configurable sizes,
+  heading scale, line spacing, and page padding.
+- Complete Browser, Source, and Rendered Markdown samples demonstrate every theme role.
+  Tab cycles the editor's right panel without hiding the settings.
+- Long values and theme names have visible carets and horizontal scrolling.
 
-See the [v0.4.1 release notes](https://github.com/reyamira/de/releases/tag/v0.4.1)
+See the [v0.5.0 release notes](https://github.com/reyamira/de/releases/tag/v0.5.0)
 and [release history](https://github.com/reyamira/de/releases) for changes between versions.
 
 ## Install
