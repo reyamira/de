@@ -62,6 +62,7 @@ jobs:
           mkdir "${archive}"
           cp "target/${{ matrix.target }}/release/de" "${archive}/de"
           cp README.md LICENSE "${archive}/"
+          cp -R docs "${archive}/docs"
           cp -R assets/syntaxes "${archive}/syntaxes"
           tar -czf "${archive}.tar.gz" "${archive}"
           shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
