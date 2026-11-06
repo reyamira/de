@@ -1,9 +1,10 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::parsing::{
@@ -16,7 +17,6 @@ use crate::Palette;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Document {
     pub lines: Vec<Line<'static>>,
-    pub source_lines: Option<Vec<Line<'static>>>,
     pub markdown_source: Option<Arc<str>>,
     pub supports_reading: bool,
     pub notice: Option<String>,
@@ -66,7 +66,6 @@ pub fn load(path: &Path, palette: &Palette) -> Result<Document, String> {
     if text.is_empty() {
         return Ok(Document {
             lines: vec![Line::default()],
-            source_lines: is_markdown.then(|| vec![Line::default()]),
             notice: Some("Empty file.".into()),
             markdown_source: is_markdown.then(|| Arc::from(text)),
             supports_reading: !is_markdown
@@ -149,12 +148,6 @@ impl Lines {
         }
     }
 
-    fn end_block(&mut self) {
-        if !self.current.is_empty() {
-            self.newline();
-        }
-    }
-
     fn finish(mut self, notice: Option<String>) -> Document {
         if !self.current.is_empty() || self.lines.is_empty() {
             self.lines.push(Line::from(self.current));
@@ -169,7 +162,6 @@ impl Lines {
         };
         Document {
             lines: self.lines,
-            source_lines: None,
             markdown_source: None,
             supports_reading: false,
             notice,
@@ -180,6 +172,7 @@ impl Lines {
 struct SyntaxAssets {
     syntaxes: SyntaxSet,
     scopes: [(Scope, SyntaxColor); 10],
+    markdown_scopes: [Scope; 13],
 }
 
 #[derive(Clone, Copy)]
@@ -188,6 +181,75 @@ enum SyntaxColor {
     Title,
     Accent,
     Symlink,
+}
+
+// Generate Sublime embed rules from the same inventory used for source files.
+// Exact spellings win before case-insensitive matches, so extensions such as
+// C/c and M/m can retain their distinct grammars.
+fn markdown_syntax(syntaxes: &[SyntaxDefinition]) -> String {
+    let mut labels = BTreeMap::new();
+    for syntax in syntaxes {
+        let scope = syntax.scope.to_string();
+        if scope.starts_with("text.html.markdown") {
+            continue;
+        }
+        for label in syntax
+            .file_extensions
+            .iter()
+            .chain(std::iter::once(&syntax.name))
+        {
+            if !label.is_empty() && !label.chars().any(char::is_whitespace) {
+                labels.insert(label.clone(), scope.clone());
+            }
+        }
+    }
+    for (alias, extension) in [
+        ("shell", "sh"),
+        ("node", "js"),
+        ("python3", "py"),
+        ("docker", "Dockerfile"),
+    ] {
+        if let Some(scope) = labels.get(extension).cloned() {
+            labels.insert(alias.to_owned(), scope);
+        }
+    }
+    let mut folded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (label, scope) in &labels {
+        folded
+            .entry(label.to_ascii_lowercase())
+            .or_default()
+            .insert(scope.clone());
+    }
+    let mut rules = String::new();
+    let mut add_rule = |label: &str, scope: &str, insensitive: bool| {
+        let mut pattern = String::new();
+        for ch in label.chars() {
+            if !ch.is_ascii_alphanumeric() && ch != '_' {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        let pattern = pattern.replace('\'', "''");
+        let pattern = if insensitive {
+            format!("(?i:{pattern})")
+        } else {
+            pattern
+        };
+        writeln!(rules, "    - match: '{{{{fenced_code_block_start}}}}[ \\t]*({pattern})(?=[ \\t]|$)[^\\n]*$'\n      captures:\n        1: punctuation.definition.raw.code-fence.begin.markdown\n        2: constant.other.language-name.markdown\n      embed: scope:{scope}\n      embed_scope: markup.raw.code-fence.markdown\n      escape: '^[ ]{{0,3}}(\\1(?:`(?<=``)|~(?<=~~))*)[ \\t]*$'\n      escape_captures:\n        1: punctuation.definition.raw.code-fence.end.markdown").unwrap();
+    };
+    for (label, scope) in &labels {
+        add_rule(label, scope, false);
+    }
+    for (label, scopes) in &folded {
+        if scopes.len() == 1 {
+            add_rule(label, scopes.iter().next().unwrap(), true);
+        }
+    }
+    include_str!("../assets/syntaxes/Markdown.sublime-syntax").replacen(
+        "  fenced-code-block:\n",
+        &format!("  fenced-code-block:\n{rules}"),
+        1,
+    )
 }
 
 static SYNTAX_ASSETS: LazyLock<SyntaxAssets> = LazyLock::new(|| SyntaxAssets {
@@ -263,6 +325,11 @@ static SYNTAX_ASSETS: LazyLock<SyntaxAssets> = LazyLock::new(|| SyntaxAssets {
                 }),
             );
         }
+        let markdown = markdown_syntax(builder.syntaxes());
+        builder.add(
+            SyntaxDefinition::load_from_str(&markdown, true, None)
+                .expect("generated Markdown grammar must be valid"),
+        );
         builder.build()
     },
     scopes: [
@@ -277,14 +344,35 @@ static SYNTAX_ASSETS: LazyLock<SyntaxAssets> = LazyLock::new(|| SyntaxAssets {
         (Scope::new("constant").unwrap(), SyntaxColor::Symlink),
         (Scope::new("support").unwrap(), SyntaxColor::Symlink),
     ],
+    markdown_scopes: [
+        "text.html.markdown",
+        "markup.heading",
+        "markup.bold",
+        "markup.italic",
+        "meta.link.inline.description",
+        "meta.image.inline.description",
+        "markup.underline.link",
+        "markup.raw.inline",
+        "punctuation.definition",
+        "punctuation.definition.list_item",
+        "punctuation.definition.blockquote",
+        "markup.list.numbered.bullet",
+        "markup.raw.code-fence",
+    ]
+    .map(|name| Scope::new(name).unwrap()),
 });
 /// List the names and file associations of the loaded syntax definitions.
 pub fn syntax_definitions() -> impl Iterator<Item = (&'static str, &'static [String])> {
-    SYNTAX_ASSETS
-        .syntaxes
-        .syntaxes()
+    let syntaxes = SYNTAX_ASSETS.syntaxes.syntaxes();
+    let markdown = syntaxes
         .iter()
-        .map(|syntax| (syntax.name.as_str(), syntax.file_extensions.as_slice()))
+        .rposition(|syntax| syntax.name == "Markdown");
+    syntaxes
+        .iter()
+        .enumerate()
+        // The defaults retain their linked contexts. Only expose the replacement.
+        .filter(move |(index, syntax)| syntax.name != "Markdown" || Some(*index) == markdown)
+        .map(|(_, syntax)| (syntax.name.as_str(), syntax.file_extensions.as_slice()))
 }
 
 fn is_jsonc_config(path: &Path) -> bool {
@@ -333,19 +421,63 @@ fn syntax_for<'a>(
 }
 
 fn syntax_style(stack: &ScopeStack, assets: &SyntaxAssets, palette: &Palette) -> Style {
-    let color = stack.as_slice().iter().rev().find_map(|scope| {
+    let scopes = stack.as_slice();
+    let [
+        root,
+        heading,
+        bold,
+        italic,
+        link_label,
+        image_label,
+        link_url,
+        inline_code,
+        punctuation,
+        list_marker,
+        quote_marker,
+        numbered_marker,
+        fence,
+    ] = &assets.markdown_scopes;
+    let markdown = scopes
+        .first()
+        .is_some_and(|scope| root.is_prefix_of(*scope));
+    let has = |prefix: &Scope| scopes.iter().any(|scope| prefix.is_prefix_of(*scope));
+    let color = scopes.iter().rev().find_map(|scope| {
         assets
             .scopes
             .iter()
             .find_map(|(prefix, color)| prefix.is_prefix_of(*scope).then_some(color))
     });
-    Style::default().fg(match color {
+    let mut style = Style::default().fg(match color {
         Some(SyntaxColor::Muted) => palette.muted,
         Some(SyntaxColor::Title) => palette.title,
         Some(SyntaxColor::Accent) => palette.accent,
         Some(SyntaxColor::Symlink) => palette.symlink,
         None => palette.text,
-    })
+    });
+    if markdown && !has(fence) {
+        if has(list_marker) || has(quote_marker) || has(numbered_marker) {
+            style = style.fg(palette.accent);
+        } else if has(punctuation) {
+            style = style.fg(palette.muted);
+        } else if has(inline_code) {
+            style = style.fg(palette.accent);
+        } else if has(link_label) || has(image_label) {
+            style = style.fg(palette.symlink).add_modifier(Modifier::UNDERLINED);
+        } else if has(link_url) {
+            style = style.fg(palette.muted);
+        } else if has(heading) {
+            style = style.fg(palette.title);
+        }
+        if !has(punctuation) {
+            if has(heading) || has(bold) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if has(italic) {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+        }
+    }
+    style
 }
 
 // The input has already been sanitized. Parse once per document, retaining lexer
@@ -411,7 +543,6 @@ fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
     }
     Document {
         lines,
-        source_lines: None,
         markdown_source: None,
         supports_reading,
         notice: parts
@@ -421,114 +552,9 @@ fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
 }
 
 fn markdown_document(text: &str, palette: &Palette) -> Document {
-    let original = Arc::from(text);
-    let text = sanitize(text);
-    let source = source_document(Path::new("source.md"), &text, palette);
-    let source_truncated = source.notice.is_some();
-    let source_lines = source.lines;
-    let mut out = Lines::new();
-    let mut style = Style::default().fg(palette.text);
-    let mut styles = Vec::new();
-    let mut lists: Vec<Option<u64>> = Vec::new();
-    let mut links: Vec<String> = Vec::new();
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
-    for event in Parser::new_ext(&text, options) {
-        if out.truncated {
-            break;
-        }
-        match event {
-            Event::Start(tag) => {
-                styles.push(style);
-                match tag {
-                    Tag::Heading { .. } => {
-                        out.end_block();
-                        style = style.fg(palette.title).add_modifier(Modifier::BOLD);
-                    }
-                    Tag::CodeBlock(_) => {
-                        out.end_block();
-                        style = style.fg(palette.accent);
-                    }
-                    Tag::BlockQuote(_) => {
-                        out.end_block();
-                        out.push("│ ", Style::default().fg(palette.muted));
-                    }
-                    Tag::List(start) => lists.push(start),
-                    Tag::Item => {
-                        out.end_block();
-                        let indent = "  ".repeat(lists.len().saturating_sub(1));
-                        let marker = match lists.last_mut() {
-                            Some(Some(number)) => {
-                                let result = format!("{number}. ");
-                                *number = number.saturating_add(1);
-                                result
-                            }
-                            _ => "• ".to_string(),
-                        };
-                        out.push(
-                            &format!("{indent}{marker}"),
-                            Style::default().fg(palette.accent),
-                        );
-                    }
-                    Tag::Emphasis => style = style.add_modifier(Modifier::ITALIC),
-                    Tag::Strong => style = style.add_modifier(Modifier::BOLD),
-                    Tag::Strikethrough => style = style.add_modifier(Modifier::CROSSED_OUT),
-                    Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
-                        links.push(sanitize(&dest_url));
-                        style = style.fg(palette.symlink).add_modifier(Modifier::UNDERLINED);
-                    }
-                    _ => {}
-                }
-            }
-            Event::End(tag) => {
-                match tag {
-                    TagEnd::Heading(_)
-                    | TagEnd::Paragraph
-                    | TagEnd::CodeBlock
-                    | TagEnd::BlockQuote(_)
-                    | TagEnd::Item
-                    | TagEnd::HtmlBlock => out.end_block(),
-                    TagEnd::List(_) => {
-                        lists.pop();
-                    }
-                    TagEnd::Link | TagEnd::Image => {
-                        if let Some(destination) = links.pop()
-                            && !destination.is_empty()
-                        {
-                            out.push(
-                                &format!(" ({destination})"),
-                                Style::default().fg(palette.muted),
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-                if let Some(previous) = styles.pop() {
-                    style = previous;
-                }
-            }
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                out.push(&sanitize(&text), style)
-            }
-            Event::Code(text) => out.push(&sanitize(&text), style.fg(palette.accent)),
-            Event::SoftBreak => out.push(" ", style),
-            Event::HardBreak => out.newline(),
-            Event::Rule => {
-                out.end_block();
-                out.push("────────", Style::default().fg(palette.muted));
-                out.newline();
-            }
-            Event::TaskListMarker(done) => out.push(if done { "[x] " } else { "[ ] " }, style),
-            Event::FootnoteReference(text) | Event::InlineMath(text) | Event::DisplayMath(text) => {
-                out.push(&sanitize(&text), style)
-            }
-        }
-    }
-    let mut doc = out.finish(None);
-    if source_truncated && doc.notice.is_none() {
-        doc.notice = Some(format!("Preview is limited to {MAX_LINES} lines."));
-    }
-    doc.source_lines = Some(source_lines);
-    doc.markdown_source = Some(original);
+    let mut doc = source_document(Path::new("source.md"), &sanitize(text), palette);
+    doc.markdown_source = Some(Arc::from(text));
+    doc.supports_reading = false;
     doc
 }
 
@@ -683,55 +709,151 @@ mod tests {
         let input = "# Heading\r\n\tText \u{1b}";
         let doc = markdown_document(input, &palette());
         assert_eq!(doc.markdown_source.as_deref(), Some(input));
-        assert!(!lines_text(doc.source_lines.as_ref().unwrap()).contains('\u{1b}'));
+        assert_eq!(text(&doc), "# Heading\n    Text �");
     }
 
     #[test]
-    fn markdown_parses_styles_and_preserves_link_destination() {
-        let doc = markdown_document(
-            "# Title\n\n- *word* and [site](https://example.org)\n\n```\ncode\n```",
-            &palette(),
-        );
-        let rendered = text(&doc);
-        assert!(rendered.contains("Title"));
-        assert!(rendered.contains("• word and site (https://example.org)"));
-        assert!(rendered.contains("code"));
-        assert!(doc.lines.iter().flat_map(|line| &line.spans).any(
-            |span| span.content == "word" && span.style.add_modifier.contains(Modifier::ITALIC)
-        ));
+    fn markdown_source_styles_literal_markup() {
+        let input = "# Heading [site](https://example.org)\n\n- **bold** and *italic* and `code`\n\n> quote\n";
+        let doc = markdown_document(input, &palette());
+        assert_eq!(text(&doc), input);
+        let span = |line: usize, content: &str| {
+            doc.lines[line]
+                .spans
+                .iter()
+                .find(|span| span.content == content)
+                .unwrap()
+                .style
+        };
+        assert!(span(0, "Heading ").add_modifier.contains(Modifier::BOLD));
+        assert_eq!(span(0, "Heading ").fg, Some(palette().title));
+        assert_eq!(span(0, "[").fg, Some(palette().muted));
+        assert_eq!(span(0, "site").fg, Some(palette().symlink));
+        assert!(span(0, "site").add_modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(span(0, "https://example.org").fg, Some(palette().muted));
+        assert_eq!(span(2, "-").fg, Some(palette().accent));
+        assert_eq!(span(2, "**").fg, Some(palette().muted));
+        assert!(span(2, "bold").add_modifier.contains(Modifier::BOLD));
+        assert!(span(2, "italic").add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(span(2, "code").fg, Some(palette().accent));
+        assert_eq!(span(4, ">").fg, Some(palette().accent));
     }
 
     #[test]
-    fn markdown_reflows_soft_breaks_but_keeps_hard_and_block_breaks() {
-        let doc = markdown_document(
-            "first *styled\nwords* continue\nhere\n\nnext  \nhard\n\n```text\n  code\n  line\n```",
-            &palette(),
+    fn markdown_fenced_languages_highlight_and_close_without_losing_source() {
+        let input = "````rust\nfn main() { let value = \"hello\"; }\n```\nlet still_code = 1;\n````\n\n# After\n\n```unknown\nfn plain = \"text\";\n```\n";
+        let doc = markdown_document(input, &palette());
+        assert_eq!(text(&doc), input);
+        assert!(
+            doc.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("fn") && span.style.fg == Some(palette().title))
         );
-        assert_eq!(
-            text(&doc),
-            "first styled words continue here\nnext\nhard\n  code\n  line"
+        assert!(
+            doc.lines[1]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("hello")
+                    && span.style.fg == Some(palette().accent))
         );
-        assert!(doc.lines[0].spans.iter().any(|span| {
-            span.content.contains("words") && span.style.add_modifier.contains(Modifier::ITALIC)
+        assert!(
+            doc.lines[3]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("let") && span.style.fg == Some(palette().title))
+        );
+        assert!(
+            doc.lines[6]
+                .spans
+                .iter()
+                .any(|span| span.content.contains("After")
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+        assert!(
+            doc.lines[9]
+                .spans
+                .iter()
+                .all(|span| span.style.fg == Some(palette().text))
+        );
+    }
+
+    #[test]
+    fn markdown_fenced_language_labels_style_code_and_preserve_source() {
+        let cases = [
+            ("bash", "echo \"hello\""),
+            ("sh", "echo \"hello\""),
+            ("json", "{\"key\": \"hello\"}"),
+            ("go", "var message = \"hello\""),
+            ("java", "String message = \"hello\";"),
+            ("sql", "SELECT 'hello';"),
+            ("yaml", "message: \"hello\""),
+            ("shell", "echo \"hello\""),
+            ("js", "const message = \"hello\";"),
+            ("c++", "const char* message = \"hello\";"),
+            ("ts", "const message: string = \"hello\";"),
+            ("jsx", "const element = <div title=\"hello\" />;"),
+            ("tsx", "const element = <div title=\"hello\" />;"),
+        ];
+        for (label, code) in cases {
+            let input = format!("```{label}\n{code}\n```\n");
+            let doc = markdown_document(&input, &palette());
+            assert_eq!(text(&doc), input, "label: {label}");
+            assert_eq!(doc.markdown_source.as_deref(), Some(input.as_str()));
+            assert!(
+                doc.lines[1].spans.iter().any(|span| {
+                    span.content.contains("hello") && span.style.fg == Some(palette().accent)
+                }),
+                "string should be styled for {label}: {:?}",
+                doc.lines[1].spans
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_unknown_and_unlabeled_fences_remain_plain() {
+        for label in ["unknown-language", ""] {
+            let input = format!("```{label}\nfn value = \"hello\";\n# Not a heading\n```\n");
+            let doc = markdown_document(&input, &palette());
+            assert_eq!(text(&doc), input, "label: {label}");
+            assert_eq!(doc.markdown_source.as_deref(), Some(input.as_str()));
+            for line in &doc.lines[1..=2] {
+                assert!(
+                    line.spans.iter().all(|span| {
+                        span.style.fg == Some(palette().text)
+                            && !span.style.add_modifier.contains(Modifier::BOLD)
+                    }),
+                    "fence should be plain for {label}: {:?}",
+                    line.spans
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_fence_retains_multiline_state_and_restores_markdown() {
+        let input = "```rust\n/* first\nstill comment */\nlet value = \"hello\";\n```\n# After\n";
+        let doc = markdown_document(input, &palette());
+        assert_eq!(text(&doc), input);
+        assert_eq!(doc.markdown_source.as_deref(), Some(input));
+        assert!(doc.lines[2].spans.iter().any(|span| {
+            span.content.contains("still comment") && span.style.fg == Some(palette().muted)
+        }));
+        assert!(doc.lines[3].spans.iter().any(|span| {
+            span.content.contains("let") && span.style.fg == Some(palette().title)
+        }));
+        assert!(doc.lines[5].spans.iter().any(|span| {
+            span.content.contains("After") && span.style.add_modifier.contains(Modifier::BOLD)
         }));
     }
 
     #[test]
     fn markdown_source_keeps_markup_newlines_and_sanitizes_controls() {
         let doc = markdown_document("# title\r\n*line*\t\x1b\n\n", &palette());
-        assert_eq!(
-            lines_text(doc.source_lines.as_ref().unwrap()),
-            "# title\n*line*    �\n\n"
-        );
-        assert_eq!(text(&doc), "title\nline    �");
-        assert!(json_document("{}", &palette()).source_lines.is_none());
-    }
-
-    #[test]
-    fn markdown_source_truncation_is_reported_even_when_prose_reflows() {
+        assert_eq!(text(&doc), "# title\n*line*    �\n\n");
+        assert!(json_document("{}", &palette()).markdown_source.is_none());
         let doc = markdown_document(&"word\n".repeat(MAX_LINES + 1), &palette());
-        assert_eq!(doc.source_lines.as_ref().unwrap().len(), MAX_LINES);
-        assert_eq!(doc.lines.len(), 1);
+        assert_eq!(doc.lines.len(), MAX_LINES);
         assert!(doc.notice.unwrap().contains("limited"));
     }
 
@@ -1031,10 +1153,9 @@ mod tests {
     fn markdown_source_is_highlighted_and_source_limit_is_enforced() {
         let doc = markdown_document("# Heading\n\n**bold**\n", &palette());
         assert!(!doc.supports_reading);
-        let source = doc.source_lines.unwrap();
-        assert_eq!(lines_text(&source), "# Heading\n\n**bold**\n");
+        assert_eq!(text(&doc), "# Heading\n\n**bold**\n");
         assert!(
-            source
+            doc.lines
                 .iter()
                 .flat_map(|line| &line.spans)
                 .any(|span| span.style.fg != Some(palette().text))
@@ -1065,7 +1186,7 @@ mod tests {
         std::fs::write(&path, []).unwrap();
         let doc = load(&path, &palette()).unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(lines_text(doc.source_lines.as_ref().unwrap()), "");
+        assert_eq!(text(&doc), "");
         assert_eq!(doc.notice.as_deref(), Some("Empty file."));
     }
 

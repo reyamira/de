@@ -288,7 +288,7 @@ impl App {
                 .preview
                 .document
                 .as_ref()
-                .is_some_and(|document| document.source_lines.is_some())
+                .is_some_and(|document| document.markdown_source.is_some())
         {
             self.markdown_source = !self.markdown_source;
             self.reading = false;

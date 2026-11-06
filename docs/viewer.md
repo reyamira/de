@@ -4,8 +4,12 @@ Return to the [README](../README.md) for installation and navigation controls.
 
 The right pane and inline viewer support these file types:
 
-- **Markdown:** The right pane shows a styled text excerpt. The full-width
+- **Markdown:** The right pane shows highlighted literal source. The full-width
   viewer uses native FMD rendering, including tables and supported local images.
+  Press `m` in the viewer to show the same highlighted source as the right pane.
+  Fenced code uses loaded grammar names, file extensions, and common aliases
+  such as `shell`, `js`, and `c++`. Exact extension case takes priority when
+  spellings differ only by case. Unknown or unlabeled fences stay plain.
 - **JSON:** Formatted, colorized text that preserves key order and number text.
   Invalid JSON remains readable with an error notice.
 - **Source and plain text:** UTF-8 text with terminal control characters
@@ -14,8 +18,7 @@ The right pane and inline viewer support these file types:
   JSON5, JSX, Dockerfiles, Vue, Svelte, GraphQL, Prisma, Terraform/HCL,
   TypeScript (`.ts`, `.mts`, `.cts`), and TSX. Ordinary `.json` files retain
   strict JSON validation and formatting. The viewer selects a grammar by
-  filename, extension, or first line. Unknown types stay plain. Markdown source
-  also has syntax highlighting.
+  filename, extension, or first line. Unknown types stay plain.
 - **Images:** PNG, JPEG, GIF, WebP, and BMP in Kitty or Ghostty.
   Animated images show their first frame.
 

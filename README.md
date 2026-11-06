@@ -126,9 +126,10 @@ to use the navigation controls above.
 
 ### File previews
 
-The right pane previews Markdown, JSON, source code, plain text, and supported
-images. Press `v` for the full-width viewer. Use arrows or `j`/`k` to scroll,
-and press `Escape` or `q` to return to the same selection.
+The right pane previews Markdown source, JSON, source code, plain text, and
+supported images. Press `v` for the full-width viewer. For Markdown, press `m`
+to switch between the rendered page and the same highlighted source. Use arrows
+or `j`/`k` to scroll. Press `Escape` or `q` to return to the same selection.
 
 The [viewer guide](docs/viewer.md) covers supported formats, controls, graphics
 requirements, Markdown rendering, and size limits.

@@ -514,13 +514,7 @@ fn preview_text_lines(
     let document_lines = app
         .preview()
         .document()
-        .map(|document| {
-            if app.is_viewing() && app.is_markdown_source() {
-                document.source_lines.as_deref().unwrap_or(&document.lines)
-            } else {
-                document.lines.as_slice()
-            }
-        })
+        .map(|document| document.lines.as_slice())
         .unwrap_or(&[]);
     if app.is_reading() {
         let paragraphs = reading_lines(document_lines);
@@ -738,24 +732,21 @@ impl WrappedRows {
 #[derive(Debug)]
 pub(crate) struct ViewerText {
     width: u16,
-    source: bool,
     reading: bool,
     rows: Vec<Line<'static>>,
 }
 
 fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Ref<'a, ViewerText> {
-    let source = app.is_viewing() && app.is_markdown_source();
     let reading = app.is_reading();
     let cache = app.viewer_text_cache();
     let needs_rebuild = cache
         .borrow()
         .as_ref()
-        .is_none_or(|text| text.width != width || text.source != source || text.reading != reading);
+        .is_none_or(|text| text.width != width || text.reading != reading);
     if needs_rebuild {
         let (rows, _) = preview_text_lines(app, width, palette, 0, usize::MAX, true);
         *cache.borrow_mut() = Some(ViewerText {
             width,
-            source,
             reading,
             rows,
         });
@@ -792,7 +783,7 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
     let markdown = app
         .preview()
         .document()
-        .is_some_and(|document| document.source_lines.is_some());
+        .is_some_and(|document| document.markdown_source.is_some());
     if area.height >= 3 {
         let [header, _, footer] = Layout::vertical([
             Constraint::Length(1),
@@ -1570,6 +1561,26 @@ mod tests {
         app.set_viewer_scroll(1);
         terminal.draw(|frame| render(frame, &app)).unwrap();
         assert!(terminal.backend().to_string().contains("fghij┃"));
+    }
+
+    #[test]
+    fn markdown_preview_and_source_view_use_the_same_styled_rows() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.md"),
+            "# Heading [site](https://example.org)\n\n- **bold** and *italic* `code`\n\n> quote\n",
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let palette = app.theme().palette();
+        for width in [25, 80] {
+            let preview = preview_text_lines(&app, width, &palette, 0, usize::MAX, true);
+            app.open_viewer();
+            app.toggle_markdown_source();
+            let source = preview_text_lines(&app, width, &palette, 0, usize::MAX, true);
+            assert_eq!(preview, source);
+            app.close_viewer();
+        }
     }
 
     #[test]
