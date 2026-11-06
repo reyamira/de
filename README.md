@@ -146,8 +146,26 @@ carries into the preview pane and navigated directories.
 ## Configuration
 
 Run `de config` to change settings with a live preview, or run `de theme` to
-choose a theme. Press `w` in the picker to save the current hidden and sort
-settings as defaults.
+choose a theme. Run `de theme edit` to edit a theme with an interactive preview.
+Press `w` in the picker to save the current hidden and sort settings as defaults.
+
+In `de theme`, use the arrows or `h`/`j`/`k`/`l` to change themes.
+Press `Tab` to cycle through the browser, Markdown source, and rendered Markdown samples.
+In a Markdown sample, press `m` to switch between source and rendered views.
+Use Page Up and Page Down to see examples below the visible area.
+Press Enter to save the selected theme, or Esc to cancel.
+The sample uses no file in your workspace.
+
+In `de theme edit [NAME]`, use `Up`/`Down` to select a field and `Enter` to
+edit it. Press `r` to reset it to the inherited value. An empty edit accepts
+inheritance. Inherited fields show their actual values; accepting an unchanged
+value keeps inheritance.
+
+Press `Tab` to cycle the right panel through Browser, Markdown source, and
+rendered Markdown. The fields keep focus. Use `PageUp`/`PageDown` to see
+examples below the visible area. Narrow terminals hide the previews. Press `s`
+to save, or `Escape` to cancel. The [configuration guide](docs/configuration.md#themes)
+has more details.
 
 The [configuration guide](docs/configuration.md) covers file locations, editing,
 defaults, themes, and date and time formats.

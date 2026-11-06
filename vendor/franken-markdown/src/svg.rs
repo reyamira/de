@@ -1,0 +1,1415 @@
+//! Standalone vector-SVG ("poster") backend.
+//!
+//! Renders a parsed Markdown document to a single vertical-flow SVG page of
+//! fixed width ([`SvgOptions::max_width_pt`]) whose height grows to fit the
+//! content. Renderer-generated glyphs are vector outlines with no `<text>`
+//! elements or view-time fonts. Supplied images are embedded subresources;
+//! their own raster resolution or SVG text/font behavior is retained.
+//!
+//! Glyph strategy: each unique `(face, glyph id)` outline is emitted once in
+//! `<defs>` as `<path id="gN" d="…">`, normalized to a 100 pt em with the
+//! font's y-up coordinates flipped to SVG's y-down, and quantized to the
+//! 0.01 determinism grid (integer round-trip, no float formatting). Use
+//! sites place instances with
+//! `<use href="#gN" transform="translate(x y) scale(size/100)" fill="…"/>`.
+//! `transform` is used instead of the `x`/`y` attributes because those
+//! cannot scale — per-glyph dedup across the heading/body/code size ladder
+//! requires scaling at the use site.
+//!
+//! TrueType outlines are quadratic and [`outline`] already resolves implied
+//! on-curve midpoints into `Segment::Line` / `Segment::Quad` chains, so the
+//! path compiler is a direct 1:1 mapping: contour start → `M`, line → `L`,
+//! quad → `Q`, close → `Z`. Caller-supplied CFF1 fonts retain their native
+//! cubic curves as `C` commands, with the same normalization and deduplication.
+//!
+//! Deliberate scope cuts (the poster is a display artifact, not a print
+//! engine): no pagination. Bounded paragraphs use the shared Knuth-Plass
+//! breaker. Text uses actual GSUB/GPOS glyphs and bounded Latin mark positioning.
+//! Safe links have keyboard-accessible hit regions; heading links use SVG views;
+//! mathematics uses the shared TeX layout engine and vector outlines. Raw HTML
+//! is preserved as inert vector text; complete numbered endnotes follow the body.
+//! PNG/JPEG/GIF/SVG images use embedded data or explicit
+//! caller assets; unresolved images retain their alt text with diagnostics.
+//!
+//! Appearance is host-independent: Auto chooses light, while explicit theme
+//! appearances use their selected palette. No system preference is queried.
+//! Typography and all four margins are resolved before layout, not as a final
+//! scale transform; see `geometry` for bounded fallbacks. Link policy and native
+//! view behavior are documented in `docs/SVG_LINKS.md`.
+
+use std::cell::{OnceCell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+
+use franken_markdown::ast::{Align, Block, Document, Inline, Table};
+use franken_markdown::fonts::{self, FontStyle};
+use franken_markdown::text::Font;
+use franken_markdown::text::outline::Segment;
+use franken_markdown::theme::{Theme, ThemeColors, TypeScale};
+
+/// Def path data is normalized to a 100 pt em, so use-site scale factors are
+/// simply `size / 100` (0.11 for 11 pt body) and 0.01-quantized def
+/// coordinates carry 1/10 000-em precision.
+const DEF_EM_PT: f64 = 100.0;
+
+/// Face slots in `Poster::faces`.
+const SLOT_BODY: usize = 0; // + style index (regular/bold/italic/bold-italic)
+const SLOT_MONO: usize = 4;
+const SLOT_SYMBOL: usize = 5;
+/// The bundled emoji face (native `emoji-face` builds); last-resort fallback.
+const SLOT_EMOJI: usize = 6;
+/// Bundled Han/kana/punctuation face; emoji keeps its original slot.
+const SLOT_CJK: usize = 7;
+const SLOT_HEADING: usize = 8;
+const SLOT_COUNT: usize = 9;
+
+// Explicit paths also support the standalone #[path] SVG integration harness.
+#[path = "svg/financial_tables.rs"]
+mod financial_tables;
+#[path = "svg/geometry.rs"]
+mod geometry;
+#[cfg(test)]
+#[path = "svg/geometry_tests.rs"]
+mod geometry_tests;
+#[path = "svg/image_source.rs"]
+pub(crate) mod image_source;
+#[cfg(test)]
+#[path = "svg/image_tests.rs"]
+mod image_tests;
+#[path = "svg/images.rs"]
+mod images;
+#[path = "svg/links.rs"]
+mod links;
+#[path = "svg/lists.rs"]
+mod lists;
+#[path = "svg/math.rs"]
+mod math;
+#[cfg(test)]
+#[path = "svg/math_tests.rs"]
+mod math_tests;
+#[path = "svg/table.rs"]
+mod table;
+#[path = "svg/text.rs"]
+mod text;
+#[cfg(test)]
+#[path = "svg/text_tests.rs"]
+mod text_tests;
+
+/// Options for the SVG poster backend.
+#[derive(Debug, Clone)]
+pub struct SvgOptions {
+    /// Visual theme (palette, page margins, font family).
+    pub theme: Theme,
+    /// Page width in points; the height grows to fit the content.
+    /// Values outside 144..=14400 points fall back to US Letter width, with
+    /// an `svg_layout_adjusted` diagnostic from the diagnostic APIs.
+    pub max_width_pt: f32,
+    /// Multiplier applied to each existing heading size.
+    pub heading_scale: f32,
+    /// Code size in CSS pixels, or the original theme size when unset.
+    pub code_size_px: Option<u16>,
+    /// Independent heading face; unset uses the normal bold body face.
+    pub heading_font: Option<std::sync::Arc<[u8]>>,
+    /// Optional heading and code text colors.
+    pub heading_color: Option<String>,
+    pub code_text_color: Option<String>,
+}
+
+impl Default for SvgOptions {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            max_width_pt: 612.0,
+            heading_scale: 1.0,
+            code_size_px: None,
+            heading_font: None,
+            heading_color: None,
+            code_text_color: None,
+        }
+    }
+}
+
+/// Render statistics from [`render_svg_with_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SvgReport {
+    /// Characters skipped because no bundled face maps them.
+    pub glyphs_missing: usize,
+    /// Glyph instances emitted as `<use>` elements.
+    pub glyphs_drawn: usize,
+    /// Unique glyph outlines emitted as `<path>` defs.
+    pub paths_emitted: usize,
+}
+
+/// A recoverable SVG export problem. Unsupported mathematics stays visible as
+/// inert source text; callers can inspect the stable code instead of guessing
+/// whether a source-looking formula was successfully typeset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvgWarning {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[cfg(test)]
+/// Render `doc` to a standalone vector-SVG poster, discarding statistics.
+#[must_use]
+pub fn render_svg(doc: &Document, opts: &SvgOptions) -> Vec<u8> {
+    render_svg_with_report(doc, opts).0
+}
+
+#[cfg(test)]
+/// Render `doc` to a standalone vector-SVG poster plus render statistics.
+#[must_use]
+pub fn render_svg_with_report(doc: &Document, opts: &SvgOptions) -> (Vec<u8>, SvgReport) {
+    let (bytes, report, _) = render_svg_with_diagnostics(doc, opts);
+    (bytes, report)
+}
+
+#[cfg(test)]
+/// Render a poster with deterministic recoverable diagnostics. Navigation
+/// warnings are deduplicated by reason; resource warnings retain occurrence order.
+/// This additive API leaves the existing report and option structs unchanged.
+#[must_use]
+pub fn render_svg_with_diagnostics(
+    doc: &Document,
+    opts: &SvgOptions,
+) -> (Vec<u8>, SvgReport, Vec<SvgWarning>) {
+    Poster::new(opts).render(doc)
+}
+
+/// Render with explicit host-owned font/image bytes, using the same slots as
+/// HTML and PDF. No file or URL is resolved by the rendering core. Image keys
+/// are trimmed, first-match wins, and data URIs work without supplied assets.
+/// Missing/malformed images keep their alt text and return stable warnings.
+///
+/// # Errors
+/// Invalid font data/instances or oversized resource collections fail before
+/// output. Unsupported or malformed used CFF1 glyphs also fail before output,
+/// rather than silently omitting their ink. Per-image input is bounded to
+/// 32 MiB; input/encoded image budgets
+/// and aggregate supplied fonts are bounded to 128 MiB each. At most 4096
+/// images are admitted. Existing option/report structures stay unchanged.
+pub fn render_svg_with_resources(
+    doc: &Document,
+    opts: &SvgOptions,
+    fonts: &franken_markdown::FontAssets,
+    images: &[franken_markdown::PdfImageAsset],
+) -> franken_markdown::Result<(Vec<u8>, SvgReport, Vec<SvgWarning>)> {
+    if opts
+        .heading_font
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > 32 * 1024 * 1024)
+    {
+        return Err(franken_markdown::RenderError::InvalidInput(
+            "svg_resources: heading font exceeds 32 MiB".to_owned(),
+        ));
+    }
+    let mut poster = Poster::new(opts).with_resources(fonts, images)?;
+    if opts.heading_font.is_some() && poster.faces[SLOT_HEADING].is_none() {
+        return Err(franken_markdown::RenderError::InvalidInput(
+            "svg_resources: invalid heading font".to_owned(),
+        ));
+    }
+    let height = poster.layout(doc);
+    poster.validate_cff_glyphs()?;
+    Ok(poster.emit(height))
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic number formatting (integer round-trip; no float printing).
+// ---------------------------------------------------------------------------
+
+#[inline(always)]
+fn push_u64_fast(out: &mut String, value: u64) {
+    if value < 10 {
+        out.push((b'0' + value as u8) as char);
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut n = value;
+    let mut idx = buf.len();
+    loop {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&buf[idx..]).unwrap_or("0"));
+}
+
+#[inline(always)]
+fn push_q2(out: &mut String, v: f64) {
+    let q = (v * 100.0).round() as i64;
+    let a = q.unsigned_abs();
+    if q < 0 {
+        out.push('-');
+    }
+    let int = a / 100;
+    let frac = a % 100;
+    push_u64_fast(out, int);
+    out.push('.');
+    out.push((b'0' + (frac / 10) as u8) as char);
+    out.push((b'0' + (frac % 10) as u8) as char);
+}
+
+/// Quantize to the 0.01 grid with two fixed decimals ("12.00", "-3.45").
+/// Rounds through an integer so output never carries float noise; negative
+/// zero collapses to "0.00".
+#[allow(dead_code)]
+fn q2(v: f64) -> String {
+    let mut s = String::with_capacity(8);
+    push_q2(&mut s, v);
+    s
+}
+
+#[inline(always)]
+fn push_trim4(out: &mut String, v: f64) {
+    let q = (v * 10_000.0).round() as i64;
+    let a = q.unsigned_abs();
+    if q < 0 {
+        out.push('-');
+    }
+    let int = a / 10_000;
+    let mut frac = a % 10_000;
+    push_u64_fast(out, int);
+    if frac == 0 {
+        return;
+    }
+    out.push('.');
+    let mut width = 4;
+    while frac.is_multiple_of(10) {
+        frac /= 10;
+        width -= 1;
+    }
+    let mut buf = [0u8; 4];
+    let mut f = frac;
+    let mut pos = width;
+    while pos > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (f % 10) as u8;
+        f /= 10;
+    }
+    if let Ok(s) = std::str::from_utf8(&buf[..width]) {
+        out.push_str(s);
+    }
+}
+
+/// Quantize to 1/10 000 with trailing zeros trimmed (for scale factors).
+#[allow(dead_code)]
+fn trim4(v: f64) -> String {
+    let mut s = String::with_capacity(8);
+    push_trim4(&mut s, v);
+    s
+}
+
+/// XML double-quoted attribute escaping: `&`, `<`, `>`, `"`, `'`.
+fn esc_attr(s: &str, out: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Palette and paint ops.
+// ---------------------------------------------------------------------------
+
+/// Theme palette slots and explicit math colours, resolved at emission time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Ink {
+    Fg,
+    FgMuted,
+    BgSubtle,
+    Border,
+    BorderMuted,
+    CodeBg,
+    QuoteFg,
+    QuoteBar,
+    Accent,
+    Heading,
+    Code,
+    Rgb(franken_markdown::math::Color),
+}
+
+impl Ink {
+    #[inline(always)]
+    fn write(self, colors: &ThemeColors, out: &mut String) {
+        let color = match self {
+            Self::Fg => &colors.fg,
+            Self::FgMuted => &colors.fg_muted,
+            Self::BgSubtle => &colors.bg_subtle,
+            Self::Border => &colors.border,
+            Self::BorderMuted => &colors.border_muted,
+            Self::CodeBg => &colors.code_bg,
+            Self::QuoteFg => &colors.quote_fg,
+            Self::QuoteBar => &colors.quote_bar,
+            Self::Accent => &colors.accent,
+            Self::Heading | Self::Code => &colors.fg,
+            Self::Rgb(color) => {
+                // Percentages retain numeric-model and mix precision without
+                // quantizing the engine's channels to an 8-bit palette.
+                out.push_str("rgb(");
+                push_trim4(out, color.r * 100.0);
+                out.push_str("%,");
+                push_trim4(out, color.g * 100.0);
+                out.push_str("%,");
+                push_trim4(out, color.b * 100.0);
+                out.push_str("%)");
+                return;
+            }
+        };
+        esc_attr(color, out);
+    }
+}
+
+/// One paint operation, in document (painter's) order.
+#[derive(Debug, Clone, PartialEq)]
+enum Op {
+    Image {
+        run: images::ImageRun,
+        x: f64,
+        y: f64,
+    },
+    Path {
+        data: String,
+        ink: Ink,
+    },
+    Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        fill: Ink,
+        stroke: Option<Ink>,
+    },
+    Rule {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        ink: Ink,
+        w: f64,
+    },
+    Glyph {
+        slot: usize,
+        gid: u16,
+        x: f64,
+        y: f64,
+        size: f64,
+        ink: Ink,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Inline flattening and greedy wrapping.
+// ---------------------------------------------------------------------------
+
+/// Style carried by a flattened run of text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RStyle {
+    bold: bool,
+    italic: bool,
+    mono: bool,
+    heading: bool,
+    strike: bool,
+    ink: Ink,
+    /// Render-local navigation identity; preserved by every inline style.
+    link: Option<usize>,
+}
+
+impl RStyle {
+    const BODY: Self = Self {
+        bold: false,
+        italic: false,
+        mono: false,
+        heading: false,
+        strike: false,
+        ink: Ink::Fg,
+        link: None,
+    };
+
+    fn font_style(self) -> FontStyle {
+        FontStyle::new(self.bold, self.italic)
+    }
+}
+
+/// A flattened inline piece: styled text or a forced line break.
+#[derive(Debug, Clone, PartialEq)]
+enum Piece {
+    Text(String, RStyle),
+    Math(String, bool, RStyle),
+    Image(String, String, RStyle),
+    Break,
+}
+
+/// One wrapped word with its measured width.
+#[derive(Debug, Clone)]
+struct Word {
+    text: String,
+    style: RStyle,
+    w: f64,
+    /// Actual source whitespace before this run; zero across style boundaries.
+    gap: f64,
+    formula: Option<math::MathRun>,
+    image: Option<images::ImageRun>,
+    warning: Option<SvgWarning>,
+    /// Exact prepared text used by wrapping, vertical layout and painting.
+    /// Images and formulas carry their independent prepared data above.
+    shaped: Option<text::ShapedText>,
+}
+
+// ---------------------------------------------------------------------------
+// The poster painter.
+// ---------------------------------------------------------------------------
+
+struct Poster {
+    /// Body regular/bold/italic/bold-italic, mono, symbol fallback. `None`
+    /// only if a bundled face failed to parse (the registry tests make that
+    /// unreachable in practice); unresolvable glyphs count as missing.
+    /// `faces[SLOT_CJK]` stays `None`: read that slot through [`Poster::face`].
+    faces: [Option<Font>; SLOT_COUNT],
+    /// The shared bundled CJK fallback, parsed on first use by
+    /// [`Poster::face`]. `resolve` reaches it only for characters inside the
+    /// face's static ranges, so posters without CJK text never parse it.
+    cjk: OnceCell<Option<&'static Font>>,
+    math_engine: OnceCell<Option<franken_markdown::math::Engine>>,
+    images: images::ImageStore,
+    navigation: RefCell<links::Navigation>,
+    warnings: Vec<SvgWarning>,
+    colors: ThemeColors,
+    heading_color: Option<String>,
+    code_text_color: Option<String>,
+    code_size: Option<f64>,
+    scale: TypeScale,
+    line_height: f64,
+    width: f64,
+    margin_bottom: f64,
+    margin_left: f64,
+    margin_right: f64,
+    table_pad_x: f64,
+    table_pad_y: f64,
+    ops: Vec<Op>,
+    /// Top of the next block, in pt from the page top.
+    y: f64,
+    top: f64,
+    missing: usize,
+}
+
+impl Poster {
+    fn new(opts: &SvgOptions) -> Self {
+        let theme = &opts.theme;
+        let geometry = geometry::resolve(opts);
+        let family = theme.font;
+        let load = |style: FontStyle| fonts::load_body(family, style).ok();
+        Self {
+            faces: [
+                load(FontStyle::Regular),
+                load(FontStyle::Bold),
+                load(FontStyle::Italic),
+                load(FontStyle::BoldItalic),
+                fonts::load_mono(FontStyle::Regular).ok(),
+                fonts::load_symbol().ok(),
+                fonts::load_emoji(),
+                None,
+                opts.heading_font
+                    .as_ref()
+                    .and_then(|bytes| Font::parse(bytes.to_vec()).ok()),
+            ],
+            cjk: OnceCell::new(),
+            math_engine: OnceCell::new(),
+            images: images::ImageStore::default(),
+            navigation: RefCell::new(links::Navigation::default()),
+            warnings: geometry.warnings,
+            colors: theme.effective_colors(false, false).clone(),
+            heading_color: opts.heading_color.clone(),
+            code_text_color: opts.code_text_color.clone(),
+            code_size: opts
+                .code_size_px
+                .filter(|size| *size > 0)
+                .map(|size| f64::from(size) * 11.0 / 16.0),
+            scale: geometry.scale,
+            line_height: geometry.line_height,
+            width: geometry.width,
+            margin_bottom: geometry.bottom,
+            margin_left: geometry.left,
+            margin_right: geometry.right,
+            table_pad_x: geometry.table_pad_x,
+            table_pad_y: geometry.table_pad_y,
+            ops: Vec::new(),
+            y: geometry.top,
+            top: geometry.top,
+            missing: 0,
+        }
+    }
+
+    fn primary_slot(&self, style: RStyle) -> usize {
+        if style.mono {
+            SLOT_MONO
+        } else if style.heading && self.faces[SLOT_HEADING].is_some() {
+            SLOT_HEADING
+        } else {
+            SLOT_BODY + style_index(style.font_style())
+        }
+    }
+
+    fn text_size(&self, style: RStyle, size: f64) -> f64 {
+        if style.mono {
+            self.code_size.unwrap_or(size)
+        } else {
+            size
+        }
+    }
+
+    fn write_ink(&self, ink: Ink, out: &mut String) {
+        let custom = match ink {
+            Ink::Heading => self.heading_color.as_deref(),
+            Ink::Code => self.code_text_color.as_deref(),
+            _ => None,
+        };
+        if let Some(color) = custom {
+            esc_attr(color, out);
+        } else {
+            ink.write(&self.colors, out);
+        }
+    }
+    fn content_left(&self) -> f64 {
+        self.margin_left
+    }
+
+    fn content_right(&self) -> f64 {
+        self.width - self.margin_right
+    }
+
+    fn unit_scale(&self) -> f64 {
+        f64::from(self.scale.body) / f64::from(TypeScale::default().body)
+    }
+
+    /// Nested containers stop consuming indentation when one body em remains.
+    fn inset(&self, l: f64, r: f64, requested: f64) -> f64 {
+        requested.min((r - l - f64::from(self.scale.body)).max(0.0))
+    }
+
+    #[cfg(test)]
+    fn render(mut self, doc: &Document) -> (Vec<u8>, SvgReport, Vec<SvgWarning>) {
+        let height = self.layout(doc);
+        self.emit(height)
+    }
+
+    fn layout(&mut self, doc: &Document) -> f64 {
+        let l = self.content_left();
+        let r = self.content_right();
+        // Share PDF's cycle-safe numbering and lossless rich-note preparation.
+        // With no footnote syntax this borrows the source rather than cloning it.
+        let prepared = doc.with_endnotes();
+        for block in &prepared.blocks {
+            self.block(block, l, r, false);
+        }
+        (self.y + self.margin_bottom).max(1.0)
+    }
+
+    /// Validate the shaped glyphs that will actually be painted, including
+    /// GSUB substitutions. Batching per face shares the CFF instruction and
+    /// output budgets; decoding each repeated occurrence independently would
+    /// bypass those aggregate limits. The strict subsetter also checks cubic
+    /// ink bounds and rejects unsupported charstring operators.
+    fn validate_cff_glyphs(&self) -> franken_markdown::Result<()> {
+        let mut used: BTreeMap<usize, BTreeSet<u16>> = BTreeMap::new();
+        for op in &self.ops {
+            if let Op::Glyph { slot, gid, .. } = op
+                && self
+                    .font_for_slot(*slot)
+                    .is_some_and(|font| !font.has_glyf_outlines())
+            {
+                used.entry(*slot).or_default().insert(*gid);
+            }
+        }
+        for (slot, glyphs) in used {
+            if let Some(font) = self.font_for_slot(slot) {
+                font.try_subset_glyphs(&glyphs.into_iter().collect::<Vec<_>>(), &[])
+                    .map_err(|error| {
+                        franken_markdown::RenderError::InvalidInput(format!(
+                            "svg_cff_font: font slot {slot}: {error}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    // -- glyph resolution / measurement ------------------------------------
+
+    /// Map `ch` to `(face slot, glyph id)`: the styled primary face first,
+    /// then the bundled CJK, symbol, and emoji fallbacks. The CJK face is
+    /// preferred for Han/kana; other symbols retain their existing priority.
+    /// `(slot, 0)` means unmapped.
+    fn resolve(&self, ch: char, st: RStyle) -> (usize, u16) {
+        let slot = self.primary_slot(st);
+        if let Some(font) = &self.faces[slot] {
+            let gid = font.glyph_index(ch);
+            if gid != 0 {
+                return (slot, gid);
+            }
+        }
+        let fallbacks = if franken_markdown::layout::classify_script(ch).wants_cjk_fallback() {
+            [SLOT_CJK, SLOT_SYMBOL, SLOT_EMOJI]
+        } else {
+            [SLOT_SYMBOL, SLOT_EMOJI, SLOT_CJK]
+        };
+        for fallback in fallbacks {
+            if slot != fallback
+                && (fallback != SLOT_CJK || fonts::cjk_face_may_map(ch))
+                && let Some(font) = self.face(fallback)
+            {
+                let gid = font.glyph_index(ch);
+                if gid != 0 {
+                    return (fallback, gid);
+                }
+            }
+        }
+        (slot, 0)
+    }
+
+    /// The face in `slot`. The bundled CJK fallback is parsed once on first
+    /// use and borrowed (`&'static`), never copied per poster.
+    fn face(&self, slot: usize) -> Option<&Font> {
+        if slot == SLOT_CJK {
+            return *self.cjk.get_or_init(fonts::cjk_face);
+        }
+        self.faces[slot].as_ref()
+    }
+
+    fn advance(&self, slot: usize, ch: char, size: f64) -> f64 {
+        self.face(slot)
+            .map_or(0.0, |font| f64::from(font.advance_1000(ch)) * size / 1000.0)
+    }
+
+    /// Width of `text` at `size` under `st` (silent; never counts missing).
+    fn measure(&self, text: &str, st: RStyle, size: f64) -> f64 {
+        text.chars()
+            .map(|ch| self.advance(self.resolve(ch, st).0, ch, size))
+            .sum()
+    }
+
+    fn space_width(&self, st: RStyle, size: f64) -> f64 {
+        self.advance(self.resolve(' ', st).0, ' ', size)
+    }
+
+    /// Draw `text` with its left edge at `x`, baseline at `baseline`; returns
+    /// the pen position after the last glyph. Unmapped characters are
+    /// skipped and counted; whitespace still advances.
+    fn draw_text(&mut self, x: f64, baseline: f64, text: &str, st: RStyle, size: f64) -> f64 {
+        let mut pen = x;
+        for ch in text.chars() {
+            let (slot, gid) = self.resolve(ch, st);
+            let adv = self.advance(slot, ch, size);
+            if gid == 0 {
+                if !ch.is_whitespace() {
+                    self.missing += 1;
+                }
+            } else if !ch.is_whitespace() {
+                self.ops.push(Op::Glyph {
+                    slot,
+                    gid,
+                    x: pen,
+                    y: baseline,
+                    size,
+                    ink: st.ink,
+                });
+            }
+            pen += adv;
+        }
+        if st.strike && pen > x {
+            self.ops.push(Op::Rule {
+                x1: x,
+                y1: baseline - size * 0.28,
+                x2: pen,
+                y2: baseline - size * 0.28,
+                ink: st.ink,
+                w: (size * 0.05).max(0.5),
+            });
+        }
+        pen
+    }
+
+    // -- inline flattening and wrapping -------------------------------------
+
+    fn flatten(&self, inlines: &[Inline], st: RStyle, out: &mut Vec<Piece>) {
+        for inline in inlines {
+            match inline {
+                Inline::Text(s) => out.push(Piece::Text(s.clone(), st)),
+                Inline::Emphasis(inner) => self.flatten(inner, RStyle { italic: true, ..st }, out),
+                Inline::Strong(content) => self.flatten(content, RStyle { bold: true, ..st }, out),
+                Inline::Strikethrough(inner) => {
+                    self.flatten(inner, RStyle { strike: true, ..st }, out);
+                }
+                Inline::Code(s) => out.push(Piece::Text(
+                    s.clone(),
+                    RStyle {
+                        mono: true,
+                        ink: if self.code_text_color.is_some() {
+                            Ink::Code
+                        } else {
+                            st.ink
+                        },
+                        ..st
+                    },
+                )),
+                Inline::Link {
+                    dest,
+                    title,
+                    content,
+                } => {
+                    let link = self
+                        .navigation
+                        .borrow_mut()
+                        .intern(dest, title.as_deref(), content);
+                    self.flatten(
+                        content,
+                        RStyle {
+                            ink: Ink::Accent,
+                            link: Some(link),
+                            ..st
+                        },
+                        out,
+                    );
+                }
+                Inline::Image { alt, dest, .. } => {
+                    out.push(Piece::Image(dest.clone(), alt.clone(), st));
+                }
+                Inline::SoftBreak => out.push(Piece::Text(" ".to_string(), st)),
+                Inline::HardBreak => out.push(Piece::Break),
+                Inline::Html(s) => {
+                    out.push(Piece::Text(s.clone(), RStyle { mono: true, ..st }));
+                }
+                Inline::FootnoteRef { id } => out.push(Piece::Text(
+                    format!("[^{id}]"),
+                    RStyle {
+                        ink: Ink::FgMuted,
+                        ..st
+                    },
+                )),
+                Inline::Math(s) => out.push(Piece::Math(s.clone(), false, st)),
+                Inline::DisplayMath(s) => out.push(Piece::Math(s.clone(), true, st)),
+            }
+        }
+    }
+
+    // -- block painters ------------------------------------------------------
+
+    fn block(&mut self, block: &Block, l: f64, r: f64, quote: bool) {
+        match block {
+            Block::Heading { level, inlines } => self.heading(*level, inlines, l, r, quote),
+            Block::Paragraph(inlines) => self.paragraph(inlines, l, r, quote),
+            Block::CodeBlock { lang, code } => {
+                // Mermaid diagrams draw as figures, as in HTML and PDF.
+                match franken_markdown::diagrams::figure_svg(code, lang.as_deref().unwrap_or("")) {
+                    Some((svg, alt)) => {
+                        let dest = format!(
+                            "data:image/svg+xml;base64,{}",
+                            franken_markdown::html::base64_encode(svg.as_bytes())
+                        );
+                        let image = Inline::Image {
+                            dest,
+                            title: None,
+                            alt: alt.to_owned(),
+                        };
+                        self.paragraph(std::slice::from_ref(&image), l, r, quote);
+                    }
+                    None => self.code_panel(code, l, r),
+                }
+            }
+            Block::MathBlock(src) => self.math_block(src, l, r, quote),
+            Block::BlockQuote(inner) => self.blockquote(inner, l, r),
+            Block::List(list) => self.list(list, l, r, quote),
+            Block::Table(table) => self.table(table, l, r),
+            Block::ThematicBreak => {
+                self.y += 4.0 * self.unit_scale();
+                self.ops.push(Op::Rule {
+                    x1: l,
+                    y1: self.y,
+                    x2: r,
+                    y2: self.y,
+                    ink: Ink::Border,
+                    w: 0.75,
+                });
+                self.y += 12.0 * self.unit_scale();
+            }
+            // Never execute raw HTML, but do not silently discard its source.
+            Block::HtmlBlock(source) => self.code_panel(source, l, r),
+            Block::FootnoteDefinition { .. } => {}
+            Block::DefinitionList(items) => {
+                let body_size = f64::from(self.scale.body);
+                for item in items {
+                    for term in &item.terms {
+                        let mut pieces = Vec::new();
+                        self.flatten(
+                            term,
+                            RStyle {
+                                bold: true,
+                                ..RStyle::BODY
+                            },
+                            &mut pieces,
+                        );
+                        self.text_lines(&pieces, body_size, l, r, quote, body_size * 0.4);
+                    }
+                    for def in &item.definitions {
+                        let mut pieces = Vec::new();
+                        self.flatten(def, RStyle::BODY, &mut pieces);
+                        let inset = self.inset(l, r, 18.0 * self.unit_scale());
+                        self.text_lines(&pieces, body_size, l + inset, r, quote, body_size * 0.4);
+                    }
+                }
+                self.y += body_size * 0.4;
+            }
+            Block::PageBreak => {}
+        }
+    }
+
+    fn default_ink(quote: bool) -> Ink {
+        if quote { Ink::QuoteFg } else { Ink::Fg }
+    }
+
+    /// Lay out flattened pieces as wrapped lines at `size`; returns after
+    /// adding `gap_after` below the last line.
+    fn text_lines(
+        &mut self,
+        pieces: &[Piece],
+        size: f64,
+        l: f64,
+        r: f64,
+        _quote: bool, // ink already carried by run styles
+        gap_after: f64,
+    ) {
+        let leading = size * self.line_height;
+        let lines = self.wrap(pieces, size, r - l);
+        for line in &lines {
+            let (ascent, height) = self.line_metrics(line, size * 0.85, leading);
+            let baseline = self.y + ascent;
+            self.draw_words(line, l, baseline, size);
+            self.y += height;
+        }
+        self.y += gap_after;
+    }
+
+    fn heading(&mut self, level: u8, inlines: &[Inline], l: f64, r: f64, quote: bool) {
+        let idx = usize::from(level.clamp(1, 6) - 1);
+        let size = f64::from(self.scale.h[idx]);
+        if self.y > self.top + 0.01 {
+            self.y += size * 0.8;
+        }
+        self.navigation.borrow_mut().heading(inlines, self.y);
+        let ink = if self.heading_color.is_some() {
+            Ink::Heading
+        } else {
+            Self::default_ink(quote)
+        };
+        let mut pieces = Vec::new();
+        self.flatten(
+            inlines,
+            RStyle {
+                bold: true,
+                heading: true,
+                ink,
+                ..RStyle::BODY
+            },
+            &mut pieces,
+        );
+        let leading = size * 1.3;
+        let lines = self.wrap(&pieces, size, r - l);
+        for line in &lines {
+            let (ascent, height) = self.line_metrics(line, size * 0.85, leading);
+            let baseline = self.y + ascent;
+            self.draw_words(line, l, baseline, size);
+            self.y += height;
+        }
+        if level == 1 {
+            let has_replaced = lines
+                .iter()
+                .flatten()
+                .any(|word| word.formula.is_some() || word.image.is_some());
+            let nominal_rule = if has_replaced {
+                self.y + size * 0.1
+            } else {
+                self.y - leading * 0.35
+            };
+            let ink_bottom = lines.last().map_or(self.y, |line| {
+                let (ascent, height) = self.line_metrics(line, size * 0.85, leading);
+                let (ink_ascent, ink_height) = self.line_metrics(line, 0.0, 0.0);
+                self.y - height + ascent + (ink_height - ink_ascent)
+            });
+            // Even a normal descender can cross the old baseline-level rule.
+            // Include half the stroke and padding after the deepest actual ink.
+            let rule_y = nominal_rule.max(ink_bottom + size * 0.1 + 0.375);
+            self.y = self.y.max(rule_y + size * 0.1);
+            self.ops.push(Op::Rule {
+                x1: l,
+                y1: rule_y,
+                x2: r,
+                y2: rule_y,
+                ink: Ink::BorderMuted,
+                w: 0.75,
+            });
+        }
+        self.y += size * 0.3;
+    }
+
+    fn paragraph(&mut self, inlines: &[Inline], l: f64, r: f64, quote: bool) {
+        let size = f64::from(self.scale.body);
+        let ink = Self::default_ink(quote);
+        let mut pieces = Vec::new();
+        self.flatten(
+            inlines,
+            RStyle {
+                ink,
+                ..RStyle::BODY
+            },
+            &mut pieces,
+        );
+        self.text_lines(&pieces, size, l, r, quote, size * 0.7);
+    }
+
+    /// Fenced code and unsupported math: mono face on a themed panel.
+    fn code_panel(&mut self, code: &str, l: f64, r: f64) {
+        let size = f64::from(self.scale.code);
+        let leading = size * 1.45;
+        let pad = 8.0 * self.unit_scale();
+        let inset = (12.0 * self.unit_scale()).min((r - l).max(0.0) * 0.25);
+        let lines = self.code_words(code, size, r - l - 2.0 * inset);
+        let h = lines
+            .iter()
+            .map(|line| {
+                self.line_metrics(std::slice::from_ref(line), size * 0.8, leading)
+                    .1
+            })
+            .sum::<f64>()
+            + 2.0 * pad;
+        self.ops.push(Op::Rect {
+            x: l,
+            y: self.y,
+            w: r - l,
+            h,
+            fill: Ink::CodeBg,
+            stroke: Some(Ink::BorderMuted),
+        });
+        let mut ly = self.y + pad;
+        for line in &lines {
+            let row = std::slice::from_ref(line);
+            let (ascent, height) = self.line_metrics(row, size * 0.8, leading);
+            self.draw_words(row, l + inset, ly + ascent, size);
+            ly += height;
+        }
+        self.y += h + f64::from(self.scale.body) * 0.7;
+    }
+
+    fn blockquote(&mut self, inner: &[Block], l: f64, r: f64) {
+        let start = self.y;
+        let inset = self.inset(l, r, 14.0 * self.unit_scale());
+        let inner_l = l + inset;
+        for block in inner {
+            self.block(block, inner_l, r, true);
+        }
+        let h = (self.y - start).max(f64::from(self.scale.body));
+        if inset > 0.0 {
+            self.ops.push(Op::Rect {
+                x: l,
+                y: start,
+                w: (3.0 * self.unit_scale()).min(inset / 3.0),
+                h,
+                fill: Ink::QuoteBar,
+                stroke: None,
+            });
+        }
+        self.y += f64::from(self.scale.body) * 0.3;
+    }
+
+    // -- emission ------------------------------------------------------------
+
+    /// Compile one glyph's contours to SVG path data in the normalized
+    /// 100 pt em (y flipped). `None` for blank glyphs (space) or outlines
+    /// that fail to decode.
+    fn glyph_path(font: &Font, gid: u16) -> Option<String> {
+        if !font.has_glyf_outlines() {
+            return Self::cff_glyph_path(font, gid);
+        }
+        let outline = font.glyph_outline(gid).ok()?;
+        if outline.contours.is_empty() {
+            return None;
+        }
+        let k = DEF_EM_PT / f64::from(font.units_per_em);
+        let mut d = String::new();
+        for contour in &outline.contours {
+            d.push('M');
+            push_q2(&mut d, contour.start.x * k);
+            d.push(' ');
+            push_q2(&mut d, -contour.start.y * k);
+            for seg in &contour.segments {
+                match seg {
+                    Segment::Line { to } => {
+                        d.push('L');
+                        push_q2(&mut d, to.x * k);
+                        d.push(' ');
+                        push_q2(&mut d, -to.y * k);
+                    }
+                    Segment::Quad { ctrl, to } => {
+                        d.push('Q');
+                        push_q2(&mut d, ctrl.x * k);
+                        d.push(' ');
+                        push_q2(&mut d, -ctrl.y * k);
+                        d.push(' ');
+                        push_q2(&mut d, to.x * k);
+                        d.push(' ');
+                        push_q2(&mut d, -to.y * k);
+                    }
+                }
+            }
+            d.push('Z');
+        }
+        Some(d)
+    }
+
+    /// CFF decoding has already passed strict validation on the fallible
+    /// resource path. Bundled-only APIs never select a CFF face.
+    fn cff_glyph_path(font: &Font, gid: u16) -> Option<String> {
+        use franken_markdown::text::cff::Command;
+
+        let outline = font.cff_outline(gid).ok()?;
+        if !outline
+            .commands
+            .iter()
+            .any(|command| matches!(command, Command::Line(_) | Command::Curve(_, _, _)))
+        {
+            return None;
+        }
+        let k = DEF_EM_PT / f64::from(font.units_per_em);
+        let mut d = String::new();
+        for command in outline.commands {
+            match command {
+                Command::Move(point) | Command::Line(point) => {
+                    d.push(if matches!(command, Command::Move(_)) {
+                        'M'
+                    } else {
+                        'L'
+                    });
+                    push_q2(&mut d, point.x * k);
+                    d.push(' ');
+                    push_q2(&mut d, -point.y * k);
+                }
+                Command::Curve(first, second, end) => {
+                    d.push('C');
+                    for (index, point) in [first, second, end].into_iter().enumerate() {
+                        if index != 0 {
+                            d.push(' ');
+                        }
+                        push_q2(&mut d, point.x * k);
+                        d.push(' ');
+                        push_q2(&mut d, -point.y * k);
+                    }
+                }
+                Command::Close => d.push('Z'),
+            }
+        }
+        Some(d)
+    }
+
+    fn emit(mut self, height: f64) -> (Vec<u8>, SvgReport, Vec<SvgWarning>) {
+        // Collect unique glyph defs in sorted (slot, gid) order: BTreeMap
+        // iteration keeps def ids stable for a fixed input.
+        let mut defs: BTreeMap<(usize, u16), Option<String>> = BTreeMap::new();
+        for op in &self.ops {
+            if let Op::Glyph { slot, gid, .. } = op {
+                defs.entry((*slot, *gid)).or_insert_with(|| {
+                    self.font_for_slot(*slot)
+                        .and_then(|font| Self::glyph_path(font, *gid))
+                });
+            }
+        }
+        let ids: BTreeMap<(usize, u16), usize> = defs
+            .iter()
+            .filter(|(_, path)| path.is_some())
+            .enumerate()
+            .map(|(i, (key, _))| (*key, i))
+            .collect();
+
+        // Deduplicate identical encoded resources even when callers used
+        // different destination keys. IDs follow first paint occurrence.
+        let mut image_ids = BTreeMap::new();
+        for op in &self.ops {
+            if let Op::Image { run, .. } = op {
+                let next = image_ids.len();
+                image_ids.entry(run.image.uri.as_str()).or_insert((
+                    next,
+                    run.image.width,
+                    run.image.height,
+                ));
+            }
+        }
+
+        let mut out = String::with_capacity(64 * 1024);
+        out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        out.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"");
+        push_q2(&mut out, self.width);
+        out.push_str("pt\" height=\"");
+        push_q2(&mut out, height);
+        out.push_str("pt\" viewBox=\"0 0 ");
+        push_q2(&mut out, self.width);
+        out.push(' ');
+        push_q2(&mut out, height);
+        out.push_str("\">\n");
+
+        // Page background.
+        out.push_str("<rect width=\"");
+        push_q2(&mut out, self.width);
+        out.push_str("\" height=\"");
+        push_q2(&mut out, height);
+        out.push_str("\" fill=\"");
+        esc_attr(&self.colors.bg, &mut out);
+        out.push_str("\"/>\n");
+
+        out.push_str("<defs>\n");
+        for (key, path) in &defs {
+            if let (Some(path), Some(id)) = (path, ids.get(key)) {
+                out.push_str("<path id=\"g");
+                push_u64_fast(&mut out, *id as u64);
+                out.push_str("\" d=\"");
+                out.push_str(path);
+                out.push_str("\"/>\n");
+            }
+        }
+        for (uri, (id, width, height)) in &image_ids {
+            out.push_str("<symbol id=\"i");
+            push_u64_fast(&mut out, *id as u64);
+            out.push_str("\" viewBox=\"0 0 ");
+            push_q2(&mut out, *width);
+            out.push(' ');
+            push_q2(&mut out, *height);
+            out.push_str("\" preserveAspectRatio=\"xMinYMin meet\"><image width=\"");
+            push_q2(&mut out, *width);
+            out.push_str("\" height=\"");
+            push_q2(&mut out, *height);
+            out.push_str("\" href=\"");
+            esc_attr(uri, &mut out);
+            out.push_str("\"/></symbol>\n");
+        }
+        out.push_str("</defs>\n");
+
+        let mut drawn = 0;
+        for op in &self.ops {
+            match op {
+                Op::Image { run, x, y } => {
+                    let Some((id, _, _)) = image_ids.get(run.image.uri.as_str()) else {
+                        continue;
+                    };
+                    out.push_str("<use href=\"#i");
+                    push_u64_fast(&mut out, *id as u64);
+                    out.push_str("\" x=\"");
+                    push_q2(&mut out, *x);
+                    out.push_str("\" y=\"");
+                    push_q2(&mut out, *y);
+                    out.push_str("\" width=\"");
+                    push_q2(&mut out, run.width);
+                    out.push_str("\" height=\"");
+                    push_q2(&mut out, run.height);
+                    if run.alt.is_empty() {
+                        out.push_str("\" aria-hidden=\"true\"/>\n");
+                    } else {
+                        out.push_str("\" role=\"img\" aria-label=\"");
+                        let alt: String = run
+                            .alt
+                            .chars()
+                            .map(|ch| {
+                                if ch.is_control() {
+                                    ' '
+                                } else if ch == '\u{fffe}' || ch == '\u{ffff}' {
+                                    '\u{fffd}'
+                                } else {
+                                    ch
+                                }
+                            })
+                            .collect();
+                        esc_attr(&alt, &mut out);
+                        out.push_str("\"/>\n");
+                    }
+                }
+                Op::Path { data, ink } => {
+                    out.push_str("<path d=\"");
+                    out.push_str(data);
+                    out.push_str("\" fill=\"");
+                    self.write_ink(*ink, &mut out);
+                    out.push_str("\"/>\n");
+                }
+                Op::Rect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    fill,
+                    stroke,
+                } => {
+                    out.push_str("<rect x=\"");
+                    push_q2(&mut out, *x);
+                    out.push_str("\" y=\"");
+                    push_q2(&mut out, *y);
+                    out.push_str("\" width=\"");
+                    push_q2(&mut out, *w);
+                    out.push_str("\" height=\"");
+                    push_q2(&mut out, *h);
+                    out.push_str("\" fill=\"");
+                    self.write_ink(*fill, &mut out);
+                    out.push('"');
+                    if let Some(stroke) = stroke {
+                        out.push_str(" stroke=\"");
+                        self.write_ink(*stroke, &mut out);
+                        out.push_str("\" stroke-width=\"0.5\"");
+                    }
+                    out.push_str("/>\n");
+                }
+                Op::Rule {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    ink,
+                    w,
+                } => {
+                    out.push_str("<line x1=\"");
+                    push_q2(&mut out, *x1);
+                    out.push_str("\" y1=\"");
+                    push_q2(&mut out, *y1);
+                    out.push_str("\" x2=\"");
+                    push_q2(&mut out, *x2);
+                    out.push_str("\" y2=\"");
+                    push_q2(&mut out, *y2);
+                    out.push_str("\" stroke=\"");
+                    self.write_ink(*ink, &mut out);
+                    out.push_str("\" stroke-width=\"");
+                    push_q2(&mut out, *w);
+                    out.push_str("\"/>\n");
+                }
+                Op::Glyph {
+                    slot,
+                    gid,
+                    x,
+                    y,
+                    size,
+                    ink,
+                } => {
+                    let key = (*slot, *gid);
+                    let Some(id) = ids.get(&key) else {
+                        continue; // outline failed to decode; no def to reference
+                    };
+                    out.push_str("<use href=\"#g");
+                    push_u64_fast(&mut out, *id as u64);
+                    out.push_str("\" transform=\"translate(");
+                    push_q2(&mut out, *x);
+                    out.push(' ');
+                    push_q2(&mut out, *y);
+                    out.push_str(") scale(");
+                    push_trim4(&mut out, *size / DEF_EM_PT);
+                    out.push_str(")\" fill=\"");
+                    self.write_ink(*ink, &mut out);
+                    out.push_str("\"/>\n");
+                    drawn += 1;
+                }
+            }
+        }
+        self.navigation
+            .into_inner()
+            .emit(&mut out, self.width, height, &mut self.warnings);
+        out.push_str("</svg>\n");
+
+        let report = SvgReport {
+            glyphs_missing: self.missing,
+            glyphs_drawn: drawn,
+            paths_emitted: ids.len(),
+        };
+        (out.into_bytes(), report, self.warnings)
+    }
+}
+
+/// `FontStyle` → body face slot offset.
+fn style_index(style: FontStyle) -> usize {
+    match style {
+        FontStyle::Regular => 0,
+        FontStyle::Bold => 1,
+        FontStyle::Italic => 2,
+        FontStyle::BoldItalic => 3,
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    #[test]
+    fn heading_face_controls_measurement_and_emitted_outlines() {
+        let document = franken_markdown::parse_markdown("# Wide heading text\n\nWide heading text");
+        let mut options = SvgOptions::default();
+        let mut default_poster = Poster::new(&options);
+        default_poster.layout(&document);
+        options.heading_font = Some(std::sync::Arc::from(fonts::body_bytes(
+            franken_markdown::theme::FontFamily::Serif,
+            FontStyle::Regular,
+        )));
+        let mut custom = Poster::new(&options);
+        custom.layout(&document);
+        assert!(custom.ops.iter().any(|op| matches!(
+            op,
+            Op::Glyph {
+                slot: SLOT_HEADING,
+                ..
+            }
+        )));
+        assert_ne!(
+            custom.measure(
+                "Wide heading text",
+                RStyle {
+                    heading: true,
+                    ..RStyle::BODY
+                },
+                20.0
+            ),
+            default_poster.measure(
+                "Wide heading text",
+                RStyle {
+                    heading: true,
+                    bold: true,
+                    ..RStyle::BODY
+                },
+                20.0
+            )
+        );
+        assert_ne!(
+            render_svg(&document, &options),
+            render_svg(&document, &SvgOptions::default())
+        );
+    }
+
+    #[test]
+    fn heading_scale_and_code_options_change_layout_and_paint() {
+        let document = franken_markdown::parse_markdown(
+            "# Heading\n\nText `inline code`\n\n```\nblock code\n```",
+        );
+        let baseline = SvgOptions::default();
+        let mut options = baseline.clone();
+        options.heading_scale = 1.5;
+        options.code_size_px = Some(24);
+        options.heading_color = Some("#123456".into());
+        options.code_text_color = Some("#abcdef".into());
+        let mut original = Poster::new(&baseline);
+        let original_height = original.layout(&document);
+        let mut poster = Poster::new(&options);
+        let height = poster.layout(&document);
+        assert!(height > original_height);
+        assert!(poster.ops.iter().any(|op| matches!(op, Op::Glyph { size, ink: Ink::Heading, .. } if *size > f64::from(original.scale.h[0]))));
+        assert!(poster.ops.iter().filter(|op| matches!(op, Op::Glyph { size, ink: Ink::Code, .. } if (*size - 16.5).abs() < 0.001)).count() >= 2);
+        let svg = String::from_utf8(poster.emit(height).0).unwrap();
+        assert!(svg.contains("fill=\"#123456\""));
+        assert!(svg.contains("fill=\"#abcdef\""));
+    }
+}

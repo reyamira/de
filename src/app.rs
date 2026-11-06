@@ -7,6 +7,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThemeSample {
+    Picker,
+    Source,
+    Rendered,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Entry {
     pub name: OsString,
@@ -137,10 +145,11 @@ pub struct App {
     viewer_text_cache: RefCell<Option<crate::ui::ViewerText>>,
     markdown_renderer: Option<crate::markdown_renderer::MarkdownRenderer>,
     markdown_request: Option<u64>,
-    markdown_key: Option<(u32, u32, u32, bool)>,
+    markdown_key: Option<(u32, u32, u32, Arc<crate::render_theme::RenderedTheme>)>,
     markdown_page: Option<crate::markdown_renderer::RenderedPage>,
     markdown_error: Option<String>,
     markdown_cell_height: usize,
+    theme_sample: ThemeSample,
 }
 
 impl App {
@@ -196,6 +205,7 @@ impl App {
             markdown_page: None,
             markdown_error: None,
             markdown_cell_height: 16,
+            theme_sample: ThemeSample::Picker,
         };
         app.refresh_preview();
         Ok(app)
@@ -250,6 +260,36 @@ impl App {
         self.viewing
     }
 
+    pub fn theme_sample(&self) -> ThemeSample {
+        self.theme_sample
+    }
+
+    pub fn set_theme_sample(&mut self, sample: ThemeSample) {
+        self.theme_sample = sample;
+        self.cancel_image_request();
+        self.cancel_markdown();
+        self.viewer_text_cache.get_mut().take();
+        self.viewer_scroll = 0;
+        self.reading = false;
+        self.status = None;
+        if sample == ThemeSample::Picker {
+            self.viewing = false;
+            self.preview.path = None;
+            self.refresh_preview();
+        } else {
+            self.viewing = true;
+            self.markdown_source = sample == ThemeSample::Source;
+            self.preview = Preview {
+                label: "theme sample".into(),
+                path: Some(self.current_dir.join(".de-theme-sample.md")),
+                entries: Vec::new(),
+                message: None,
+                document: Some(crate::document::markdown_sample(&self.theme.palette())),
+                image: None,
+            };
+        }
+    }
+
     pub fn is_markdown_source(&self) -> bool {
         self.markdown_source
     }
@@ -294,6 +334,13 @@ impl App {
             self.reading = false;
             self.status = None;
             self.viewer_scroll = 0;
+            if self.theme_sample != ThemeSample::Picker {
+                self.theme_sample = if self.markdown_source {
+                    ThemeSample::Source
+                } else {
+                    ThemeSample::Rendered
+                };
+            }
             self.cancel_markdown();
         }
     }
@@ -370,14 +417,17 @@ impl App {
         }
         self.markdown_cell_height = cell_height.max(1) as usize;
         let scroll = self.viewer_scroll.min(u32::MAX as usize) as u32;
-        let dark = self.theme.name() != "light";
-        let key = (width, height, scroll, dark);
-        if self.markdown_key == Some(key) {
+        let style = self.theme.rendered();
+        let unchanged = self.markdown_key.as_ref().is_some_and(|old| {
+            old.0 == width && old.1 == height && old.2 == scroll && Arc::ptr_eq(&old.3, &style)
+        });
+        if unchanged {
             return;
         }
         if self
             .markdown_key
-            .is_some_and(|old| old.0 != width || old.1 != height || old.3 != dark)
+            .as_ref()
+            .is_some_and(|old| old.0 != width || old.1 != height || !Arc::ptr_eq(&old.3, &style))
         {
             self.markdown_page = None;
         }
@@ -401,9 +451,9 @@ impl App {
             width,
             height,
             scroll_y: scroll,
-            dark,
+            style: Arc::clone(&style),
         }));
-        self.markdown_key = Some(key);
+        self.markdown_key = Some((width, height, scroll, style));
         self.markdown_error = None;
     }
 
@@ -503,11 +553,28 @@ impl App {
     }
 
     pub fn set_theme(&mut self, theme: Theme) {
-        if self.theme != theme && self.preview.document.is_some() {
+        let sample_scroll = self.viewer_scroll;
+        let changed = self.theme.name() != theme.name()
+            || self.theme.palette() != theme.palette()
+            || !Arc::ptr_eq(&self.theme.rendered(), &theme.rendered());
+        if changed && self.preview.document.is_some() {
             self.preview.path = None;
         }
         self.theme = theme;
-        self.refresh_preview();
+        if changed {
+            self.cancel_markdown();
+            self.viewer_text_cache.get_mut().take();
+            self.viewer_scroll = 0;
+        }
+        if self.theme_sample != ThemeSample::Picker {
+            self.set_theme_sample(self.theme_sample);
+            self.viewer_scroll = sample_scroll;
+        } else {
+            self.refresh_preview();
+            if !self.viewing {
+                self.viewer_scroll = sample_scroll;
+            }
+        }
     }
 
     pub fn display_settings(&self) -> &DisplaySettings {
@@ -902,6 +969,46 @@ mod tests {
         File::create(temp.path().join("notes.txt")).unwrap();
         let app = App::new(temp.path().to_path_buf()).unwrap();
         (temp, app)
+    }
+
+    #[test]
+    fn sample_reuses_real_viewer_and_invalidates_render_on_theme_change() {
+        let temp = tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let catalog = crate::Config::built_ins();
+        app.set_theme_sample(ThemeSample::Rendered);
+        assert!(app.is_rendered_markdown_view());
+        let source = app
+            .preview()
+            .document()
+            .unwrap()
+            .markdown_source
+            .as_ref()
+            .unwrap();
+        assert!(
+            source.contains('#')
+                && source.contains("](")
+                && source.contains("```")
+                && source.contains('|')
+        );
+        assert!(!temp.path().join(".de-theme-sample.md").exists());
+        app.update_markdown_view(640, 480, 16);
+        let first = app.markdown_request.unwrap();
+        app.update_markdown_view(640, 480, 16);
+        assert_eq!(app.markdown_request, Some(first));
+        app.set_viewer_scroll(20);
+        app.set_theme(catalog.find("light").unwrap().clone());
+        assert_eq!(app.viewer_scroll(), 20);
+        assert!(app.markdown_key.is_none());
+        app.update_markdown_view(640, 480, 16);
+        assert_ne!(app.markdown_request, Some(first));
+        assert!(Arc::ptr_eq(
+            &app.markdown_key.as_ref().unwrap().3,
+            &app.theme().rendered()
+        ));
+        app.set_theme_sample(ThemeSample::Picker);
+        assert!(!app.is_viewing());
+        assert!(app.preview().document().is_none());
     }
 
     #[test]

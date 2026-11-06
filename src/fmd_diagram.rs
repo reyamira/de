@@ -27,7 +27,7 @@ fn fonts() -> Arc<usvg::fontdb::Database> {
     Arc::clone(&FONTS)
 }
 
-pub(crate) fn options(dark: bool) -> Options<'static> {
+pub(crate) fn options(style: Arc<crate::render_theme::RenderedTheme>) -> Options<'static> {
     let default_data = ImageHrefResolver::default_data_resolver();
     Options {
         fontdb: fonts(),
@@ -37,7 +37,7 @@ pub(crate) fn options(dark: bool) -> Options<'static> {
                     return default_data(mime, data, opt);
                 }
                 let source = std::str::from_utf8(&data).ok()?;
-                let adapted = adapt_svg(source, dark);
+                let adapted = adapt_svg(source, &style);
                 let nested = Options {
                     fontdb: Arc::clone(&opt.fontdb),
                     image_href_resolver: ImageHrefResolver {
@@ -56,7 +56,7 @@ pub(crate) fn options(dark: bool) -> Options<'static> {
 
 // FMD emits static styles with CSS variables and a dark media block. usvg does
 // not evaluate either, so resolve those rules before parsing the nested SVG.
-fn adapt_svg(svg: &str, dark: bool) -> String {
+fn adapt_svg(svg: &str, style: &crate::render_theme::RenderedTheme) -> String {
     let mut out = String::with_capacity(svg.len());
     let mut rest = svg;
     while let Some(start) = rest.find("<style>") {
@@ -66,18 +66,17 @@ fn adapt_svg(svg: &str, dark: bool) -> String {
             out.push_str(after);
             return out;
         };
-        out.push_str(&resolve_css(&after[..end], dark));
+        out.push_str(&resolve_css(&after[..end], style));
         rest = &after[end..];
     }
     out.push_str(rest);
-    let muted = if dark { "#8b949e" } else { "#57606a" };
     out.replace(
         "fill=\"var(--fg-muted, #57606a)\"",
-        &format!("fill=\"{muted}\""),
+        &format!("fill=\"{}\"", style.quote),
     )
 }
 
-fn resolve_css(css: &str, dark: bool) -> String {
+fn resolve_css(css: &str, style: &crate::render_theme::RenderedTheme) -> String {
     let mut flattened = String::with_capacity(css.len());
     let mut rest = css;
     while let Some(start) = rest.find("@media") {
@@ -106,9 +105,6 @@ fn resolve_css(css: &str, dark: bool) -> String {
             flattened.push_str(block);
             return flattened;
         };
-        if dark && block[..open].contains("prefers-color-scheme") {
-            flattened.push_str(&block[open + 1..end]);
-        }
         rest = &block[end + 1..];
     }
     flattened.push_str(rest);
@@ -122,21 +118,36 @@ fn resolve_css(css: &str, dark: bool) -> String {
             return out;
         };
         let (name, fallback) = expression[..end].split_once(',').unwrap_or(("", ""));
-        let color = if dark {
-            match name.trim() {
-                "--fg-default" => "#e6edf3",
-                "--fg-muted" => "#8b949e",
-                "--bg-canvas" => "#161b22",
-                "--bg-subtle" => "#21262d",
-                "--border-default" => "#30363d",
-                _ => fallback.trim(),
-            }
-        } else {
-            fallback.trim()
+        let color = match name.trim() {
+            "--fg-default" => style.text.as_str(),
+            "--fg-muted" => style.quote.as_str(),
+            "--bg-canvas" => style.code_background.as_str(),
+            "--bg-subtle" => style.code_background.as_str(),
+            "--border-default" => style.table_border.as_str(),
+            _ => fallback.trim(),
         };
         out.push_str(color);
         rest = &expression[end + 1..];
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagram_css_uses_configured_colors_in_both_appearances() {
+        for dark in [false, true] {
+            let mut style = crate::render_theme::RenderedTheme::defaults(dark);
+            style.text = "#123456".into();
+            style.code_background = "#abcdef".into();
+            let css = ".node { fill: var(--bg-canvas, #fff); color: var(--fg-default, #000); } @media (prefers-color-scheme: dark) { .node { fill: #000; } }";
+            let result = resolve_css(css, &style);
+            assert!(result.contains("#123456"));
+            assert!(result.contains("#abcdef"));
+            assert!(!result.contains("fill: #000"));
+        }
+    }
 }

@@ -5,12 +5,14 @@ use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use de::backend::InlineBackend;
+use de::theme_editor::ThemeEditorDraft;
+use de::theme_editor_ui::{EditorAction, ThemeEditorUi};
 use de::{
     App, BrowseDefaults, CONFIG_PICKER_MIN_HEIGHT, Config, DisplaySettings, NavigationResult,
-    SettingsPicker, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, create_custom_theme, ensure_config_file,
-    preview_image_area, render, render_config_picker, render_theme_preview, resolve_start_path,
-    save_defaults, save_settings, save_theme, shell_init, theme_config_path, viewer_body,
-    viewer_page_rows, viewer_scroll_max, viewer_scrollbar,
+    SettingsPicker, THEME_ENV, TWO_PANE_MIN_WIDTH, Theme, ThemeSample, create_custom_theme,
+    ensure_config_file, preview_image_area, render, render_config_picker, render_theme_preview,
+    resolve_start_path, save_defaults, save_settings, save_theme, shell_init, theme_config_path,
+    viewer_body, viewer_page_rows, viewer_scroll_max, viewer_scrollbar,
 };
 use ratatui::Terminal;
 use ratatui::layout::Rect;
@@ -40,7 +42,7 @@ const PICKER_HELP: &str = "Picker controls:
   w                  Save hidden and sort settings as defaults
   Enter              Go here         Esc / q / Ctrl-C   Cancel
 
-Run `de theme` to preview and save a color theme.
+Run `de theme` to preview and save a color theme, or `de theme edit` to edit one.
 Run `de config` to change settings, or `de config edit` to open the file.
 Run `de init --help` for shell setup.";
 
@@ -107,7 +109,7 @@ Grammars without extensions show (none)."
     )]
     Languages,
 
-    /// Preview, save, or create themes
+    /// Preview, save, create, or edit themes
     Theme {
         #[command(subcommand)]
         command: Option<ThemeCommand>,
@@ -135,6 +137,11 @@ enum ThemeCommand {
     Create {
         /// Name for the custom theme
         name: String,
+    },
+    /// Edit a custom theme or create a copy of a built-in theme
+    Edit {
+        /// Theme to edit (defaults to the selected theme)
+        name: Option<String>,
     },
 }
 
@@ -202,6 +209,34 @@ fn run(cli: Cli) -> Result<(), String> {
                 "Created theme {name} in {}. Edit its colors, then run `de theme` to preview it.",
                 path.display()
             );
+        }
+        Some(CliCommand::Theme {
+            command: Some(ThemeCommand::Edit { name }),
+        }) => {
+            require_terminal()?;
+            let catalog = Config::load().map_err(|error| format!("cannot load config: {error}"))?;
+            let selected = resolve_theme(name.or(theme), &catalog)?;
+            let builtin = Config::built_ins().find(selected.name()).is_some();
+            let table = if builtin {
+                de::new_custom_theme(selected.name())
+            } else {
+                de::load_custom_theme(selected.name())
+            }
+            .map_err(|error| format!("cannot edit theme: {error}"))?;
+            let draft_name = if builtin { "draft" } else { selected.name() };
+            let draft = ThemeEditorDraft::new(draft_name.to_owned(), table)
+                .map_err(|error| format!("cannot edit theme: {error}"))?;
+            let start = resolve_start_path(None)
+                .map_err(|error| format!("cannot resolve current directory: {error}"))?;
+            let mut app = App::with_defaults(start, catalog.defaults())
+                .map_err(|error| format!("cannot open current directory: {error}"))?;
+            app.set_display_settings(catalog.display().clone());
+            app.set_theme(draft.preview().clone());
+            if let Some((name, path)) =
+                run_theme_editor(app, draft, builtin).map_err(|error| error.to_string())?
+            {
+                eprintln!("Saved theme {name} to {}", path.display());
+            }
         }
         Some(CliCommand::Config {
             command: Some(ConfigCommand::Path),
@@ -340,14 +375,77 @@ fn run_picker(app: App) -> io::Result<Option<PickerAction>> {
 }
 
 fn run_theme_picker(app: App, catalog: &Config) -> io::Result<Option<Theme>> {
-    run_inline(
+    run_inline_with_mouse(
         app,
         (),
-        0,
-        true,
+        InlineOptions {
+            min_height: 11,
+            images: true,
+            editor_mouse: false,
+        },
         |frame, app, ()| render_theme_preview(frame, app),
-        |app, (), key, _| handle_theme_key(app, key, catalog),
+        |app, (), key, page_rows, area| {
+            let rows = if app.theme_sample() == ThemeSample::Picker {
+                de::browser_sample_page_rows(area)
+            } else {
+                page_rows
+            };
+            handle_theme_key(app, key, catalog, rows.max(1))
+        },
+        |_, _, _, _| InlineResult::Continue,
+        |_, area| Some(area),
     )
+}
+
+fn run_theme_editor(
+    app: App,
+    draft: ThemeEditorDraft,
+    builtin: bool,
+) -> io::Result<Option<(String, std::path::PathBuf)>> {
+    run_inline_with_mouse(
+        app,
+        ThemeEditorUi::new(draft, builtin),
+        InlineOptions {
+            min_height: 18,
+            images: true,
+            editor_mouse: true,
+        },
+        |frame, app, editor| editor.draw(frame, app),
+        |app, editor, key, _, area| {
+            let action = editor.handle_key(app, key, area);
+            handle_editor_action(editor, action, builtin)
+        },
+        |app, editor, mouse, area| {
+            let action = editor.handle_mouse(app, mouse, area);
+            handle_editor_action(editor, action, builtin)
+        },
+        |editor, area| editor.preview_area(area),
+    )
+}
+
+fn handle_editor_action(
+    editor: &mut ThemeEditorUi,
+    action: EditorAction,
+    builtin: bool,
+) -> InlineResult<(String, std::path::PathBuf)> {
+    match action {
+        EditorAction::Continue => InlineResult::Continue,
+        EditorAction::Cancel => InlineResult::Cancel,
+        EditorAction::Save(name) => {
+            let saved = if builtin {
+                de::create_custom_theme_from(&name, editor.draft.table())
+            } else {
+                de::save_custom_theme(&name, editor.draft.table())
+            };
+            match saved {
+                Ok(path) => InlineResult::Accept((name, path)),
+                Err(error) => {
+                    editor.set_error(error.to_string());
+                    InlineResult::Continue
+                }
+            }
+        }
+    }
 }
 
 /// Returns the chosen settings on `Enter`, for the caller to save.
@@ -367,13 +465,48 @@ fn run_config_picker(app: App) -> io::Result<Option<(BrowseDefaults, DisplaySett
 /// `handle`; `min_height` keeps views whose content is not the entry list
 /// from being sized to a short directory.
 fn run_inline<S, T>(
-    mut app: App,
-    mut state: S,
+    app: App,
+    state: S,
     min_height: u16,
     images: bool,
-    mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App, &S),
+    draw: impl FnMut(&mut ratatui::Frame<'_>, &App, &S),
     mut handle: impl FnMut(&mut App, &mut S, KeyEvent, usize) -> InlineResult<T>,
 ) -> io::Result<Option<T>> {
+    run_inline_with_mouse(
+        app,
+        state,
+        InlineOptions {
+            min_height,
+            images,
+            editor_mouse: false,
+        },
+        draw,
+        |app, state, key, rows, _| handle(app, state, key, rows),
+        |_, _, _, _| InlineResult::Continue,
+        |_, area| Some(area),
+    )
+}
+
+struct InlineOptions {
+    min_height: u16,
+    images: bool,
+    editor_mouse: bool,
+}
+
+fn run_inline_with_mouse<S, T>(
+    mut app: App,
+    mut state: S,
+    options: InlineOptions,
+    mut draw: impl FnMut(&mut ratatui::Frame<'_>, &App, &S),
+    mut handle: impl FnMut(&mut App, &mut S, KeyEvent, usize, Rect) -> InlineResult<T>,
+    mut handle_mouse: impl FnMut(&mut App, &mut S, MouseEvent, Rect) -> InlineResult<T>,
+    preview_area: impl Fn(&S, Rect) -> Option<Rect>,
+) -> io::Result<Option<T>> {
+    let InlineOptions {
+        min_height,
+        images,
+        editor_mouse,
+    } = options;
     let input_terminal = PlatformTerminal::new()?;
     let reader = input_terminal.event_reader();
     enable_raw_mode()?;
@@ -400,7 +533,7 @@ fn run_inline<S, T>(
             redraw |= app.poll_preview();
             redraw |= app.poll_markdown();
             if redraw {
-                let viewing = app.is_viewing();
+                let viewing = app.is_viewing() || editor_mouse;
                 if viewer_active && !viewing {
                     drag = None;
                     set_mouse_capture(&mut raw_mode.mouse_capture, false, &mut io::stderr())?;
@@ -435,11 +568,18 @@ fn run_inline<S, T>(
                 )?;
                 viewer_active = viewing;
                 let area = Rect::new(0, 0, terminal_width, viewport_height);
-                if app.is_viewing() {
-                    app.set_viewer_scroll(app.viewer_scroll().min(viewer_scroll_max(&app, area)));
+                let preview = preview_area(&state, area);
+                if app.is_viewing()
+                    && let Some(preview) = preview
+                {
+                    app.set_viewer_scroll(
+                        app.viewer_scroll().min(viewer_scroll_max(&app, preview)),
+                    );
                 }
-                if app.is_rendered_markdown_view() {
-                    let body = viewer_body(area);
+                if let Some(body) = preview
+                    .filter(|_| app.is_rendered_markdown_view())
+                    .map(viewer_body)
+                {
                     let (cell_width, cell_height) = terminal_cell_pixels();
                     app.update_markdown_view(
                         u32::from(body.width) * cell_width,
@@ -451,14 +591,16 @@ fn run_inline<S, T>(
                 redraw = false;
             }
             let area = Rect::new(0, 0, terminal_width, viewport_height);
-            let image = if images {
-                app.markdown_image()
-                    .or_else(|| {
-                        (!app.is_rendered_markdown_view())
-                            .then(|| app.preview().image())
-                            .flatten()
-                    })
-                    .zip(preview_image_area(&app, area))
+            let image = if images && (!editor_mouse || app.is_rendered_markdown_view()) {
+                preview_area(&state, area).and_then(|preview| {
+                    app.markdown_image()
+                        .or_else(|| {
+                            (!app.is_rendered_markdown_view())
+                                .then(|| app.preview().image())
+                                .flatten()
+                        })
+                        .zip(preview_image_area(&app, preview))
+                })
             } else {
                 None
             };
@@ -483,9 +625,12 @@ fn run_inline<S, T>(
                     } else {
                         visible_entry_rows(&app, terminal_width, viewport_height)
                     };
-                    match handle(&mut app, &mut state, key, page_rows) {
+                    match handle(&mut app, &mut state, key, page_rows, area) {
                         InlineResult::Continue => {
-                            if !app.is_viewing() || matches!(key.code, KeyCode::Char('m' | 'R')) {
+                            if !app.is_viewing()
+                                || app.theme_sample() != ThemeSample::Picker
+                                || matches!(key.code, KeyCode::Char('m' | 'R'))
+                            {
                                 drag = None;
                             }
                             redraw = true;
@@ -495,7 +640,23 @@ fn run_inline<S, T>(
                     }
                 }
                 Event::Mouse(mouse) if viewer_active => {
-                    redraw |= handle_viewer_mouse(&mut app, area, origin, mouse, &mut drag);
+                    if editor_mouse {
+                        if let Some(origin) = origin
+                            && mouse.row >= origin
+                            && mouse.row - origin < area.height
+                            && mouse.column < area.width
+                        {
+                            let mut relative = mouse;
+                            relative.row -= origin;
+                            match handle_mouse(&mut app, &mut state, relative, area) {
+                                InlineResult::Continue => redraw = true,
+                                InlineResult::Accept(value) => break Ok(Some(value)),
+                                InlineResult::Cancel => break Ok(None),
+                            }
+                        }
+                    } else {
+                        redraw |= handle_viewer_mouse(&mut app, area, origin, mouse, &mut drag);
+                    }
                 }
                 Event::WindowResized(size) => {
                     let (width, height) = (size.cols, size.rows);
@@ -509,14 +670,14 @@ fn run_inline<S, T>(
                         .resize_viewport(width, viewport_height)?;
                     terminal.resize(Rect::new(0, 0, width, viewport_height))?;
                     origin = None;
-                    if app.is_viewing() && origin_supported {
+                    if (app.is_viewing() || editor_mouse) && origin_supported {
                         terminal.backend_mut().request_origin()?;
                         let result = read_origin(&reader, width, height, viewport_height)?;
                         origin = resolve_origin(result, &mut origin_supported);
                     }
                     set_mouse_capture(
                         &mut raw_mode.mouse_capture,
-                        app.is_viewing() && origin.is_some(),
+                        (app.is_viewing() || editor_mouse) && origin.is_some(),
                         &mut io::stderr(),
                     )?;
                     redraw = true;
@@ -707,7 +868,12 @@ fn handle_config_key(
     InlineResult::Continue
 }
 
-fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &Config) -> InlineResult<Theme> {
+fn handle_theme_key(
+    app: &mut App,
+    key: KeyEvent,
+    catalog: &Config,
+    page_rows: usize,
+) -> InlineResult<Theme> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return InlineResult::Cancel;
     }
@@ -716,9 +882,52 @@ fn handle_theme_key(app: &mut App, key: KeyEvent, catalog: &Config) -> InlineRes
         KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
             app.set_theme(catalog.previous(app.theme().name()));
         }
-        KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('l') | KeyCode::Char('j') => {
+        KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => {
             app.set_theme(catalog.next(app.theme().name()))
         }
+        KeyCode::Tab => {
+            let next = match app.theme_sample() {
+                ThemeSample::Picker => ThemeSample::Source,
+                ThemeSample::Source => ThemeSample::Rendered,
+                ThemeSample::Rendered => ThemeSample::Picker,
+            };
+            app.set_theme_sample(next);
+        }
+        KeyCode::PageUp | KeyCode::PageDown if app.theme_sample() == ThemeSample::Picker => {
+            let maximum = de::browser_sample_scroll_max(page_rows);
+            let current = app.viewer_scroll().min(maximum);
+            let next = if key.code == KeyCode::PageUp {
+                current.saturating_sub(page_rows)
+            } else {
+                current.saturating_add(page_rows).min(maximum)
+            };
+            app.set_viewer_scroll(next);
+        }
+        KeyCode::Char('m') if app.is_viewing() => app.toggle_markdown_source(),
+        KeyCode::PageUp if app.is_viewing() => {
+            let step = if app.is_rendered_markdown_view() {
+                app.markdown_scroll_step()
+            } else {
+                1
+            };
+            app.set_viewer_scroll(
+                app.viewer_scroll()
+                    .saturating_sub(page_rows.saturating_mul(step)),
+            );
+        }
+        KeyCode::PageDown if app.is_viewing() => {
+            let step = if app.is_rendered_markdown_view() {
+                app.markdown_scroll_step()
+            } else {
+                1
+            };
+            app.set_viewer_scroll(
+                app.viewer_scroll()
+                    .saturating_add(page_rows.saturating_mul(step)),
+            );
+        }
+        KeyCode::Home if app.is_viewing() => app.set_viewer_scroll(0),
+        KeyCode::End if app.is_viewing() => app.set_viewer_scroll(usize::MAX),
         KeyCode::Enter => return InlineResult::Accept(app.theme().clone()),
         KeyCode::Escape | KeyCode::Char('q') => return InlineResult::Cancel,
         _ => {}
@@ -1031,6 +1240,21 @@ mod tests {
             Some(CliCommand::Theme {
                 command: Some(ThemeCommand::Create { name })
             }) if name == "midnight"
+        ));
+
+        let cli = Cli::try_parse_from(["de", "theme", "edit", "midnight"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Theme {
+                command: Some(ThemeCommand::Edit { name: Some(name) })
+            }) if name == "midnight"
+        ));
+        let cli = Cli::try_parse_from(["de", "theme", "edit"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Theme {
+                command: Some(ThemeCommand::Edit { name: None })
+            })
         ));
     }
 
@@ -1445,22 +1669,77 @@ mod tests {
 
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         assert!(matches!(
-            handle_theme_key(&mut app, right, &catalog),
+            handle_theme_key(&mut app, right, &catalog, 4),
             InlineResult::Continue
         ));
         assert_eq!(app.theme().name(), "light");
 
         let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
         assert!(matches!(
-            handle_theme_key(&mut app, left, &catalog),
+            handle_theme_key(&mut app, left, &catalog, 4),
             InlineResult::Continue
         ));
         assert_eq!(app.theme().name(), "auto");
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        match handle_theme_key(&mut app, enter, &catalog) {
+        match handle_theme_key(&mut app, enter, &catalog, 4) {
             InlineResult::Accept(theme) => assert_eq!(theme.name(), "auto"),
             _ => panic!("Enter should accept the previewed theme"),
         }
+    }
+
+    #[test]
+    fn theme_browser_sample_scrolls_without_changing_theme() {
+        let temp = tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let catalog = Config::built_ins();
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        handle_theme_key(&mut app, down, &catalog, 3);
+        assert!(app.viewer_scroll() > 0);
+        assert_eq!(app.theme_sample(), ThemeSample::Picker);
+        assert_eq!(app.theme().name(), "auto");
+        handle_theme_key(&mut app, down, &catalog, 3);
+        handle_theme_key(&mut app, down, &catalog, 3);
+        assert_eq!(app.viewer_scroll(), de::browser_sample_scroll_max(3));
+        handle_theme_key(&mut app, up, &catalog, 3);
+        assert!(app.viewer_scroll() < de::browser_sample_scroll_max(3));
+    }
+
+    #[test]
+    fn theme_sample_keys_cycle_and_keep_theme_selection() {
+        let temp = tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let catalog = Config::built_ins();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        handle_theme_key(&mut app, tab, &catalog, 4);
+        assert_eq!(app.theme_sample(), ThemeSample::Source);
+        handle_theme_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &catalog,
+            4,
+        );
+        assert_eq!(app.theme_sample(), ThemeSample::Rendered);
+        handle_theme_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &catalog,
+            4,
+        );
+        assert_eq!(app.theme().name(), "light");
+        assert_eq!(app.theme_sample(), ThemeSample::Rendered);
+        handle_theme_key(&mut app, tab, &catalog, 4);
+        assert_eq!(app.theme_sample(), ThemeSample::Picker);
+        assert!(!app.is_viewing());
+        assert!(matches!(
+            handle_theme_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                &catalog,
+                4
+            ),
+            InlineResult::Cancel
+        ));
     }
 }

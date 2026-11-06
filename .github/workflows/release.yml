@@ -64,6 +64,9 @@ jobs:
           cp README.md LICENSE "${archive}/"
           cp -R docs "${archive}/docs"
           cp -R assets/syntaxes "${archive}/syntaxes"
+          mkdir -p "${archive}/licenses/franken-markdown/fmd-font"
+          cp vendor/franken-markdown/LICENSE vendor/franken-markdown/PROVENANCE "${archive}/licenses/franken-markdown/"
+          cp vendor/franken-markdown/fmd-font/LICENSE "${archive}/licenses/franken-markdown/fmd-font/"
           tar -czf "${archive}.tar.gz" "${archive}"
           shasum -a 256 "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
       - uses: actions/upload-artifact@v7

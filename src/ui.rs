@@ -23,7 +23,174 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 pub fn render_theme_preview(frame: &mut Frame<'_>, app: &App) {
-    render_picker(frame, app, true);
+    if app.theme_sample() == crate::ThemeSample::Picker {
+        let area = frame.area();
+        frame.render_widget(Clear, area);
+        render_editor_browser(frame, app, area, &app.theme().palette(), true);
+    } else {
+        render_picker(frame, app, true);
+    }
+}
+
+/// Draw the active theme sample inside `area`, clipped to the frame.
+///
+/// For viewer samples, pass the same clipped rectangle to `viewer_body` and
+/// the image renderer so their geometry matches this preview.
+pub fn render_editor_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let area = area.intersection(frame.area());
+    if area.is_empty() {
+        return;
+    }
+    let palette = app.theme().palette();
+    frame.render_widget(Clear, area);
+    if app.theme_sample() == crate::ThemeSample::Picker {
+        render_editor_browser(frame, app, area, &palette, false);
+        return;
+    }
+
+    render_viewer(frame, app, area, &palette);
+    if area.height >= 3 {
+        let [header, _, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        frame.render_widget(Clear, header);
+        frame.render_widget(
+            Paragraph::new(if app.is_markdown_source() {
+                " Source"
+            } else {
+                " Rendered Markdown"
+            })
+            .style(
+                Style::default()
+                    .fg(palette.title)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            header,
+        );
+        frame.render_widget(Clear, footer);
+        frame.render_widget(
+            Paragraph::new(" Tab sample  PgUp/PgDown scroll").style(muted_style(&palette)),
+            footer,
+        );
+    }
+}
+
+const BROWSER_SAMPLE_ROWS: usize = 9;
+
+/// The last useful browser sample offset for a given body height.
+pub fn browser_sample_scroll_max(rows: usize) -> usize {
+    BROWSER_SAMPLE_ROWS.saturating_sub(rows)
+}
+
+/// Number of visible rows inside the browser sample's border.
+pub fn browser_sample_page_rows(area: Rect) -> usize {
+    let [_, outer, _] = browser_sample_areas(area);
+    viewer_inner(outer).height as usize
+}
+
+fn browser_sample_areas(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(u16::from(area.height >= 2)),
+    ])
+    .areas(area)
+}
+
+fn render_editor_browser(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: &Palette,
+    standalone: bool,
+) {
+    let [header, outer, footer] = browser_sample_areas(area);
+    let body = viewer_inner(outer);
+    if body != outer {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(muted_style(palette)),
+            outer,
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(if standalone {
+            format!(" Browser · {}", app.theme().name())
+        } else {
+            " Browser".to_owned()
+        })
+        .style(
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        header,
+    );
+    let examples = [
+        ("Directory", true, false, false),
+        ("File", false, false, false),
+        ("Symlink", false, true, false),
+        ("Selected directory", true, false, true),
+        ("Selected file", false, false, true),
+        ("Selected symlink", false, true, true),
+    ];
+    let entries: Vec<Entry> = examples
+        .into_iter()
+        .map(|(name, is_dir, is_symlink, _)| Entry {
+            name: name.into(),
+            path: name.into(),
+            is_dir,
+            is_symlink,
+            modified: None,
+        })
+        .collect();
+    let now = SystemTime::now();
+    let mut lines = vec![
+        Line::styled(" Normal interface text", Style::default().fg(palette.text)),
+        Line::styled(" Muted information", muted_style(palette)),
+        Line::styled(
+            " Sample diagnostic (not an error)",
+            Style::default().fg(palette.error),
+        ),
+    ];
+    lines.extend(entries.iter().enumerate().map(|(index, entry)| {
+        let selected = examples[index].3;
+        Line::styled(
+            entry_row(
+                if selected { "› " } else { "  " },
+                entry,
+                body.width as usize,
+                None,
+                app.display_settings(),
+                now,
+            ),
+            if selected {
+                emphasis_style(palette)
+            } else {
+                entry_style(entry, palette)
+            },
+        )
+    }));
+    let offset = app
+        .viewer_scroll()
+        .min(browser_sample_scroll_max(body.height as usize));
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
+        body,
+    );
+    frame.render_widget(
+        Paragraph::new(if standalone {
+            " ←→ theme  Tab sample  PgUp/PgDown scroll  Enter save"
+        } else {
+            " Tab sample  PgUp/PgDown scroll"
+        })
+        .style(muted_style(palette)),
+        footer,
+    );
 }
 
 /// The `de config` picker: settings on the left, and the current directory
@@ -120,11 +287,15 @@ fn render_config_footer(frame: &mut Frame<'_>, area: Rect, palette: &Palette) {
 
 fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
     let area = frame.area();
+    render_picker_in(frame, app, theme_preview, area);
+}
+
+fn render_picker_in(frame: &mut Frame<'_>, app: &App, theme_preview: bool, area: Rect) {
     let palette = app.theme().palette();
     let now = SystemTime::now();
     frame.render_widget(Clear, area);
 
-    if app.is_viewing() && !theme_preview {
+    if app.is_viewing() {
         render_viewer(frame, app, area, &palette);
         return;
     }
@@ -334,7 +505,7 @@ fn render_preview(
     frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn picker_panes(area: Rect) -> [Rect; 3] {
+pub(crate) fn picker_panes(area: Rect) -> [Rect; 3] {
     Layout::horizontal([
         Constraint::Percentage(44),
         Constraint::Length(1),
@@ -797,7 +968,11 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             } else {
                 "FMD rendered"
             };
-            format!(" {mode} · {}", app.preview().label())
+            if app.theme_sample() != crate::ThemeSample::Picker {
+                format!(" {} · {mode} · theme sample", app.theme().name())
+            } else {
+                format!(" {mode} · {}", app.preview().label())
+            }
         } else if app.supports_reading() {
             let mode = if app.is_reading() { "reading" } else { "raw" };
             format!(" {mode} · {}", app.preview().label())
@@ -815,6 +990,10 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         frame.render_widget(
             Paragraph::new(if let Some(status) = app.status() {
                 status
+            } else if app.theme_sample() != crate::ThemeSample::Picker && footer.width >= 64 {
+                " tab sample  m mode  ←→/↑↓ theme  pg↑↓ scroll  enter save  esc cancel"
+            } else if app.theme_sample() != crate::ThemeSample::Picker {
+                " tab sample  m mode  arrows theme  ↵ save  esc"
             } else if markdown && footer.width >= 64 {
                 " m source/rendered  q/esc back  ↑↓/jk scroll  pg↑↓ page  o open"
             } else if markdown && footer.width >= 32 {
@@ -1012,6 +1191,8 @@ fn render_theme_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &P
         Line::from(vec![
             key(" ←→/↑↓", palette),
             hint(" preview  ", palette),
+            key("tab", palette),
+            hint(" sample  ", palette),
             Span::styled(format!(" {} ", app.theme().name()), emphasis_style(palette)),
             key("  enter", palette),
             hint(" save  ", palette),
@@ -1022,6 +1203,8 @@ fn render_theme_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &P
         Line::from(vec![
             key(" ←→", palette),
             hint(" ", palette),
+            key("tab", palette),
+            hint(" sample ", palette),
             Span::styled(app.theme().name().to_owned(), emphasis_style(palette)),
             key("  ↵", palette),
             hint("save  ", palette),
@@ -1470,6 +1653,23 @@ mod tests {
     }
 
     #[test]
+    fn browser_sample_scroll_uses_inner_border_height() {
+        let area = Rect::new(0, 0, 40, 6);
+        assert_eq!(browser_sample_page_rows(area), 2);
+        assert_eq!(browser_sample_page_rows(Rect::new(0, 0, 2, 4)), 2);
+        let temp = tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_viewer_scroll(browser_sample_scroll_max(browser_sample_page_rows(area)));
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_theme_preview(frame, &app))
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Selected file"));
+        assert!(rendered.contains("Selected symlink"));
+    }
+
+    #[test]
     fn viewer_border_and_page_rows_follow_terminal_size() {
         let area = Rect::new(2, 3, 40, 12);
         assert_eq!(viewer_body(area), Rect::new(3, 5, 37, 8));
@@ -1738,25 +1938,62 @@ mod tests {
     }
 
     #[test]
-    fn theme_preview_uses_the_real_picker_and_selector_controls() {
+    fn editor_preview_uses_examples_and_confines_viewer_to_its_area() {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("project")).unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        let themes = crate::Config::built_ins();
-        app.set_theme(themes.find("dark").unwrap().clone());
-        let backend = TestBackend::new(88, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect::new(9, 4, 60, 12);
 
+        for sample in [
+            crate::ThemeSample::Picker,
+            crate::ThemeSample::Source,
+            crate::ThemeSample::Rendered,
+        ] {
+            app.set_theme_sample(sample);
+            let mut reference = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            reference
+                .draw(|frame| render_theme_preview(frame, &app))
+                .unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let background = vec![Line::raw("x".repeat(80)); 20];
+                    frame.render_widget(Paragraph::new(background), frame.area());
+                    render_editor_preview(frame, &app, area);
+                })
+                .unwrap();
+
+            let actual = terminal.backend().buffer();
+            let expected = reference.backend().buffer();
+            for y in 0..20 {
+                for x in 0..80 {
+                    if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+                        assert_eq!(actual[(x, y)].symbol(), "x");
+                    } else if sample != crate::ThemeSample::Picker
+                        && y > area.y
+                        && y + 1 < area.bottom()
+                    {
+                        assert_eq!(actual[(x, y)], expected[(x - area.x, y - area.y)]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn theme_sample_uses_viewer_and_shows_theme_controls() {
+        let temp = tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_theme_sample(crate::ThemeSample::Source);
+        let backend = TestBackend::new(88, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| render_theme_preview(frame, &app))
             .unwrap();
-
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("de theme"));
-        assert!(rendered.contains("next · project/"));
-        assert!(rendered.contains("dark"));
-        assert!(rendered.contains("preview"));
+        assert!(rendered.contains("source · theme sample"));
+        assert!(rendered.contains("tab sample"));
+        assert!(rendered.contains("m mode"));
         assert!(rendered.contains("enter save"));
-        assert!(rendered.contains("esc cancel"));
     }
 }

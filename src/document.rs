@@ -171,16 +171,19 @@ impl Lines {
 
 struct SyntaxAssets {
     syntaxes: SyntaxSet,
-    scopes: [(Scope, SyntaxColor); 10],
+    scopes: [(Scope, SyntaxColor); 11],
     markdown_scopes: [Scope; 13],
 }
 
 #[derive(Clone, Copy)]
 enum SyntaxColor {
-    Muted,
-    Title,
-    Accent,
-    Symlink,
+    Comment,
+    Keyword,
+    Entity,
+    String,
+    Number,
+    Constant,
+    Support,
 }
 
 // Generate Sublime embed rules from the same inventory used for source files.
@@ -333,16 +336,17 @@ static SYNTAX_ASSETS: LazyLock<SyntaxAssets> = LazyLock::new(|| SyntaxAssets {
         builder.build()
     },
     scopes: [
-        (Scope::new("comment").unwrap(), SyntaxColor::Muted),
-        (Scope::new("keyword").unwrap(), SyntaxColor::Title),
-        (Scope::new("storage").unwrap(), SyntaxColor::Title),
-        (Scope::new("entity").unwrap(), SyntaxColor::Title),
-        (Scope::new("string").unwrap(), SyntaxColor::Accent),
-        (Scope::new("markup.heading").unwrap(), SyntaxColor::Title),
-        (Scope::new("markup.bold").unwrap(), SyntaxColor::Title),
-        (Scope::new("markup.italic").unwrap(), SyntaxColor::Accent),
-        (Scope::new("constant").unwrap(), SyntaxColor::Symlink),
-        (Scope::new("support").unwrap(), SyntaxColor::Symlink),
+        (Scope::new("comment").unwrap(), SyntaxColor::Comment),
+        (Scope::new("keyword").unwrap(), SyntaxColor::Keyword),
+        (Scope::new("storage").unwrap(), SyntaxColor::Keyword),
+        (Scope::new("entity").unwrap(), SyntaxColor::Entity),
+        (Scope::new("string").unwrap(), SyntaxColor::String),
+        (Scope::new("markup.heading").unwrap(), SyntaxColor::Entity),
+        (Scope::new("markup.bold").unwrap(), SyntaxColor::Entity),
+        (Scope::new("markup.italic").unwrap(), SyntaxColor::String),
+        (Scope::new("constant.numeric").unwrap(), SyntaxColor::Number),
+        (Scope::new("constant").unwrap(), SyntaxColor::Constant),
+        (Scope::new("support").unwrap(), SyntaxColor::Support),
     ],
     markdown_scopes: [
         "text.html.markdown",
@@ -448,25 +452,32 @@ fn syntax_style(stack: &ScopeStack, assets: &SyntaxAssets, palette: &Palette) ->
             .find_map(|(prefix, color)| prefix.is_prefix_of(*scope).then_some(color))
     });
     let mut style = Style::default().fg(match color {
-        Some(SyntaxColor::Muted) => palette.muted,
-        Some(SyntaxColor::Title) => palette.title,
-        Some(SyntaxColor::Accent) => palette.accent,
-        Some(SyntaxColor::Symlink) => palette.symlink,
-        None => palette.text,
+        Some(SyntaxColor::Comment) => palette.syntax.comment,
+        Some(SyntaxColor::Keyword) => palette.syntax.keyword,
+        Some(SyntaxColor::Entity) => palette.syntax.entity,
+        Some(SyntaxColor::String) => palette.syntax.string,
+        Some(SyntaxColor::Number) => palette.syntax.number,
+        Some(SyntaxColor::Constant) => palette.syntax.constant,
+        Some(SyntaxColor::Support) => palette.syntax.support,
+        None if markdown && !has(fence) => palette.markdown.text,
+        None => palette.syntax.text,
     });
     if markdown && !has(fence) {
+        style = style.fg(palette.markdown.text);
         if has(list_marker) || has(quote_marker) || has(numbered_marker) {
-            style = style.fg(palette.accent);
+            style = style.fg(palette.markdown.marker);
         } else if has(punctuation) {
-            style = style.fg(palette.muted);
+            style = style.fg(palette.markdown.punctuation);
         } else if has(inline_code) {
-            style = style.fg(palette.accent);
+            style = style.fg(palette.markdown.code);
         } else if has(link_label) || has(image_label) {
-            style = style.fg(palette.symlink).add_modifier(Modifier::UNDERLINED);
+            style = style
+                .fg(palette.markdown.link)
+                .add_modifier(Modifier::UNDERLINED);
         } else if has(link_url) {
-            style = style.fg(palette.muted);
+            style = style.fg(palette.markdown.link_url);
         } else if has(heading) {
-            style = style.fg(palette.title);
+            style = style.fg(palette.markdown.heading);
         }
         if !has(punctuation) {
             if has(heading) || has(bold) {
@@ -528,14 +539,14 @@ fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
                 spans.clear();
                 spans.push(Span::styled(
                     line.to_owned(),
-                    Style::default().fg(palette.text),
+                    Style::default().fg(palette.syntax.text),
                 ));
             }
         } else {
             parser = None;
             spans.push(Span::styled(
                 line.to_owned(),
-                Style::default().fg(palette.text),
+                Style::default().fg(palette.syntax.text),
             ));
         }
         lines.push(Line::from(spans));
@@ -556,6 +567,50 @@ fn markdown_document(text: &str, palette: &Palette) -> Document {
     doc.markdown_source = Some(Arc::from(text));
     doc.supports_reading = false;
     doc
+}
+
+/// Create the Markdown sample used by the theme picker.
+pub fn markdown_sample(palette: &Palette) -> Document {
+    markdown_document(
+        r#"# Heading level 1
+
+Body text with **bold**, *italic*, ***bold italic***, ~~strikethrough~~,
+a [link label](https://example.com/path) and `inline code`.
+
+## Heading level 2
+### Heading level 3
+#### Heading level 4
+##### Heading level 5
+###### Heading level 6
+
+> A quoted passage shows the quote text and bar.
+
+- Bullet item
+  - Nested bullet
+1. Numbered item
+   1. Nested number
+
+| Table | Example |
+| --- | --- |
+| First | Normal row |
+| Second | Striped row |
+| Third | Another row |
+
+```jsx
+// Syntax colors
+function sample(value) {
+  const message = "hello";
+  return true ? Math.max(value, 42) : null;
+}
+```
+
+```mermaid
+flowchart LR
+    A[Start] --> B[Finish]
+```
+"#,
+        palette,
+    )
 }
 
 fn json_document(text: &str, palette: &Palette) -> Document {
@@ -674,18 +729,32 @@ mod tests {
     use ratatui::style::Color;
 
     fn palette() -> Palette {
-        Palette {
-            accent: Color::Green,
-            text: Color::White,
-            muted: Color::DarkGray,
-            title: Color::Yellow,
-            error: Color::Red,
-            symlink: Color::Cyan,
-            emphasis_foreground: Color::Black,
-            emphasis_background: Color::White,
-            reverse_emphasis: false,
-            dim_muted: false,
-        }
+        let mut p = crate::Theme::auto().palette();
+        p.accent = Color::Green;
+        p.text = Color::White;
+        p.muted = Color::DarkGray;
+        p.title = Color::Yellow;
+        p.error = Color::Red;
+        p.symlink = Color::Cyan;
+        p.emphasis_foreground = Color::Black;
+        p.emphasis_background = Color::White;
+        p.reverse_emphasis = false;
+        p.syntax.text = p.text;
+        p.syntax.comment = p.muted;
+        p.syntax.keyword = p.title;
+        p.syntax.entity = p.title;
+        p.syntax.string = p.accent;
+        p.syntax.number = p.symlink;
+        p.syntax.constant = p.symlink;
+        p.syntax.support = p.symlink;
+        p.markdown.text = p.text;
+        p.markdown.heading = p.title;
+        p.markdown.link = p.symlink;
+        p.markdown.link_url = p.muted;
+        p.markdown.code = p.accent;
+        p.markdown.punctuation = p.muted;
+        p.markdown.marker = p.accent;
+        p
     }
     fn text(doc: &Document) -> String {
         lines_text(&doc.lines)
@@ -702,6 +771,45 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn source_and_markdown_roles_control_their_own_spans() {
+        let mut p = palette();
+        p.syntax.keyword = Color::Red;
+        p.syntax.string = Color::Blue;
+        p.syntax.number = Color::Magenta;
+        p.syntax.comment = Color::Cyan;
+        p.markdown.heading = Color::Green;
+        p.markdown.link = Color::Yellow;
+        p.markdown.code = Color::Red;
+        let source = source_document(
+            Path::new("sample.rs"),
+            "let x = \"hello\"; let n = 42; // note",
+            &p,
+        );
+        let source_has = |fragment: &str, color| {
+            source
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains(fragment) && span.style.fg == Some(color))
+        };
+        assert!(source_has("let", Color::Red));
+        assert!(source_has("hello", Color::Blue));
+        assert!(source_has("42", Color::Magenta));
+        assert!(source_has("note", Color::Cyan));
+        let markdown = markdown_document("# Heading\n\n[site](url) and `code`", &p);
+        let markdown_has = |fragment: &str, color| {
+            markdown
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains(fragment) && span.style.fg == Some(color))
+        };
+        assert!(markdown_has("Heading", Color::Green));
+        assert!(markdown_has("site", Color::Yellow));
+        assert!(markdown_has("code", Color::Red));
     }
 
     #[test]

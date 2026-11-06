@@ -11,7 +11,7 @@ pub struct RenderRequest {
     pub width: u32,
     pub height: u32,
     pub scroll_y: u32,
-    pub dark: bool,
+    pub style: Arc<crate::render_theme::RenderedTheme>,
 }
 
 #[derive(Debug)]
@@ -118,13 +118,22 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
     }
 }
 
-#[derive(PartialEq, Eq)]
 struct CacheKey {
     path: PathBuf,
     source: Arc<str>,
     width: u32,
-    dark: bool,
+    style: Arc<crate::render_theme::RenderedTheme>,
 }
+
+impl PartialEq for CacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.source == other.source
+            && self.width == other.width
+            && Arc::ptr_eq(&self.style, &other.style)
+    }
+}
+impl Eq for CacheKey {}
 
 struct CachedPage {
     key: CacheKey,
@@ -150,7 +159,7 @@ fn render(
         path: request.path.clone(),
         source: Arc::clone(&request.source),
         width: request.width,
-        dark: request.dark,
+        style: Arc::clone(&request.style),
     };
     if cache.as_ref().is_none_or(|page| page.key != key) {
         *cache = None;
@@ -159,33 +168,54 @@ fn render(
             return Err("Markdown rendering cancelled.".into());
         }
         let assets = crate::fmd_assets::prepare(&mut doc, &request.path, cancelled)?;
-        let mut options = franken_markdown::svg::SvgOptions {
+        let style = &request.style;
+        let mut options = crate::fmd_svg::SvgOptions {
             max_width_pt: (request.width as f32 * 0.75).max(144.0),
+            heading_scale: f32::from(style.heading_scale_percent) / 100.0,
+            code_size_px: Some(style.code_size_px),
+            heading_font: style.heading_bytes.clone(),
+            heading_color: Some(style.heading.clone()),
+            code_text_color: Some(style.code_text.clone()),
             ..Default::default()
         };
+        let padding = f32::from(style.page_padding_px) * 0.75;
         options.theme.page.margins = franken_markdown::PageMargins {
-            top_pt: 9.0,
-            right_pt: 9.0,
-            bottom_pt: 9.0,
-            left_pt: 9.0,
+            top_pt: padding,
+            right_pt: padding,
+            bottom_pt: padding,
+            left_pt: padding,
         };
-        options.theme.appearance = if request.dark {
+        options.theme.spacing.base_px = style.body_size_px;
+        options.theme.spacing.line_height = f32::from(style.line_height_percent) / 100.0;
+        options.theme.appearance = if style.dark {
             franken_markdown::SystemAppearance::Dark
         } else {
             franken_markdown::SystemAppearance::Light
         };
-        let (svg, _, _) = franken_markdown::svg::render_svg_with_resources(
-            &doc,
-            &options,
-            &franken_markdown::FontAssets::default(),
-            &assets,
-        )
-        .map_err(|error| format!("Cannot render Markdown: {error}"))?;
+        let colors = if style.dark {
+            &mut options.theme.dark_colors
+        } else {
+            &mut options.theme.colors
+        };
+        colors.fg = style.text.clone();
+        colors.bg = style.background.clone();
+        colors.accent = style.link.clone();
+        colors.code_bg = style.code_background.clone();
+        colors.quote_fg = style.quote.clone();
+        colors.quote_bar = style.quote_bar.clone();
+        colors.border = style.table_border.clone();
+        colors.stripe = style.table_stripe.clone();
+        let (svg, _, _) =
+            crate::fmd_svg::render_svg_with_resources(&doc, &options, &style.fonts, &assets)
+                .map_err(|error| format!("Cannot render Markdown: {error}"))?;
         if cancelled() {
             return Err("Markdown rendering cancelled.".into());
         }
-        let tree = resvg::usvg::Tree::from_data(&svg, &crate::fmd_diagram::options(request.dark))
-            .map_err(|error| format!("Cannot parse rendered Markdown: {error}"))?;
+        let tree = resvg::usvg::Tree::from_data(
+            &svg,
+            &crate::fmd_diagram::options(Arc::clone(&request.style)),
+        )
+        .map_err(|error| format!("Cannot parse rendered Markdown: {error}"))?;
         let scale = (request.width as f32 / tree.size().width()).min(1.0);
         let height = (tree.size().height() * scale).ceil();
         if !height.is_finite() || height > u32::MAX as f32 {
@@ -206,11 +236,14 @@ fn render(
     let scroll_y = request.scroll_y.min(max_scroll);
     let mut pixmap = resvg::tiny_skia::Pixmap::new(request.width, request.height)
         .ok_or("Cannot allocate Markdown viewport.")?;
-    pixmap.fill(if request.dark {
-        resvg::tiny_skia::Color::from_rgba8(13, 17, 23, 255)
-    } else {
-        resvg::tiny_skia::Color::WHITE
-    });
+    let rgb = &request.style.background;
+    let component = |range| u8::from_str_radix(&rgb[range], 16).expect("validated color");
+    pixmap.fill(resvg::tiny_skia::Color::from_rgba8(
+        component(1..3),
+        component(3..5),
+        component(5..7),
+        255,
+    ));
     resvg::render(
         &page.tree,
         resvg::tiny_skia::Transform::from_row(
@@ -240,6 +273,12 @@ fn render(
 mod tests {
     use super::*;
 
+    fn style(dark: bool) -> Arc<crate::render_theme::RenderedTheme> {
+        crate::render_theme::RenderedTheme::defaults(dark)
+            .resolve(std::path::Path::new("."))
+            .unwrap()
+    }
+
     #[test]
     fn compact_margins_leave_more_width_for_text() {
         let source = "A paragraph with enough words to wrap across several lines. ".repeat(20);
@@ -249,7 +288,7 @@ mod tests {
             width: 320,
             height: 180,
             scroll_y: 0,
-            dark: false,
+            style: style(false),
         };
         let mut cache = None;
         let page = render(&request, &mut cache, &mut || false).unwrap();
@@ -270,7 +309,7 @@ mod tests {
         )
         .unwrap();
         let default_tree =
-            resvg::usvg::Tree::from_data(&svg, &crate::fmd_diagram::options(false)).unwrap();
+            resvg::usvg::Tree::from_data(&svg, &crate::fmd_diagram::options(style(false))).unwrap();
         assert!(compact.tree.size().height() < default_tree.size().height());
     }
 
@@ -283,7 +322,7 @@ mod tests {
             width: 500,
             height: 180,
             scroll_y: 0,
-            dark: false,
+            style: style(false),
         };
         let mut cache = None;
         let first = render(&request, &mut cache, &mut || false).unwrap();
@@ -299,11 +338,38 @@ mod tests {
         let resized = render(&request, &mut cache, &mut || false).unwrap();
         assert_eq!(resized.image.width, 320);
         assert_eq!(cache.as_ref().unwrap().key.width, 320);
-        request.dark = true;
+        request.style = style(true);
         let dark = render(&request, &mut cache, &mut || false).unwrap();
         assert_ne!(resized.image.encoded, dark.image.encoded);
-        assert!(cache.as_ref().unwrap().key.dark);
+        assert!(cache.as_ref().unwrap().key.style.dark);
         assert!(render(&request, &mut cache, &mut || true).is_err());
+    }
+
+    #[test]
+    fn changed_typography_and_colors_replace_cached_layout() {
+        let mut request = RenderRequest {
+            path: PathBuf::from("/tmp/test.md"),
+            source: Arc::from("# A heading\n\nA paragraph with several words. ".repeat(40)),
+            width: 400,
+            height: 160,
+            scroll_y: 0,
+            style: style(false),
+        };
+        let mut cache = None;
+        let first = render(&request, &mut cache, &mut || false).unwrap();
+        let old_height = cache.as_ref().unwrap().height;
+        let mut changed = crate::render_theme::RenderedTheme::defaults(false);
+        changed.body_size_px = 24;
+        changed.heading_scale_percent = 150;
+        changed.background = "#123456".into();
+        request.style = changed.resolve(std::path::Path::new(".")).unwrap();
+        let second = render(&request, &mut cache, &mut || false).unwrap();
+        assert_ne!(first.image.encoded, second.image.encoded);
+        assert_ne!(old_height, cache.as_ref().unwrap().height);
+        assert!(Arc::ptr_eq(
+            &cache.as_ref().unwrap().key.style,
+            &request.style
+        ));
     }
 
     #[test]
@@ -315,7 +381,7 @@ mod tests {
             width: 600,
             height: 300,
             scroll_y: 0,
-            dark: true,
+            style: style(true),
         };
         let page = render(&request, &mut None, &mut || false).unwrap();
         let png = base64::engine::general_purpose::STANDARD

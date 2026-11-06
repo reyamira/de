@@ -1,0 +1,9 @@
+The SVG backend and table_format.rs are adapted from franken_markdown 0.7.0,
+https://crates.io/crates/franken_markdown/0.7.0, upstream commit
+ddbdefd8c35770766838a735c554119ff0ef39e3. The parser, fonts, and layout
+remain dependencies on the published crate. Local changes add independent SVG
+heading and code typography and colors and adapt imports for this crate.
+
+fmd-font/fonts/test-shaping/FmdShaping.ttf is from fmd-font 0.4.0,
+https://crates.io/crates/fmd-font/0.4.0, and supports upstream SVG tests.
+Each upstream license is included alongside its corresponding files.

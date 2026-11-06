@@ -1,9 +1,11 @@
+use crate::render_theme::RenderedTheme;
 use crate::{BrowseDefaults, DisplaySettings};
 use ratatui::style::Color;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub const THEME_ENV: &str = "DE_THEME";
@@ -16,13 +18,21 @@ const BUILTIN_NAMES: [&str; 8] = [
 pub struct Theme {
     name: String,
     palette: Palette,
+    rendered: Arc<RenderedTheme>,
 }
 
 impl Theme {
-    fn new(name: impl Into<String>, palette: Palette) -> Self {
+    fn new(name: impl Into<String>, mut palette: Palette) -> Self {
+        let name = name.into();
+        palette.syntax = SyntaxPalette::from_interface(&palette);
+        palette.markdown = MarkdownPalette::from_interface(&palette);
+        let rendered = RenderedTheme::defaults(!name.eq_ignore_ascii_case("light"))
+            .resolve(Path::new("."))
+            .expect("bundled rendered theme must be valid");
         Self {
-            name: name.into(),
+            name,
             palette,
+            rendered,
         }
     }
 
@@ -36,6 +46,10 @@ impl Theme {
 
     pub const fn palette(&self) -> Palette {
         self.palette
+    }
+
+    pub fn rendered(&self) -> Arc<RenderedTheme> {
+        Arc::clone(&self.rendered)
     }
 }
 
@@ -60,7 +74,7 @@ impl Config {
     pub fn load() -> io::Result<Self> {
         let path = theme_config_path()?;
         match fs::read_to_string(&path) {
-            Ok(contents) => Self::from_toml(&contents),
+            Ok(contents) => Self::from_toml_at(&contents, path.parent().unwrap_or(Path::new("."))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let mut catalog = Self::built_ins();
                 catalog.saved_theme = load_legacy_theme(&path)?;
@@ -70,7 +84,12 @@ impl Config {
         }
     }
 
+    #[cfg(test)]
     fn from_toml(contents: &str) -> io::Result<Self> {
+        Self::from_toml_at(contents, Path::new("."))
+    }
+
+    fn from_toml_at(contents: &str, config_dir: &Path) -> io::Result<Self> {
         let document = parse_document(contents)?;
         let mut catalog = Self::built_ins();
         catalog.display = DisplaySettings::from_document(&document)?;
@@ -112,7 +131,7 @@ impl Config {
             let table = item
                 .as_table()
                 .ok_or_else(|| invalid_data(format!("custom theme {name:?} must be a table")))?;
-            let theme = parse_custom_theme(name, table, &catalog.themes)?;
+            let theme = parse_custom_theme(name, table, &catalog.themes, config_dir)?;
             catalog.themes.push(theme);
         }
 
@@ -173,7 +192,81 @@ pub struct Palette {
     pub emphasis_background: Color,
     pub reverse_emphasis: bool,
     pub dim_muted: bool,
+    pub syntax: SyntaxPalette,
+    pub markdown: MarkdownPalette,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyntaxPalette {
+    pub text: Color,
+    pub comment: Color,
+    pub keyword: Color,
+    pub string: Color,
+    pub number: Color,
+    pub constant: Color,
+    pub entity: Color,
+    pub support: Color,
+}
+
+impl SyntaxPalette {
+    const fn from_interface(p: &Palette) -> Self {
+        Self {
+            text: p.text,
+            comment: p.muted,
+            keyword: p.title,
+            string: p.accent,
+            number: p.symlink,
+            constant: p.symlink,
+            entity: p.title,
+            support: p.symlink,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MarkdownPalette {
+    pub text: Color,
+    pub heading: Color,
+    pub link: Color,
+    pub link_url: Color,
+    pub code: Color,
+    pub punctuation: Color,
+    pub marker: Color,
+}
+
+impl MarkdownPalette {
+    const fn from_interface(p: &Palette) -> Self {
+        Self {
+            text: p.text,
+            heading: p.title,
+            link: p.symlink,
+            link_url: p.muted,
+            code: p.accent,
+            punctuation: p.muted,
+            marker: p.accent,
+        }
+    }
+}
+
+const EMPTY_SYNTAX: SyntaxPalette = SyntaxPalette {
+    text: Color::Reset,
+    comment: Color::Reset,
+    keyword: Color::Reset,
+    string: Color::Reset,
+    number: Color::Reset,
+    constant: Color::Reset,
+    entity: Color::Reset,
+    support: Color::Reset,
+};
+const EMPTY_MARKDOWN: MarkdownPalette = MarkdownPalette {
+    text: Color::Reset,
+    heading: Color::Reset,
+    link: Color::Reset,
+    link_url: Color::Reset,
+    code: Color::Reset,
+    punctuation: Color::Reset,
+    marker: Color::Reset,
+};
 
 pub fn theme_config_path() -> io::Result<PathBuf> {
     if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
@@ -264,6 +357,124 @@ pub fn create_custom_theme(name: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Start a sparse custom theme that inherits an existing built-in theme.
+pub fn new_custom_theme(base: &str) -> io::Result<Table> {
+    if !is_builtin_name(base) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown built-in theme {base:?}"),
+        ));
+    }
+    let mut draft = Table::new();
+    draft["extends"] = value(base);
+    Ok(draft)
+}
+
+/// Load the editable, unexpanded table so omitted values remain inherited.
+pub fn load_custom_theme(name: &str) -> io::Result<Table> {
+    let path = theme_config_path()?;
+    load_custom_theme_at(&path, name)
+}
+
+fn load_custom_theme_at(path: &Path, name: &str) -> io::Result<Table> {
+    validate_theme_name(name)?;
+    let document = read_document_or_new(path)?;
+    let themes = document.get("themes").and_then(Item::as_table);
+    let item = themes.and_then(|themes| {
+        themes
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+    });
+    let (_, item) = item.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("custom theme {name:?} not found"),
+        )
+    })?;
+    item.as_table()
+        .cloned()
+        .ok_or_else(|| invalid_data(format!("custom theme {name:?} must be a table")))
+}
+
+/// Resolve a draft with the same validation and relative paths as config loading.
+pub fn preview_custom_theme(name: &str, draft: &Table) -> io::Result<Theme> {
+    let path = theme_config_path()?;
+    preview_custom_theme_at(&path, name, draft)
+}
+
+pub(crate) fn preview_custom_theme_at(path: &Path, name: &str, draft: &Table) -> io::Result<Theme> {
+    validate_theme_name(name)?;
+    if is_builtin_name(name) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{name:?} is a built-in theme"),
+        ));
+    }
+    parse_custom_theme(
+        name,
+        draft,
+        &built_in_themes(),
+        path.parent().unwrap_or(Path::new(".")),
+    )
+}
+
+/// Save an existing custom theme without changing the rest of the config.
+pub fn save_custom_theme(name: &str, draft: &Table) -> io::Result<PathBuf> {
+    let path = theme_config_path()?;
+    save_custom_theme_at(&path, name, draft, false)?;
+    Ok(path)
+}
+
+/// Create a custom theme without overwriting an existing name.
+pub fn create_custom_theme_from(name: &str, draft: &Table) -> io::Result<PathBuf> {
+    let path = theme_config_path()?;
+    save_custom_theme_at(&path, name, draft, true)?;
+    Ok(path)
+}
+
+fn save_custom_theme_at(path: &Path, name: &str, draft: &Table, create: bool) -> io::Result<()> {
+    preview_custom_theme_at(path, name, draft)?;
+    let mut document = read_document_or_new(path)?;
+    if !document.contains_key("themes") {
+        if !create {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("custom theme {name:?} not found"),
+            ));
+        }
+        let mut themes = Table::new();
+        themes.set_implicit(true);
+        document["themes"] = Item::Table(themes);
+    }
+    let themes = document["themes"]
+        .as_table_mut()
+        .ok_or_else(|| invalid_data("themes must be a table"))?;
+    let existing = themes
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(key, _)| key.to_owned());
+    match (create, existing) {
+        (true, Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("custom theme {name:?} already exists"),
+            ));
+        }
+        (false, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("custom theme {name:?} not found"),
+            ));
+        }
+        (_, key) => themes[key.as_deref().unwrap_or(name)] = Item::Table(draft.clone()),
+    }
+    Config::from_toml_at(
+        &document.to_string(),
+        path.parent().unwrap_or(Path::new(".")),
+    )?;
+    write_document(path, &document)
+}
+
 fn save_theme_at(path: &Path, name: &str) -> io::Result<()> {
     let mut document = read_document_or_new(path)?;
     let legacy_prefix = document
@@ -350,6 +561,66 @@ fn create_custom_theme_at(path: &Path, name: &str) -> io::Result<()> {
     custom["selection_bg"] = value("#67e8f9");
     custom["reverse_selection"] = value(false);
     custom["dim_muted"] = value(false);
+    let mut syntax = Table::new();
+    syntax
+        .decor_mut()
+        .set_prefix("\n# Source colors are independent of interface colors.\n");
+    for (key, color) in [
+        ("text", "white"),
+        ("comment", "gray"),
+        ("keyword", "light-blue"),
+        ("string", "light-cyan"),
+        ("number", "light-magenta"),
+        ("constant", "light-magenta"),
+        ("entity", "light-blue"),
+        ("support", "light-magenta"),
+    ] {
+        syntax[key] = value(color);
+    }
+    custom["syntax"] = Item::Table(syntax);
+    let mut markdown = Table::new();
+    for (key, color) in [
+        ("text", "white"),
+        ("heading", "light-blue"),
+        ("link", "light-magenta"),
+        ("link_url", "gray"),
+        ("code", "light-cyan"),
+        ("punctuation", "gray"),
+        ("marker", "light-cyan"),
+    ] {
+        markdown[key] = value(color);
+    }
+    custom["markdown"] = Item::Table(markdown);
+    let defaults = RenderedTheme::defaults(true);
+    let mut rendered = Table::new();
+    rendered.decor_mut().set_prefix("\n# Colors use #RRGGBB. Fonts use bundled or a local TTF/OTF path relative to this file.\n# Sizes and padding use pixels; scales and line height use percent.\n");
+    for (key, color) in [
+        ("background", &defaults.background),
+        ("text", &defaults.text),
+        ("heading", &defaults.heading),
+        ("link", &defaults.link),
+        ("code_background", &defaults.code_background),
+        ("code_text", &defaults.code_text),
+        ("quote", &defaults.quote),
+        ("quote_bar", &defaults.quote_bar),
+        ("table_border", &defaults.table_border),
+        ("table_stripe", &defaults.table_stripe),
+    ] {
+        rendered[key] = value(color.as_str());
+    }
+    for key in ["body_font", "heading_font", "code_font"] {
+        rendered[key] = value("bundled");
+    }
+    for (key, number) in [
+        ("body_size_px", defaults.body_size_px),
+        ("code_size_px", defaults.code_size_px),
+        ("heading_scale_percent", defaults.heading_scale_percent),
+        ("line_height_percent", defaults.line_height_percent),
+        ("page_padding_px", defaults.page_padding_px),
+    ] {
+        rendered[key] = value(i64::from(number));
+    }
+    custom["rendered"] = Item::Table(rendered);
     themes[name] = Item::Table(custom);
 
     write_document(path, &document)
@@ -403,7 +674,12 @@ fn load_legacy_theme(config_path: &Path) -> io::Result<Option<String>> {
     Ok(Some(value.to_ascii_lowercase()))
 }
 
-fn parse_custom_theme(name: &str, table: &Table, built_ins: &[Theme]) -> io::Result<Theme> {
+fn parse_custom_theme(
+    name: &str,
+    table: &Table,
+    built_ins: &[Theme],
+    config_dir: &Path,
+) -> io::Result<Theme> {
     let extends = optional_string(table, "extends", name)?.unwrap_or("auto");
     let base = built_ins
         .iter()
@@ -441,7 +717,117 @@ fn parse_custom_theme(name: &str, table: &Table, built_ins: &[Theme]) -> io::Res
     )?;
     apply_bool(table, "dim_muted", name, &mut palette.dim_muted)?;
 
-    Ok(Theme::new(name, palette))
+    if let Some(syntax) = nested_table(table, "syntax", name)? {
+        for (key, target) in [
+            ("text", &mut palette.syntax.text),
+            ("comment", &mut palette.syntax.comment),
+            ("keyword", &mut palette.syntax.keyword),
+            ("string", &mut palette.syntax.string),
+            ("number", &mut palette.syntax.number),
+            ("constant", &mut palette.syntax.constant),
+            ("entity", &mut palette.syntax.entity),
+            ("support", &mut palette.syntax.support),
+        ] {
+            apply_color(syntax, key, name, target)?;
+        }
+    }
+    if let Some(markdown) = nested_table(table, "markdown", name)? {
+        for (key, target) in [
+            ("text", &mut palette.markdown.text),
+            ("heading", &mut palette.markdown.heading),
+            ("link", &mut palette.markdown.link),
+            ("link_url", &mut palette.markdown.link_url),
+            ("code", &mut palette.markdown.code),
+            ("punctuation", &mut palette.markdown.punctuation),
+            ("marker", &mut palette.markdown.marker),
+        ] {
+            apply_color(markdown, key, name, target)?;
+        }
+    }
+    let mut rendered = (*base.rendered).clone();
+    if let Some(settings) = nested_table(table, "rendered", name)? {
+        for (key, item) in settings {
+            macro_rules! string_field {
+                ($field:ident) => {{
+                    rendered.$field = item
+                        .as_str()
+                        .ok_or_else(|| {
+                            invalid_data(format!(
+                                "rendered.{key} in custom theme {name:?} must be a string"
+                            ))
+                        })?
+                        .to_owned();
+                }};
+            }
+            macro_rules! font_field {
+                ($field:ident) => {{
+                    let font = item.as_str().ok_or_else(|| {
+                        invalid_data(format!(
+                            "rendered.{key} in custom theme {name:?} must be a font path"
+                        ))
+                    })?;
+                    rendered.$field = if font == "bundled" {
+                        None
+                    } else {
+                        Some(PathBuf::from(font))
+                    };
+                }};
+            }
+            macro_rules! number_field {
+                ($field:ident) => {{
+                    let number = item.as_integer().and_then(|n| u16::try_from(n).ok())
+                        .ok_or_else(|| invalid_data(format!("rendered.{key} in custom theme {name:?} must be a nonnegative integer")))?;
+                    rendered.$field = number;
+                }};
+            }
+            match key {
+                "background" => string_field!(background),
+                "text" => string_field!(text),
+                "heading" => string_field!(heading),
+                "link" => string_field!(link),
+                "code_background" => string_field!(code_background),
+                "code_text" => string_field!(code_text),
+                "quote" => string_field!(quote),
+                "quote_bar" => string_field!(quote_bar),
+                "table_border" => string_field!(table_border),
+                "table_stripe" => string_field!(table_stripe),
+                "body_font" => font_field!(body_font),
+                "heading_font" => font_field!(heading_font),
+                "code_font" => font_field!(code_font),
+                "body_size_px" => number_field!(body_size_px),
+                "code_size_px" => number_field!(code_size_px),
+                "heading_scale_percent" => number_field!(heading_scale_percent),
+                "line_height_percent" => number_field!(line_height_percent),
+                "page_padding_px" => number_field!(page_padding_px),
+                _ => {
+                    return Err(invalid_data(format!(
+                        "unknown rendered setting {key:?} in custom theme {name:?}"
+                    )));
+                }
+            }
+        }
+    }
+    let rendered = rendered.resolve(config_dir).map_err(|error| {
+        invalid_data(format!(
+            "rendered settings in custom theme {name:?}: {error}"
+        ))
+    })?;
+    Ok(Theme {
+        name: name.to_owned(),
+        palette,
+        rendered,
+    })
+}
+
+fn nested_table<'a>(table: &'a Table, key: &str, name: &str) -> io::Result<Option<&'a Table>> {
+    table
+        .get(key)
+        .map(|item| {
+            item.as_table().ok_or_else(|| {
+                invalid_data(format!("{key:?} in custom theme {name:?} must be a table"))
+            })
+        })
+        .transpose()
 }
 
 fn optional_string<'a>(table: &'a Table, key: &str, theme: &str) -> io::Result<Option<&'a str>> {
@@ -554,6 +940,8 @@ fn built_in_themes() -> Vec<Theme> {
                 emphasis_background: Color::Blue,
                 reverse_emphasis: false,
                 dim_muted: false,
+                syntax: EMPTY_SYNTAX,
+                markdown: EMPTY_MARKDOWN,
             },
         ),
         Theme::new(
@@ -569,6 +957,8 @@ fn built_in_themes() -> Vec<Theme> {
                 emphasis_background: Color::LightCyan,
                 reverse_emphasis: false,
                 dim_muted: false,
+                syntax: EMPTY_SYNTAX,
+                markdown: EMPTY_MARKDOWN,
             },
         ),
         Theme::new(
@@ -584,6 +974,8 @@ fn built_in_themes() -> Vec<Theme> {
                 emphasis_background: Color::Reset,
                 reverse_emphasis: true,
                 dim_muted: true,
+                syntax: EMPTY_SYNTAX,
+                markdown: EMPTY_MARKDOWN,
             },
         ),
         Theme::new(
@@ -649,6 +1041,8 @@ const fn auto_palette() -> Palette {
         emphasis_background: Color::Reset,
         reverse_emphasis: true,
         dim_muted: false,
+        syntax: EMPTY_SYNTAX,
+        markdown: EMPTY_MARKDOWN,
     }
 }
 
@@ -676,6 +1070,8 @@ const fn vivid_palette(
         emphasis_background: rgb(selection_background),
         reverse_emphasis: false,
         dim_muted: false,
+        syntax: EMPTY_SYNTAX,
+        markdown: EMPTY_MARKDOWN,
     }
 }
 
@@ -683,6 +1079,179 @@ const fn vivid_palette(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn editor_save_preserves_sparse_values_and_unrelated_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let contents = r##"# file comment
+[defaults]
+hidden = true # keep this
+
+[themes.mine]
+extends = "light" # base
+text = "default" # explicit terminal reset
+
+[themes.mine.syntax]
+keyword = "red" # source comment
+
+[themes.other]
+extends = "dark" # another theme
+"##;
+        fs::write(&path, contents).unwrap();
+        let mut draft = load_custom_theme_at(&path, "MINE").unwrap();
+        draft["accent"] = value("#123456");
+        save_custom_theme_at(&path, "mine", &draft, false).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        for expected in [
+            "# file comment",
+            "hidden = true # keep this",
+            "extends = \"light\" # base",
+            "text = \"default\" # explicit terminal reset",
+            "keyword = \"red\" # source comment",
+            "extends = \"dark\" # another theme",
+        ] {
+            assert!(saved.contains(expected), "missing {expected:?}: {saved}");
+        }
+        let config = Config::from_toml_at(&saved, dir.path()).unwrap();
+        let theme = config.find("mine").unwrap();
+        assert_eq!(theme.palette().text, Color::Reset);
+        assert_eq!(theme.palette().accent, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(
+            theme.palette().muted,
+            config.find("light").unwrap().palette().muted
+        );
+        assert!(!saved.contains("muted ="));
+    }
+
+    #[test]
+    fn editor_rejects_invalid_drafts_and_duplicate_names_without_writing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[themes.mine]\nextends = \"dark\"\n";
+        fs::write(&path, original).unwrap();
+        let mut draft = load_custom_theme_at(&path, "mine").unwrap();
+        draft["accent"] = value("not-a-color");
+        assert!(preview_custom_theme_at(&path, "mine", &draft).is_err());
+        assert!(save_custom_theme_at(&path, "mine", &draft, false).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let draft = new_custom_theme("light").unwrap();
+        assert_eq!(
+            save_custom_theme_at(&path, "MINE", &draft, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            save_custom_theme_at(&path, "dark", &draft, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            save_custom_theme_at(&path, "missing", &draft, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn editor_copy_inherits_complete_builtin_and_resolves_relative_fonts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let draft = new_custom_theme("auto").unwrap();
+        let preview = preview_custom_theme_at(&path, "copy", &draft).unwrap();
+        let base = Config::built_ins().find("auto").unwrap().clone();
+        assert_eq!(preview.palette(), base.palette());
+        assert_eq!(*preview.rendered(), *base.rendered());
+        save_custom_theme_at(&path, "copy", &draft, true).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("extends = \"auto\""));
+        assert!(!saved.contains("text ="));
+        let mut invalid = draft;
+        let mut rendered = Table::new();
+        rendered["body_font"] = value("missing.ttf");
+        invalid["rendered"] = Item::Table(rendered);
+        let error = preview_custom_theme_at(&path, "copy", &invalid)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&dir.path().join("missing.ttf").display().to_string()));
+        assert!(save_custom_theme_at(&path, "copy", &invalid, false).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+    }
+
+    #[test]
+    fn custom_roles_are_independent_and_inherit_light_rendering() {
+        let config = Config::from_toml(
+            r##"
+[themes.day]
+extends = "light"
+accent = "#010203"
+[themes.day.syntax]
+keyword = "#112233"
+[themes.day.markdown]
+heading = "#445566"
+[themes.day.rendered]
+link = "#abcdef"
+body_size_px = 20
+"##,
+        )
+        .unwrap();
+        let base = config.find("light").unwrap();
+        let custom = config.find("day").unwrap();
+        assert_eq!(
+            custom.palette().syntax.keyword,
+            Color::Rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(custom.palette().syntax.string, base.palette().syntax.string);
+        assert_eq!(
+            custom.palette().markdown.heading,
+            Color::Rgb(0x44, 0x55, 0x66)
+        );
+        assert_eq!(custom.palette().markdown.link, base.palette().markdown.link);
+        assert!(!custom.rendered().dark);
+        assert_eq!(custom.rendered().background, base.rendered().background);
+        assert_eq!(custom.rendered().link, "#abcdef");
+        assert_eq!(custom.rendered().body_size_px, 20);
+    }
+
+    #[test]
+    fn rendered_errors_identify_setting_and_config_relative_font() {
+        let dir = tempdir().unwrap();
+        let config = "[themes.x.rendered]\nbody_font = \"fonts/missing.ttf\"\n";
+        let error = Config::from_toml_at(config, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("body_font"));
+        assert!(error.contains(&dir.path().join("fonts/missing.ttf").display().to_string()));
+        for (setting, value) in [
+            ("body_size_px", "8"),
+            ("line_height_percent", "401"),
+            ("background", "\"red\""),
+            ("body_font_typo", "\"bundled\""),
+        ] {
+            let config = format!("[themes.x.rendered]\n{setting} = {value}\n");
+            let error = Config::from_toml_at(&config, dir.path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(setting), "{error}");
+        }
+    }
+
+    #[test]
+    fn generated_theme_contains_editable_roles() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        create_custom_theme_at(&path, "sample").unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("[themes.sample.syntax]"));
+        assert!(contents.contains("[themes.sample.markdown]"));
+        assert!(contents.contains("[themes.sample.rendered]"));
+        assert!(contents.contains("body_font = \"bundled\""));
+        Config::from_toml_at(&contents, dir.path()).unwrap();
+    }
 
     #[test]
     fn built_in_themes_cycle_in_both_directions() {

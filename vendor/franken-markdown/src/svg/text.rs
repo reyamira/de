@@ -1,0 +1,243 @@
+//! Whitespace-aware poster text flow. Style boundaries are not word boundaries.
+
+use super::{Op, Piece, Poster, RStyle, SvgWarning, Word};
+
+#[path = "text_shaping.rs"]
+mod shaping;
+pub(super) use shaping::ShapedText;
+use shaping::Shaper;
+
+#[path = "text_wrapping.rs"]
+mod wrapping;
+use wrapping::place_shaped;
+
+#[path = "paragraph.rs"]
+mod paragraph;
+use paragraph::Paragraph;
+
+impl Poster {
+    /// Optimize each hard-break-delimited paragraph using its prepared widths.
+    /// Style boundaries do not introduce spaces or break opportunities. The
+    /// bounded fallback retains complete clusters and reshapes contextual text
+    /// at its actual emergency line boundaries.
+    pub(super) fn wrap(&self, pieces: &[Piece], size: f64, width: f64) -> Vec<Vec<Word>> {
+        let width = width.max(1.0);
+        let shaper = Shaper::new(self);
+        let mut flow = TextFlow::default();
+        let mut paragraph = Paragraph::default();
+        for piece in pieces {
+            match piece {
+                Piece::Break => {
+                    self.collect_word(&mut flow, &mut paragraph, &shaper, size, width);
+                    paragraph.finish(self, &mut flow, &shaper, size, width);
+                    flow.new_line();
+                    flow.gap = 0.0;
+                    flow.trailing_break = true;
+                }
+                Piece::Image(destination, alt, style) => {
+                    flow.word
+                        .push(self.image_word(destination, alt, *style, size, width));
+                    flow.trailing_break = false;
+                }
+                Piece::Math(source, display, style) => {
+                    flow.word
+                        .push(self.math_word(source, *display, *style, size, width));
+                    flow.trailing_break = false;
+                }
+                Piece::Text(text, style) => {
+                    let mut start = 0;
+                    for (offset, ch) in text.char_indices() {
+                        // Code spans preserve their internal whitespace. NBSP
+                        // and narrow NBSP never become ordinary breakable glue.
+                        if !style.mono && breakable_space(ch) {
+                            append_run(&mut flow, &text[start..offset], *style);
+                            self.collect_word(&mut flow, &mut paragraph, &shaper, size, width);
+                            if flow.gap == 0.0 {
+                                flow.gap = self.space_width(*style, size);
+                            }
+                            start = offset + ch.len_utf8();
+                        }
+                    }
+                    append_run(&mut flow, &text[start..], *style);
+                }
+            }
+        }
+        self.collect_word(&mut flow, &mut paragraph, &shaper, size, width);
+        paragraph.finish(self, &mut flow, &shaper, size, width);
+        if !flow.line.is_empty() || flow.trailing_break {
+            flow.new_line();
+        }
+        flow.lines
+    }
+
+    fn collect_word(
+        &self,
+        flow: &mut TextFlow,
+        paragraph: &mut Paragraph,
+        shaper: &Shaper<'_>,
+        size: f64,
+        width: f64,
+    ) {
+        if flow.word.is_empty() {
+            return;
+        }
+        let mut word = std::mem::take(&mut flow.word);
+        // Shape after equal-style pieces have coalesced. Retain that exact
+        // result so sizing and painting cannot disagree or repeat mark work.
+        for run in &mut word {
+            if run.formula.is_none() && run.image.is_none() {
+                let prepared = shaper.shape(&run.text, run.style, size);
+                run.w = prepared.width();
+                run.shaped = Some(prepared);
+            }
+        }
+        let gap = std::mem::take(&mut flow.gap);
+        paragraph.push(self, flow, shaper, word, gap, size, width);
+    }
+
+    /// Consume already-prepared runs. Both planned lines and emergency fallback
+    /// use this path; neither can accidentally reshape an ordinary word twice.
+    fn place_prepared(
+        &self,
+        flow: &mut TextFlow,
+        shaper: &Shaper<'_>,
+        word: Vec<Word>,
+        gap: f64,
+        size: f64,
+        width: f64,
+    ) {
+        let word_width: f64 = word.iter().map(|run| run.w).sum();
+        let mut gap = if flow.line.is_empty() { 0.0 } else { gap };
+        if !flow.line.is_empty() && flow.line_width + gap + word_width > width {
+            flow.new_line();
+            gap = 0.0;
+        }
+        if word_width <= width {
+            flow.line_width += gap + word_width;
+            for (index, mut run) in word.into_iter().enumerate() {
+                run.gap = if index == 0 { gap } else { 0.0 };
+                flow.line.push(run);
+            }
+        } else {
+            for mut run in word {
+                if let Some(prepared) = run.shaped.take() {
+                    place_shaped(flow, run, &prepared, shaper, size, width);
+                } else {
+                    if !flow.line.is_empty() && flow.line_width + run.w > width {
+                        flow.new_line();
+                    }
+                    flow.line_width += run.w;
+                    flow.line.push(run);
+                }
+            }
+        }
+    }
+
+    pub(super) fn draw_words(&mut self, words: &[Word], x: f64, baseline: f64, size: f64) {
+        let mut pen = x;
+        // Merge hit regions only within this physical line and across adjacent
+        // runs of the same link. Never bridge unlinked text or a table cell.
+        let mut previous_link = None;
+        for word in words {
+            pen += word.gap;
+            let start = pen;
+            if let Some(warning) = &word.warning {
+                self.warnings.push(warning.clone());
+            }
+            if let Some(run) = &word.image {
+                self.draw_image(run, pen, baseline);
+                pen += word.w;
+            } else if let Some(run) = &word.formula {
+                self.draw_math(run, pen, baseline, word.style.ink);
+                if word.style.strike && word.w > 0.0 {
+                    self.ops.push(Op::Rule {
+                        x1: pen,
+                        y1: baseline - size * 0.28,
+                        x2: pen + word.w,
+                        y2: baseline - size * 0.28,
+                        ink: word.style.ink,
+                        w: (size * 0.05).max(0.5),
+                    });
+                }
+                pen += word.w;
+            } else if let Some(prepared) = &word.shaped {
+                pen = prepared.paint(self, pen, baseline, word.style, size);
+            } else if !word.text.is_empty() {
+                // Compatibility for internal callers constructing a fallback
+                // word directly; normal wrapped/code lines always retain it.
+                let prepared = Shaper::new(self).shape(&word.text, word.style, size);
+                pen = prepared.paint(self, pen, baseline, word.style, size);
+            }
+            if word.style.link.is_some() {
+                let (ascent, height) =
+                    self.line_metrics(std::slice::from_ref(word), size * 0.85, size);
+                let bounds = (start, baseline - ascent, pen, baseline - ascent + height);
+                self.navigation.borrow_mut().record(
+                    word.style.link,
+                    Some(bounds),
+                    &mut previous_link,
+                );
+            } else {
+                previous_link = None;
+            }
+        }
+    }
+
+    pub(super) fn words_width(&self, words: &[Word], _size: f64) -> f64 {
+        words.iter().map(|word| word.gap + word.w).sum()
+    }
+}
+
+fn append_run(flow: &mut TextFlow, text: &str, style: RStyle) {
+    if text.is_empty() {
+        return;
+    }
+    flow.trailing_break = false;
+    if let Some(last) = flow.word.last_mut().filter(|run| {
+        run.style == style && run.formula.is_none() && run.image.is_none() && run.warning.is_none()
+    }) {
+        last.text.push_str(text);
+    } else {
+        flow.word.push(Word {
+            text: text.to_owned(),
+            style,
+            w: 0.0,
+            gap: 0.0,
+            formula: None,
+            image: None,
+            warning: None,
+            shaped: None,
+        });
+    }
+}
+
+fn breakable_space(ch: char) -> bool {
+    ch.is_whitespace() && !matches!(ch, '\u{00a0}' | '\u{202f}')
+}
+
+#[derive(Default)]
+struct TextFlow {
+    lines: Vec<Vec<Word>>,
+    line: Vec<Word>,
+    line_width: f64,
+    word: Vec<Word>,
+    gap: f64,
+    trailing_break: bool,
+}
+
+impl TextFlow {
+    fn new_line(&mut self) {
+        self.lines.push(std::mem::take(&mut self.line));
+        self.line_width = 0.0;
+    }
+}
+
+#[cfg(test)]
+#[path = "paragraph_tests.rs"]
+mod paragraph_tests;
+#[cfg(test)]
+#[path = "text_positioning_tests.rs"]
+mod positioning_tests;
+#[cfg(test)]
+#[path = "text_shaping_tests.rs"]
+mod shaping_tests;

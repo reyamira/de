@@ -64,6 +64,11 @@ multiplexer. It does not require a browser. The page is a raster image, so text
 selection and clickable links are not available. Source mode does not require
 terminal graphics support.
 
+Themes can set separate colors for source syntax, Markdown source, and rendered
+Markdown. Rendered Markdown also supports separate body, heading, and code fonts,
+sizes, and spacing. Source text always uses the terminal font. See
+[theme configuration](configuration.md#themes) for settings and limits.
+
 Markdown images must be local PNG, JPEG, GIF, WebP, or BMP files inside the
 document folder or its subfolders. Remote assets are not loaded. Raw HTML is
 inert. Animated GIFs show their first frame. Images are resized to at most 2,048

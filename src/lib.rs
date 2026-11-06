@@ -4,24 +4,32 @@ mod config;
 pub mod document;
 mod fmd_assets;
 mod fmd_diagram;
+#[path = "../vendor/franken-markdown/src/svg.rs"]
+mod fmd_svg;
 mod image_loader;
 mod markdown_renderer;
 pub mod media;
+pub mod render_theme;
 mod settings;
+#[path = "../vendor/franken-markdown/src/table_format.rs"]
+mod table_format;
 mod theme;
+pub mod theme_editor;
+pub mod theme_editor_ui;
 mod ui;
 
-pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode};
+pub use app::{App, Entry, NavigationResult, Preview, SortDirection, SortMode, ThemeSample};
 pub use config::{BrowseDefaults, DateFormat, DisplaySettings, TimeFormat, Timezone};
 pub use settings::{Setting, SettingsPicker};
 pub use theme::{
-    Config, Palette, THEME_ENV, Theme, create_custom_theme, ensure_config_file, save_defaults,
-    save_settings, save_theme, theme_config_path,
+    Config, Palette, THEME_ENV, Theme, create_custom_theme, create_custom_theme_from,
+    ensure_config_file, load_custom_theme, new_custom_theme, preview_custom_theme,
+    save_custom_theme, save_defaults, save_settings, save_theme, theme_config_path,
 };
 pub use ui::{
-    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, ViewerScrollBar, preview_image_area, render,
-    render_config_picker, render_theme_preview, viewer_body, viewer_page_rows, viewer_scroll_max,
-    viewer_scrollbar,
+    CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, ViewerScrollBar, browser_sample_page_rows,
+    browser_sample_scroll_max, preview_image_area, render, render_config_picker,
+    render_theme_preview, viewer_body, viewer_page_rows, viewer_scroll_max, viewer_scrollbar,
 };
 
 use std::ffi::OsStr;

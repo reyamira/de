@@ -21,6 +21,12 @@ The small relative-coordinate backend in `src/backend.rs` keeps the picker inlin
 Keyboard navigation does not require cursor-position queries.
 Mouse controls use an optional query to locate the viewer within the terminal.
 
+The rendered viewer uses the FMD SVG backend in `vendor/franken-markdown`.
+Local changes support independent heading and code fonts, sizes, and theme colors.
+The published FMD dependency still supplies Markdown parsing and shared types.
+See `vendor/franken-markdown/PROVENANCE` for the source revision and local changes.
+Keep those changes when updating FMD. Verify the crate package, not only the checkout.
+
 ## Checks
 
 ```sh
