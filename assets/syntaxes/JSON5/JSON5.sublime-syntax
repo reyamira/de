@@ -1,0 +1,104 @@
+%YAML 1.2
+---
+# http://www.sublimetext.com/docs/3/syntax.html
+name: JSON5
+file_extensions:
+  - .babelrc
+  - json5
+scope: source.json5
+contexts:
+  main:
+    - include: value
+  array:
+    - match: '\['
+      push:
+        - meta_scope: meta.structure.array.json5
+        - match: '\]'
+          pop: true
+        - include: comments
+        - include: value
+        - match: ","
+          scope: punctuation.separator.array.json5
+        - match: '[^\s\]]'
+          scope: invalid.illegal.expected-array-separator.json5
+  comments:
+    - match: "/{2}.*"
+      scope: comment.single.json5
+    - match: /\*\*(?!/)
+      push:
+        - meta_scope: comment.block.documentation.json5
+        - match: \*/
+          pop: true
+    - match: /\*
+      push:
+        - meta_scope: comment.block.json5
+        - match: \*/
+          pop: true
+  constant:
+    - match: '(?<![\w$])(?:true|false|null)(?![\w$])'
+      scope: constant.language.json5
+  'infinity':
+    - match: '(?<![\w$])[+-]?(?:Infinity|NaN)(?![\w$])'
+      scope: constant.language.json5
+  key:
+    - include: stringSingle
+    - include: stringDouble
+    - match: '(?:[$_\p{L}\p{Nl}]|\\u[0-9a-fA-F]{4})(?:[$_\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}\x{200c}\x{200d}]|\\u[0-9a-fA-F]{4})*'
+      scope: string.key.json5
+  number:
+    - match: '[+-]?0[xX][0-9a-fA-F]+'
+      comment: handles hexadecimal numbers
+      scope: constant.hex.numeric.json5
+    - match: '[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?'
+      comment: handles integer and decimal numbers
+      scope: constant.dec.numeric.json5
+  object:
+    - match: '\{'
+      comment: a json5 object
+      push:
+        - meta_scope: meta.structure.dictionary.json5
+        - match: '\}'
+          pop: true
+        - include: comments
+        - include: key
+        - match: ":"
+          push:
+            - meta_scope: meta.structure.dictionary.value.json5
+            - match: '(,)|(?=\})'
+              captures:
+                1: punctuation.separator.dictionary.pair.json5
+              pop: true
+            - include: value
+            - match: '[^\s,]'
+              scope: invalid.illegal.expected-dictionary-separator.json5
+        - match: '[^\s\}]'
+          scope: invalid.illegal.expected-dictionary-separator.json5
+  stringDouble:
+    - match: '["]'
+      push:
+        - meta_scope: string.quoted.json5
+        - match: '["]'
+          pop: true
+        - match: '\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|0(?!\d)|[^\r\n0-9xu]|\r?$\n?)'
+          scope: constant.character.escape.json5
+        - match: '\\.'
+          scope: invalid.illegal.unrecognized-string-escape.json5
+  stringSingle:
+    - match: "[']"
+      push:
+        - meta_scope: string.quoted.json5
+        - match: "[']"
+          pop: true
+        - match: '\\(?:u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|0(?!\d)|[^\r\n0-9xu]|\r?$\n?)'
+          scope: constant.character.escape.json5
+        - match: '\\.'
+          scope: invalid.illegal.unrecognized-string-escape.json5
+  value:
+    - include: constant
+    - include: 'infinity'
+    - include: number
+    - include: stringSingle
+    - include: stringDouble
+    - include: array
+    - include: object
+    - include: comments

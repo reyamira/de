@@ -1,0 +1,8 @@
+Terraform syntax: https://github.com/SublimeText/Terraform
+Revision: 1576c26c2ac215f9bed5e1f8a061f123bf63e6b2 (1.3.1)
+Source: Terraform.sublime-syntax
+License: MIT; see LICENSE.txt (upstream LICENSE).
+The newer 2.x grammars use Sublime syntax version 2 and HCL inheritance,
+which syntect 5.3 does not fully support. This version includes tf, hcl,
+and nomad extensions in one self-contained source.terraform syntax.
+Local change: added tfvars to file_extensions.

@@ -1,0 +1,4 @@
+Upstream: https://github.com/sublimehq/Packages
+Commit: 722fa65e600b62812373b6f449ef9afa5f80b273
+Files: JSON/JSON.sublime-syntax, LICENSE
+Adaptation: renamed syntax and root scope to JSONC/source.jsonc; limited extensions to jsonc and removed hidden extensions. Token scopes remain upstream JSON scopes.

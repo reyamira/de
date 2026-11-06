@@ -1,0 +1,3 @@
+Upstream: https://github.com/dncrews/GraphQL-SublimeText3
+Commit: acc1dfe30dde5091069afd6070b79a68eb1c229a
+Files: GraphQL.sublime-syntax, LICENSE

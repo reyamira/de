@@ -1,11 +1,14 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use syntect::parsing::{
+    ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet,
+};
 
 use crate::Palette;
 
@@ -15,6 +18,7 @@ pub struct Document {
     pub lines: Vec<Line<'static>>,
     pub source_lines: Option<Vec<Line<'static>>>,
     pub markdown_source: Option<Arc<str>>,
+    pub supports_reading: bool,
     pub notice: Option<String>,
 }
 
@@ -65,18 +69,19 @@ pub fn load(path: &Path, palette: &Palette) -> Result<Document, String> {
             source_lines: is_markdown.then(|| vec![Line::default()]),
             notice: Some("Empty file.".into()),
             markdown_source: is_markdown.then(|| Arc::from(text)),
+            supports_reading: !is_markdown
+                && !extension.eq_ignore_ascii_case("json")
+                && syntax_for(&SYNTAX_ASSETS, path, text)
+                    .is_none_or(|syntax| syntax.name == "Plain Text"),
         });
     }
-    if extension.eq_ignore_ascii_case("json") {
+    if extension.eq_ignore_ascii_case("json") && !is_jsonc_config(path) {
         return Ok(json_document(text, palette));
     }
     if is_markdown {
         Ok(markdown_document(text, palette))
     } else {
-        let text = sanitize(text);
-        let mut output = Lines::new();
-        output.push(&text, Style::default().fg(palette.text));
-        Ok(output.finish(None))
+        Ok(source_document(path, &sanitize(text), palette))
     }
 }
 
@@ -166,26 +171,261 @@ impl Lines {
             lines: self.lines,
             source_lines: None,
             markdown_source: None,
+            supports_reading: false,
             notice,
         }
+    }
+}
+
+struct SyntaxAssets {
+    syntaxes: SyntaxSet,
+    scopes: [(Scope, SyntaxColor); 10],
+}
+
+#[derive(Clone, Copy)]
+enum SyntaxColor {
+    Muted,
+    Title,
+    Accent,
+    Symlink,
+}
+
+static SYNTAX_ASSETS: LazyLock<SyntaxAssets> = LazyLock::new(|| SyntaxAssets {
+    syntaxes: {
+        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+        // https://github.com/sharkdp/bat/blob/73dc3258bec83bd7c66334f05b13c2d8221859f9/assets/syntaxes/02_Extra/TypeScript.sublime-syntax
+        // Converted from Microsoft/TypeScript-Sublime-Plugin; license in assets/syntaxes.
+        builder.add(
+            SyntaxDefinition::load_from_str(
+                include_str!("../assets/syntaxes/TypeScript.sublime-syntax"),
+                true,
+                None,
+            )
+            .expect("bundled TypeScript grammar must be valid"),
+        );
+        builder.add(
+            SyntaxDefinition::load_from_str(
+                include_str!("../assets/syntaxes/TypsecriptReact.sublime-syntax"),
+                true,
+                None,
+            )
+            .expect("bundled TypeScriptReact grammar must be valid"),
+        );
+        for (name, source) in [
+            (
+                "TOML",
+                include_str!("../assets/syntaxes/TOML/TOML.sublime-syntax"),
+            ),
+            (
+                "JSONC",
+                include_str!("../assets/syntaxes/JSONC/JSONC.sublime-syntax"),
+            ),
+            (
+                "JSON5",
+                include_str!("../assets/syntaxes/JSON5/JSON5.sublime-syntax"),
+            ),
+            (
+                "Dockerfile",
+                include_str!("../assets/syntaxes/Dockerfile/Dockerfile.sublime-syntax"),
+            ),
+            (
+                "GraphQL",
+                include_str!("../assets/syntaxes/GraphQL/GraphQL.sublime-syntax"),
+            ),
+            (
+                "JavaScript Regular Expressions",
+                include_str!("../assets/syntaxes/web/JavaScript-RegExp.sublime-syntax"),
+            ),
+            (
+                "JavaScript (Babel)",
+                include_str!("../assets/syntaxes/web/JavaScript-Babel.sublime-syntax"),
+            ),
+            (
+                "Vue Component",
+                include_str!("../assets/syntaxes/web/Vue.sublime-syntax"),
+            ),
+            (
+                "Svelte",
+                include_str!("../assets/syntaxes/web/Svelte.sublime-syntax"),
+            ),
+            (
+                "Prisma",
+                include_str!("../assets/syntaxes/Prisma/Prisma.sublime-syntax"),
+            ),
+            (
+                "Terraform",
+                include_str!("../assets/syntaxes/Terraform/Terraform.sublime-syntax"),
+            ),
+        ] {
+            builder.add(
+                SyntaxDefinition::load_from_str(source, true, Some(name)).unwrap_or_else(|error| {
+                    panic!("bundled {name} grammar must be valid: {error}")
+                }),
+            );
+        }
+        builder.build()
+    },
+    scopes: [
+        (Scope::new("comment").unwrap(), SyntaxColor::Muted),
+        (Scope::new("keyword").unwrap(), SyntaxColor::Title),
+        (Scope::new("storage").unwrap(), SyntaxColor::Title),
+        (Scope::new("entity").unwrap(), SyntaxColor::Title),
+        (Scope::new("string").unwrap(), SyntaxColor::Accent),
+        (Scope::new("markup.heading").unwrap(), SyntaxColor::Title),
+        (Scope::new("markup.bold").unwrap(), SyntaxColor::Title),
+        (Scope::new("markup.italic").unwrap(), SyntaxColor::Accent),
+        (Scope::new("constant").unwrap(), SyntaxColor::Symlink),
+        (Scope::new("support").unwrap(), SyntaxColor::Symlink),
+    ],
+});
+/// List the names and file associations of the loaded syntax definitions.
+pub fn syntax_definitions() -> impl Iterator<Item = (&'static str, &'static [String])> {
+    SYNTAX_ASSETS
+        .syntaxes
+        .syntaxes()
+        .iter()
+        .map(|syntax| (syntax.name.as_str(), syntax.file_extensions.as_slice()))
+}
+
+fn is_jsonc_config(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    ["tsconfig", "jsconfig"].iter().any(|prefix| {
+        name == format!("{prefix}.json")
+            || (name.starts_with(&format!("{prefix}.")) && name.ends_with(".json"))
+    })
+}
+
+fn syntax_for<'a>(
+    assets: &'a SyntaxAssets,
+    path: &Path,
+    text: &str,
+) -> Option<&'a SyntaxReference> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    if is_jsonc_config(path) {
+        return assets.syntaxes.find_syntax_by_extension("jsonc");
+    }
+    if name.eq_ignore_ascii_case("Dockerfile")
+        || name
+            .get(..11)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Dockerfile."))
+    {
+        return assets.syntaxes.find_syntax_by_extension("Dockerfile");
+    }
+    if name.eq_ignore_ascii_case("Cargo.lock") {
+        return assets.syntaxes.find_syntax_by_extension("toml");
+    }
+    assets
+        .syntaxes
+        .find_syntax_by_extension(name)
+        .or_else(|| assets.syntaxes.find_syntax_by_extension(extension))
+        .or_else(|| {
+            assets
+                .syntaxes
+                .find_syntax_by_first_line(text.lines().next().unwrap_or(""))
+        })
+}
+
+fn syntax_style(stack: &ScopeStack, assets: &SyntaxAssets, palette: &Palette) -> Style {
+    let color = stack.as_slice().iter().rev().find_map(|scope| {
+        assets
+            .scopes
+            .iter()
+            .find_map(|(prefix, color)| prefix.is_prefix_of(*scope).then_some(color))
+    });
+    Style::default().fg(match color {
+        Some(SyntaxColor::Muted) => palette.muted,
+        Some(SyntaxColor::Title) => palette.title,
+        Some(SyntaxColor::Accent) => palette.accent,
+        Some(SyntaxColor::Symlink) => palette.symlink,
+        None => palette.text,
+    })
+}
+
+// The input has already been sanitized. Parse once per document, retaining lexer
+// state across lines; unknown syntaxes and parser errors remain readable as text.
+fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
+    let assets = &*SYNTAX_ASSETS;
+    let syntax = syntax_for(assets, path, text);
+    let supports_reading = syntax.is_none_or(|syntax| syntax.name == "Plain Text");
+    let mut parser = syntax.map(ParseState::new);
+    let mut stack = ScopeStack::new();
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    let mut parts = text.split('\n');
+    for line in parts.by_ref().take(MAX_LINES) {
+        let end = offset + line.len();
+        let input_end = end + usize::from(text.as_bytes().get(end) == Some(&b'\n'));
+        let input = &text[offset..input_end];
+        let mut spans = Vec::new();
+        let operations = parser
+            .as_mut()
+            .and_then(|state| state.parse_line(input, &assets.syntaxes).ok());
+        if let Some(operations) = operations {
+            let mut position = 0;
+            let mut valid = true;
+            for (index, operation) in operations {
+                let visible_end = index.min(line.len());
+                if position < visible_end {
+                    spans.push(Span::styled(
+                        line[position..visible_end].to_owned(),
+                        syntax_style(&stack, assets, palette),
+                    ));
+                }
+                position = visible_end;
+                if stack.apply(&operation).is_err() {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                if position < line.len() {
+                    spans.push(Span::styled(
+                        line[position..].to_owned(),
+                        syntax_style(&stack, assets, palette),
+                    ));
+                }
+            } else {
+                parser = None;
+                spans.clear();
+                spans.push(Span::styled(
+                    line.to_owned(),
+                    Style::default().fg(palette.text),
+                ));
+            }
+        } else {
+            parser = None;
+            spans.push(Span::styled(
+                line.to_owned(),
+                Style::default().fg(palette.text),
+            ));
+        }
+        lines.push(Line::from(spans));
+        offset = input_end;
+    }
+    Document {
+        lines,
+        source_lines: None,
+        markdown_source: None,
+        supports_reading,
+        notice: parts
+            .next()
+            .map(|_| format!("Preview is limited to {MAX_LINES} lines.")),
     }
 }
 
 fn markdown_document(text: &str, palette: &Palette) -> Document {
     let original = Arc::from(text);
     let text = sanitize(text);
-    let mut source = text.split('\n');
-    let source_lines: Vec<_> = source
-        .by_ref()
-        .take(MAX_LINES)
-        .map(|line| {
-            Line::from(Span::styled(
-                line.to_owned(),
-                Style::default().fg(palette.text),
-            ))
-        })
-        .collect();
-    let source_truncated = source.next().is_some();
+    let source = source_document(Path::new("source.md"), &text, palette);
+    let source_truncated = source.notice.is_some();
+    let source_lines = source.lines;
     let mut out = Lines::new();
     let mut style = Style::default().fg(palette.text);
     let mut styles = Vec::new();
@@ -295,18 +535,22 @@ fn markdown_document(text: &str, palette: &Palette) -> Document {
 fn json_document(text: &str, palette: &Palette) -> Document {
     let json = text.strip_prefix('\u{feff}').unwrap_or(text);
     match serde_json::from_str::<serde_json::Value>(json) {
-        Ok(_) => color_json(json, palette),
-        Err(error) => raw_json(text, palette, format!("Invalid JSON: {error}")),
+        Ok(_) => format_json(json, palette),
+        Err(error) => {
+            let mut doc = source_document(Path::new("source.json"), &sanitize(text), palette);
+            doc.supports_reading = false;
+            let message = format!("Invalid JSON: {error}");
+            doc.notice = Some(match doc.notice {
+                Some(notice) => format!("{message} {notice}"),
+                None => message,
+            });
+            doc
+        }
     }
 }
 
-fn raw_json(text: &str, palette: &Palette, notice: String) -> Document {
-    let mut out = Lines::new();
-    out.push(&sanitize(text), Style::default().fg(palette.text));
-    out.finish(Some(notice))
-}
-
-fn color_json(text: &str, palette: &Palette) -> Document {
+// Format without deserializing values, preserving duplicate keys and number spelling.
+fn format_json(text: &str, palette: &Palette) -> Document {
     let mut out = Lines::new();
     let base = Style::default().fg(palette.text);
     let bytes = text.as_bytes();
@@ -365,13 +609,7 @@ fn color_json(text: &str, palette: &Palette) -> Document {
                         i += 1;
                     }
                 }
-                let key = bytes[i..]
-                    .iter()
-                    .copied()
-                    .find(|b| !b.is_ascii_whitespace())
-                    == Some(b':');
-                let color = if key { palette.title } else { palette.accent };
-                out.push(&sanitize(&text[start..i]), base.fg(color));
+                out.push(&sanitize(&text[start..i]), base);
             }
             _ => {
                 let start = i;
@@ -381,12 +619,27 @@ fn color_json(text: &str, palette: &Palette) -> Document {
                 {
                     i += 1;
                 }
-                out.push(&text[start..i], base.fg(palette.symlink));
+                out.push(&text[start..i], base);
             }
         }
         previous = byte;
     }
-    out.finish(None)
+    let formatted = out.finish(None);
+    let text = formatted
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut doc = source_document(Path::new("source.json"), &text, palette);
+    doc.supports_reading = false;
+    doc.notice = formatted.notice;
+    doc
 }
 
 #[cfg(test)]
@@ -504,7 +757,7 @@ mod tests {
             doc.lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .any(|span| span.content == "\"key\"" && span.style.fg == Some(Color::Yellow))
+                .any(|span| span.style.fg != Some(palette().text))
         );
         let invalid = json_document("{broken\u{1b}", &palette());
         assert!(text(&invalid).contains("{broken�"));
@@ -533,6 +786,264 @@ mod tests {
             "]".repeat(100)
         );
         let doc = json_document(&json, &palette());
+        assert_eq!(doc.lines.len(), MAX_LINES);
+        assert!(doc.notice.unwrap().contains("limited"));
+    }
+
+    #[test]
+    fn source_highlights_common_languages_and_shebangs() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, input) in [
+            ("example.rs", "fn main() { let value = \"hello\"; }\n"),
+            ("example.py", "def greet():\n    return \"hello\"\n"),
+            ("example.yaml", "name: \"hello\"\n"),
+            ("script", "#!/bin/sh\necho \"hello\"\n"),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, input).unwrap();
+            let doc = load(&path, &palette()).unwrap();
+            assert!(!doc.supports_reading, "{name}");
+            assert_eq!(text(&doc), input, "{name}");
+            assert!(
+                doc.lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.style.fg != Some(palette().text)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn additional_grammars_color_real_files_and_preserve_comment_state() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, input, colored, comment) in [
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\n# note\n",
+                "demo",
+                "note",
+            ),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"demo\"\n# note\n",
+                "demo",
+                "note",
+            ),
+            (
+                "settings.jsonc",
+                "{\n // note\n \"name\": \"demo\",\n}\n",
+                "demo",
+                "note",
+            ),
+            (
+                "settings.json5",
+                "{\n // note\n name: 'demo',\n}\n",
+                "demo",
+                "note",
+            ),
+            (
+                "component.jsx",
+                "const view = <div>hello</div>;\n/* first\nsecond */\n",
+                "div",
+                "second",
+            ),
+            ("Dockerfile", "FROM alpine:3\n# note\n", "FROM", "note"),
+            ("Dockerfile.dev", "FROM alpine:3\n# note\n", "FROM", "note"),
+            (
+                "component.vue",
+                "<template><div>hello</div></template>\n<script>\n/* first\nsecond */\nconst value = \"demo\";\n</script>\n",
+                "div",
+                "second",
+            ),
+            (
+                "component.svelte",
+                "<script>\n/* first\nsecond */\nconst value = \"demo\";\n</script>\n<div>{value}</div>\n",
+                "div",
+                "second",
+            ),
+            (
+                "schema.graphql",
+                "type Query {\n  name: String\n}\n# note\n",
+                "Query",
+                "note",
+            ),
+            (
+                "schema.gql",
+                "type Query {\n  name: String\n}\n# note\n",
+                "Query",
+                "note",
+            ),
+            (
+                "schema.prisma",
+                "model User {\n  id Int @id\n}\n// note\n",
+                "model",
+                "note",
+            ),
+            (
+                "main.tf",
+                "resource \"thing\" \"demo\" {}\n# note\n",
+                "resource",
+                "note",
+            ),
+            ("values.tfvars", "name = \"demo\"\n# note\n", "demo", "note"),
+            ("config.hcl", "name = \"demo\"\n# note\n", "demo", "note"),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, input).unwrap();
+            let doc = load(&path, &palette()).unwrap();
+            assert_eq!(text(&doc), input, "{name}");
+            assert!(!doc.supports_reading, "{name}");
+            assert!(doc.notice.is_none(), "{name}: {:?}", doc.notice);
+            assert!(
+                doc.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.contains(colored) && span.style.fg != Some(palette().text)
+                }),
+                "{name}: missing colored {colored}"
+            );
+            assert!(
+                doc.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.contains(comment) && span.style.fg == Some(palette().muted)
+                }),
+                "{name}: missing comment {comment}"
+            );
+            if name.ends_with(".vue") || name.ends_with(".svelte") {
+                assert!(
+                    doc.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                        span.content.contains("demo") && span.style.fg == Some(palette().accent)
+                    }),
+                    "{name}: embedded JavaScript string"
+                );
+                assert!(
+                    doc.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                        span.content.contains("const") && span.style.fg == Some(palette().title)
+                    }),
+                    "{name}: embedded JavaScript keyword"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jsonc_config_names_bypass_strict_json_formatting() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = "{\n  // note\n  \"compilerOptions\": {},\n}\n";
+        for name in [
+            "tsconfig.json",
+            "tsconfig.build.json",
+            "jsconfig.json",
+            "jsconfig.base.json",
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, input).unwrap();
+            let doc = load(&path, &palette()).unwrap();
+            assert_eq!(text(&doc), input, "{name}");
+            assert!(doc.notice.is_none(), "{name}");
+            assert!(
+                doc.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                    span.content.contains("note") && span.style.fg == Some(palette().muted)
+                }),
+                "{name}"
+            );
+        }
+        let path = directory.path().join("ordinary.json");
+        std::fs::write(&path, input).unwrap();
+        assert!(
+            load(&path, &palette())
+                .unwrap()
+                .notice
+                .unwrap()
+                .starts_with("Invalid JSON:")
+        );
+    }
+
+    #[test]
+    fn typescript_highlights_types_and_keeps_multiline_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("example.ts");
+        let input = "interface Box<T> {\n  value: string;\n  /* first\n     second */\n}\n";
+        std::fs::write(&path, input).unwrap();
+        let doc = load(&path, &palette()).unwrap();
+        assert!(!doc.supports_reading);
+        assert_eq!(text(&doc), input);
+        assert!(doc.lines[0].spans.iter().any(|span| {
+            span.content.contains("interface") && span.style.fg == Some(palette().title)
+        }));
+        assert!(doc.lines[1].spans.iter().any(|span| {
+            span.content.contains("string") && span.style.fg == Some(palette().symlink)
+        }));
+        assert!(doc.lines[3].spans.iter().any(|span| {
+            span.content.contains("second") && span.style.fg == Some(palette().muted)
+        }));
+    }
+
+    #[test]
+    fn typescript_react_highlights_jsx_and_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("example.tsx");
+        let input = "interface Props { title: string }\nconst view = <div>{title}</div>;\n";
+        std::fs::write(&path, input).unwrap();
+        let doc = load(&path, &palette()).unwrap();
+        assert!(!doc.supports_reading);
+        assert_eq!(text(&doc), input);
+        assert!(doc.lines[0].spans.iter().any(|span| {
+            span.content.contains("interface") && span.style.fg == Some(palette().title)
+        }));
+        assert!(doc.lines[1].spans.iter().any(|span| {
+            span.content.contains("div") && span.style.fg == Some(palette().title)
+        }));
+    }
+
+    #[test]
+    fn source_tracks_multiline_comment_and_preserves_unknown_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("example.c");
+        std::fs::write(&path, "int x;\n/* start\nstill comment\nend */\nint y;\n").unwrap();
+        let doc = load(&path, &palette()).unwrap();
+        let comment = &doc.lines[2].spans;
+        assert!(
+            comment
+                .iter()
+                .any(|span| span.content.contains("still comment")
+                    && span.style.fg == Some(palette().muted))
+        );
+        assert!(
+            doc.lines[4]
+                .spans
+                .iter()
+                .any(|span| span.style.fg != Some(palette().muted))
+        );
+
+        let path = directory.path().join("unknown.unrecognizedextension");
+        std::fs::write(&path, "  alpha\r\n\tbeta\u{1b}\n\n").unwrap();
+        let doc = load(&path, &palette()).unwrap();
+        assert!(doc.supports_reading);
+        assert_eq!(text(&doc), "  alpha\n    beta�\n\n");
+        assert!(
+            doc.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg == Some(palette().text))
+        );
+    }
+
+    #[test]
+    fn markdown_source_is_highlighted_and_source_limit_is_enforced() {
+        let doc = markdown_document("# Heading\n\n**bold**\n", &palette());
+        assert!(!doc.supports_reading);
+        let source = doc.source_lines.unwrap();
+        assert_eq!(lines_text(&source), "# Heading\n\n**bold**\n");
+        assert!(
+            source
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg != Some(palette().text))
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.rs");
+        std::fs::write(&path, "let x = 1;\n".repeat(MAX_LINES + 1)).unwrap();
+        let doc = load(&path, &palette()).unwrap();
         assert_eq!(doc.lines.len(), MAX_LINES);
         assert!(doc.notice.unwrap().contains("limited"));
     }

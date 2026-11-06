@@ -131,6 +131,7 @@ pub struct App {
     viewing: bool,
     viewer_scroll: usize,
     markdown_source: bool,
+    reading: bool,
     image_loader: Option<crate::image_loader::ImageLoader>,
     image_request: Option<u64>,
     viewer_text_cache: RefCell<Option<crate::ui::ViewerText>>,
@@ -185,6 +186,7 @@ impl App {
             viewing: false,
             viewer_scroll: 0,
             markdown_source: false,
+            reading: false,
             image_loader: None,
             image_request: None,
             viewer_text_cache: RefCell::new(None),
@@ -252,6 +254,30 @@ impl App {
         self.markdown_source
     }
 
+    pub fn is_reading(&self) -> bool {
+        self.viewing && self.reading
+    }
+
+    pub fn supports_reading(&self) -> bool {
+        self.preview
+            .document
+            .as_ref()
+            .is_some_and(|document| document.supports_reading)
+    }
+
+    pub fn toggle_reading(&mut self) {
+        if !self.viewing {
+            return;
+        }
+        if self.supports_reading() {
+            self.reading = !self.reading;
+            self.viewer_scroll = 0;
+            self.status = None;
+        } else {
+            self.status = Some("reading mode is available for plain text only".into());
+        }
+    }
+
     pub(crate) fn viewer_text_cache(&self) -> &RefCell<Option<crate::ui::ViewerText>> {
         &self.viewer_text_cache
     }
@@ -265,6 +291,8 @@ impl App {
                 .is_some_and(|document| document.source_lines.is_some())
         {
             self.markdown_source = !self.markdown_source;
+            self.reading = false;
+            self.status = None;
             self.viewer_scroll = 0;
             self.cancel_markdown();
         }
@@ -428,6 +456,7 @@ impl App {
                 self.viewing = true;
                 self.viewer_scroll = 0;
                 self.markdown_source = false;
+                self.reading = false;
                 self.status = None;
             }
             _ => self.status = Some("select a file to view".into()),
@@ -437,6 +466,8 @@ impl App {
     pub fn close_viewer(&mut self) {
         self.viewing = false;
         self.viewer_scroll = 0;
+        self.reading = false;
+        self.status = None;
         self.cancel_markdown();
     }
 
@@ -693,6 +724,8 @@ impl App {
             self.cancel_markdown();
             self.viewer_text_cache.get_mut().take();
             self.markdown_source = false;
+            self.reading = false;
+            self.viewer_scroll = 0;
             self.preview = Preview {
                 label: "preview".into(),
                 path: None,
@@ -714,6 +747,8 @@ impl App {
         self.cancel_markdown();
         self.viewer_text_cache.get_mut().take();
         self.markdown_source = false;
+        self.reading = false;
+        self.viewer_scroll = 0;
         let mut preview = Preview {
             label,
             path: Some(path.clone()),

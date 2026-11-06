@@ -34,6 +34,7 @@ const PICKER_HELP: &str = "Picker controls:
   Shift+S            Ascending / descending
   v                  View file inline   Esc / q           Return to picker
   m                  Toggle Markdown source / rendered inside the viewer
+  R                  Toggle plain-text reading / raw inside the viewer
   o                  Open file with its default application
   . / r              Hidden / refresh
   w                  Save hidden and sort settings as defaults
@@ -97,6 +98,14 @@ enum CliCommand {
         #[arg(value_enum)]
         shell: Shell,
     },
+
+    /// List loaded syntax grammars and their file extensions
+    #[command(
+        long_about = "List loaded syntax grammars and their file extensions, one grammar per line. \
+Each line contains the grammar name, a tab, and comma-separated extensions. \
+Grammars without extensions show (none)."
+    )]
+    Languages,
 
     /// Preview, save, or create themes
     Theme {
@@ -169,6 +178,20 @@ fn run(cli: Cli) -> Result<(), String> {
         Some(CliCommand::Init { shell }) => {
             let script = shell_init(shell.name()).expect("Clap limits shells to supported values");
             println!("{script}");
+        }
+        Some(CliCommand::Languages) => {
+            let mut definitions: Vec<_> = de::document::syntax_definitions().collect();
+            definitions.sort_unstable();
+            for (name, extensions) in definitions {
+                let mut extensions: Vec<_> = extensions.iter().map(String::as_str).collect();
+                extensions.sort_unstable();
+                let extensions = if extensions.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    extensions.join(", ")
+                };
+                println!("{name}\t{extensions}");
+            }
         }
         Some(CliCommand::Theme {
             command: Some(ThemeCommand::Create { name }),
@@ -462,7 +485,7 @@ fn run_inline<S, T>(
                     };
                     match handle(&mut app, &mut state, key, page_rows) {
                         InlineResult::Continue => {
-                            if !app.is_viewing() || key.code == KeyCode::Char('m') {
+                            if !app.is_viewing() || matches!(key.code, KeyCode::Char('m' | 'R')) {
                                 drag = None;
                             }
                             redraw = true;
@@ -775,6 +798,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::End => app.set_viewer_scroll(usize::MAX),
             KeyCode::Char('o') => return app.open_selected(),
             KeyCode::Char('m') => app.toggle_markdown_source(),
+            KeyCode::Char('R') => app.toggle_reading(),
             _ => {}
         }
         return NavigationResult::Continue;
@@ -1202,6 +1226,9 @@ mod tests {
             &mut drag
         ));
         app.open_viewer();
+        let raw_max = viewer_scroll_max(&app, area);
+        app.toggle_reading();
+        assert!(viewer_scroll_max(&app, area) < raw_max);
         assert!(!handle_viewer_mouse(
             &mut app,
             area,
@@ -1343,6 +1370,34 @@ mod tests {
         handle_key(&mut app, key('m'), 2);
         assert_eq!(app.filter_query(), "m");
         assert!(!app.is_viewing());
+    }
+
+    #[test]
+    fn reading_key_resets_on_mode_and_view_changes_and_rejects_code() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), "first\nsecond\nthird").unwrap();
+        fs::write(temp.path().join("b.rs"), "fn main() {}\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let key = |code| KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE);
+        handle_key(&mut app, key('v'), 2);
+        app.set_viewer_scroll(3);
+        handle_key(&mut app, key('R'), 2);
+        assert!(app.is_reading());
+        assert_eq!(app.viewer_scroll(), 0);
+        app.set_viewer_scroll(2);
+        handle_key(&mut app, key('R'), 2);
+        assert!(!app.is_reading());
+        assert_eq!(app.viewer_scroll(), 0);
+        handle_key(&mut app, key('R'), 2);
+        handle_key(&mut app, key('q'), 2);
+        handle_key(&mut app, key('v'), 2);
+        assert!(!app.is_reading());
+        handle_key(&mut app, key('q'), 2);
+        app.move_down();
+        handle_key(&mut app, key('v'), 2);
+        handle_key(&mut app, key('R'), 2);
+        assert!(!app.is_reading());
+        assert!(app.status().unwrap().contains("plain text only"));
     }
 
     #[test]

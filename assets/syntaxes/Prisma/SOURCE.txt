@@ -1,0 +1,7 @@
+Prisma syntax: https://github.com/Sublime-Instincts/PrismaHighlight
+Revision: 9fb0557004fd0d2442fc343d47eeb0b7bc141479 (v1.1.0, 2022-06-25)
+Source: resources/syntax/Prisma.sublime-syntax
+License: MIT; see LICENSE.txt (upstream LICENSE.md).
+Local changes: add name; replace pop: 2 with pop: true for syntect.
+The two affected stacked contexts both include the newline pop rule.
+This upstream release has not been updated since 2022.

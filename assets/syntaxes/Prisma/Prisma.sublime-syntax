@@ -1,0 +1,430 @@
+%YAML 1.2
+---
+name: Prisma
+file_extensions:
+  - prisma
+scope: source.prisma
+version: 2
+
+variables:
+
+  identifier: '[A-Za-z][A-Za-z0-9_]*'
+  field_types: |-
+    (?x:
+      String|Boolean|Int|BigInt|Float|Decimal|DateTime|Json|Bytes
+    )
+
+  attributes: |-
+    (?x:
+      id|default|unique|index|relation|map|updatedAt|map|db|ignore|fulltext
+    )
+
+  illegal_model_names: |-
+    (?x:
+      PrismaClient|Prisma|break|case|catch|class|const|continue|debugger
+      |default|delete|do|else|enum|export|extends|false|finally|for|function|if
+      |implements|import|in|instanceof|interface|let|new|null|package|private
+      |protected|public|return|super|switch|this|throw|true|try|typeof|var|void
+      |while|with|yield|
+    )
+
+  builtin_functions: |-
+    (?x:
+      auto(?:increment)?|cuid|uuid|now|dbgenerated|env
+    )
+
+contexts:
+
+  prototype:
+    - include: documentation_comment
+    - include: line_comment
+
+  documentation_comment:
+    - match: \/{3}
+      scope: punctuation.definition.comment.prisma
+      push: documentation_comment_body
+
+  documentation_comment_body:
+    - meta_scope: comment.block.documentation.prisma
+    - match: $\n?
+      pop: 1
+
+  line_comment:
+    - match: \/{2}
+      scope: punctuation.definition.comment.prisma
+      push: comment_body
+
+  comment_body:
+    - meta_scope: comment.line.prisma
+    - match: $\n?
+      pop: 1
+
+  eol_pop_2:
+    - match: (?=\n)
+      pop: true
+
+  else_pop:
+    - match: (?=\S)
+      pop: 1
+
+  immediately_pop:
+    - match: ''
+      pop: 1
+
+  main:
+    - include: generator
+    - include: datasource
+    - include: model
+    - include: enum
+    - include: composite_type
+    - include: primitives
+
+  function:
+    - match: '{{builtin_functions}}'
+      scope: support.function.prisma
+      push: possible_function_body_start
+    - match: '{{identifier}}(?=\()'
+      scope: variable.function.prisma meta.function-call.identifier.prisma
+      push: function_body_start
+
+  possible_function_body_start:
+    - meta_scope: meta.function-call.identifier.prisma
+    - match: (?=\()
+      set: function_body_start
+    - include: else_pop
+
+  function_body_start:
+    - meta_scope: meta.function-call.arguments.prisma
+    - match: \(
+      scope: punctuation.section.arguments.begin.prisma
+      set: function_body_end
+
+  function_body_end:
+    - match: \)
+      scope: punctuation.section.arguments.end.prisma
+      pop: 1
+    - include: primitives
+    - include: attribute_argument
+
+  composite_type:
+    - match: \b(type)\b
+      scope: keyword.declaration.type.prisma
+      push:
+        - meta_composite_type
+        - composite_type_body_begin
+        - composite_type_identifier
+
+  meta_composite_type:
+    - meta_scope: meta.type.prisma
+    - include: immediately_pop
+
+  composite_type_body_begin:
+    - meta_scope: meta.block.prisma
+    - match: \{
+      scope: punctuation.section.block.begin.prisma
+      set: composite_type_body_end
+    - include: else_pop
+
+  composite_type_body_end:
+    - meta_scope: meta.block.prisma
+    - match: \}
+      scope: punctuation.section.block.end.prisma
+      pop: 1
+    - include: composite_type_field
+
+  composite_type_identifier:
+    - match: '{{identifier}}'
+      scope: entity.name.type.prisma
+    - include: else_pop
+
+  composite_type_field:
+    - match: '{{identifier}}'
+      scope: variable.other.type.prisma
+      push:
+        - attributes
+        - field_relation_type
+        - field_scalar_type
+
+  enum:
+    - match: \b(enum)\b
+      scope: keyword.declaration.enum.prisma
+      push:
+        - meta_enum
+        - enum_body_begin
+        - enum_identifier
+
+  meta_enum:
+    - meta_scope: meta.enum.prisma
+    - include: immediately_pop
+
+  enum_body_begin:
+    - meta_scope: meta.block.prisma
+    - match: \{
+      scope: punctuation.section.block.begin.prisma
+      set: enum_body_end
+    - include: else_pop
+
+  enum_body_end:
+    - meta_scope: meta.block.prisma
+    - match: \}
+      scope: punctuation.section.block.end.prisma
+      pop: 1
+    - match: \b{{identifier}}\b
+      scope: variable.other.enum.prisma
+
+  enum_identifier:
+    - match: '{{identifier}}'
+      scope: entity.name.enum.prisma
+    - include: else_pop
+
+  attributes:
+    - match: (\@{1,2})({{attributes}})(?:(\.)(\w+))?
+      captures:
+        1: punctuation.definition.annotation.prisma
+        2: variable.annotation.prisma
+        3: punctuation.accessor.dot.prisma
+        4: variable.annotation.prisma
+      push: maybe_attributes_body
+    - include: else_pop
+
+  maybe_attributes_body:
+    - match: (?=\()
+      set: attributes_body_start
+    - include: else_pop
+
+  attributes_body_start:
+    - match: \(
+      scope: punctuation.section.arguments.begin.prisma
+      set: attributes_body_end
+
+  attributes_body_end:
+    - match: \)
+      scope: punctuation.section.arguments.end.prisma
+      pop: 1
+    - include: function
+    - include: primitives
+    - include: attribute_argument
+
+  attribute_argument:
+    - match: '{{identifier}}'
+      scope: variable.parameter.prisma
+      push:
+        - primitives_else_pop
+        - attribute_argument_assignment
+    - match: \,
+      scope: punctuation.separator.comma.prisma
+    - include: else_pop
+
+  attribute_argument_assignment:
+    - match: ':'
+      scope: keyword.operator.assignment.prisma
+    - include: else_pop
+
+  model:
+    - match: \b(model)\b
+      scope: keyword.declaration.model.prisma
+      push:
+        - meta_model
+        - model_body_begin
+        - model_identifier
+
+  meta_model:
+    - meta_scope: meta.model.prisma
+    - include: immediately_pop
+
+  model_body_begin:
+    - match: \{
+      scope: punctuation.section.block.begin.prisma
+      set: model_body_end
+    - include: else_pop
+
+  model_body_end:
+    - meta_scope: meta.block.prisma
+    - match: \}
+      scope: punctuation.section.block.end.prisma
+      pop: 1
+    - include: model_field
+    - include: primitives
+    - include: attributes
+
+  model_identifier:
+    - match: '\b{{illegal_model_names}}\b'
+      scope: invalid.illegal.model-name.prisma
+    - match: '{{identifier}}'
+      scope: entity.name.model.prisma
+    - include: else_pop
+
+  model_field:
+    - match: '{{identifier}}'
+      scope: variable.other.prisma
+      push:
+        - attributes
+        - field_relation_type
+        - field_scalar_type
+
+  field_relation_type:
+    - match: ({{identifier}})(?:(\[)(\])|(\?))?
+      captures:
+        1: support.class.prisma
+        2: punctuation.definition.modifier.begin.prisma
+        3: punctuation.definition.modifier.end.prisma
+        4: punctuation.definition.modifier.prisma
+    - include: eol_pop_2
+    - include: else_pop
+
+  field_scalar_type:
+    - match: \b(Unsupported)\b(\()
+      captures:
+        1: keyword.other.field.prisma
+        2: punctuation.section.field.begin.prisma
+      set: unsupported_body
+    - match: ({{field_types}})(?:(\[)(\])|(\?))?
+      captures:
+        1: keyword.other.field.prisma
+        2: punctuation.definition.modifier.begin.prisma
+        3: punctuation.definition.modifier.end.prisma
+        4: punctuation.definition.modifier.prisma
+    - include: eol_pop_2
+    - include: else_pop
+
+  unsupported_body:
+    - meta_scope: meta.field.prisma
+    - match: \)
+      scope: punctuation.section.field.end.prisma
+      pop: 1
+    - include: string
+
+  field:
+    - match: \b\w+\b
+      scope: variable.other.prisma
+      push:
+        - primitives_else_pop
+        - field_intializer
+
+  field_intializer:
+    - match: \=
+      scope: keyword.operator.assignment.prisma
+    - include: else_pop
+
+  primitives_else_pop:
+    - include: primitives
+    - include: else_pop
+
+  datasource:
+    - match: \b(datasource)\b
+      scope: keyword.declaration.datasource.prisma
+      push:
+        - meta_datasource
+        - generator_datasource_body_begin
+        - datasource_identifier
+
+  meta_datasource:
+    - meta_scope: meta.datasource.prisma
+    - include: immediately_pop
+
+  datasource_identifier:
+    - match: \w+
+      scope: entity.name.datasource.prisma
+    - include: else_pop
+
+  generator:
+    - match: \b(generator)\b
+      scope: keyword.declaration.generator.prisma
+      push:
+        - meta_generator
+        - generator_datasource_body_begin
+        - generator_identifier
+
+  meta_generator:
+    - meta_scope: meta.generator.prisma
+    - include: immediately_pop
+
+  generator_identifier:
+    - match: \w+
+      scope: entity.name.generator.prisma
+    - include: else_pop
+
+  generator_datasource_body_begin:
+    - match: \{
+      scope: punctuation.section.block.begin.prisma
+      set: generator_datasource_body_end
+    - include: else_pop
+
+  generator_datasource_body_end:
+    - meta_scope: meta.block.prisma
+    - match: \}
+      scope: punctuation.section.block.end.prisma
+      pop: 1
+    - include: function
+    - include: field
+    - include: primitives
+
+  primitives:
+    - include: list
+    - include: string
+    - include: number
+    - include: boolean
+    - include: operator
+
+  list:
+    - match: \[
+      scope: punctuation.section.sequence.begin.prisma
+      push: list_body
+
+  list_body:
+    - meta_scope: meta.sequence.list.prisma
+    - match: \]
+      scope: punctuation.section.sequence.end.prisma
+      pop: 1
+    - include: function
+    - include: string
+    - match: \,
+      scope: punctuation.separator.sequence.prisma
+    - match: '{{identifier}}'
+      scope: variable.other.model.prisma
+
+  number:
+    - match: \d+
+      scope: meta.number.integer.decimal.prisma constant.numeric.prisma
+
+  string:
+    - include: single_quoted_string
+    - include: double_quoted_string
+
+  single_quoted_string:
+    - match: \'
+      scope: punctuation.definition.string.begin.prisma
+      push: single_quoted_string_body
+
+  single_quoted_string_body:
+    - meta_include_prototype: false
+    - meta_scope: meta.string.prisma string.quoted.single.prisma
+    - match: \'
+      scope: punctuation.definition.string.end.prisma
+      pop: 1
+    - include: string_escapes
+
+  double_quoted_string:
+    - match: \"
+      scope: punctuation.definition.string.begin.prisma
+      push: double_quoted_string_body
+
+  double_quoted_string_body:
+    - meta_include_prototype: false
+    - meta_scope: meta.string.prisma string.quoted.double.prisma
+    - match: \"
+      scope: punctuation.definition.string.end.prisma
+      pop: 1
+    - include: string_escapes
+
+  string_escapes:
+    - match: \\['"]
+      scope: constant.character.escape.prisma
+
+  operator:
+    - match: ([+-])
+      scope: keyword.operator.arithmetic.prisma
+
+  boolean:
+    - match: \b(true|false)\b
+      scope: constant.language.boolean.prisma

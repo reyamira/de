@@ -1,0 +1,33 @@
+Vue.sublime-syntax
+  Source: https://github.com/vuejs/vue-syntax-highlight/blob/6eb71bc6bba5e6a284b6d1d3154484da6f366e21/Vue%20Component.sublime-syntax
+  Revision: 6eb71bc6bba5e6a284b6d1d3154484da6f366e21
+  License: MIT; see LICENSE-Vue.txt.
+  This is the self-contained Sublime Text 3 grammar from the upstream new branch.
+
+Svelte.sublime-syntax
+  Source: https://github.com/corneliusio/svelte-sublime/blob/c71f1290b061c79c027b5eb002ed06aa6d874ffe/Svelte.sublime-syntax
+  Revision: c71f1290b061c79c027b5eb002ed06aa6d874ffe (st3-3.4.1)
+  License: MIT; see LICENSE-Svelte.txt.
+  Local changes: remove the HTML first-line matcher; resolve JavaScript and Babel
+  includes by scope instead of Sublime package paths.
+
+JavaScript-Babel.sublime-syntax
+  Source: https://github.com/sharkdp/bat/blob/73dc3258bec83bd7c66334f05b13c2d8221859f9/assets/syntaxes/02_Extra/JavaScript%20%28Babel%29.sublime-syntax
+  Revision: 73dc3258bec83bd7c66334f05b13c2d8221859f9
+  Bat's converted grammar derives from https://github.com/babel/babel-sublime
+  at f4579f9107996c16208466248a85dc2296083a5f.
+  License: MIT; see LICENSE-Babel.txt.
+  Local changes: register only the jsx extension, remove the JavaScript shebang
+  matcher, and use source.js.jsx to avoid replacing the bundled JavaScript scope.
+  Replace the unavailable source.js.css include with the bundled CSS scope and
+  a local JavaScript interpolation context for styled templates.
+
+JavaScript-RegExp.sublime-syntax
+  Source: https://github.com/sublimehq/Packages/blob/fa6b8629c95041bf262d4c1dab95c456a0530122/JavaScript/Regular%20Expressions%20%28JavaScript%29.sublime-syntax
+  Revision: fa6b8629c95041bf262d4c1dab95c456a0530122, the Packages
+  submodule revision in Syntect v5.3.0.
+  License: MIT; see LICENSE-Sublime-Packages.txt.
+
+Vue and Svelte use legacy grammar versions because newer upstream versions use
+Sublime syntax features that Syntect does not support. Embedded language scopes
+must also be present in the loaded syntax set for their highlighting to work.

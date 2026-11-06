@@ -522,13 +522,56 @@ fn preview_text_lines(
             }
         })
         .unwrap_or(&[]);
-    wrap_text_lines(
-        notices.iter().chain(document_lines.iter()),
-        width,
-        offset,
-        limit,
-        count_all,
-    )
+    if app.is_reading() {
+        let paragraphs = reading_lines(document_lines);
+        wrap_text_lines(
+            notices.iter().chain(paragraphs.iter()),
+            width,
+            offset,
+            limit,
+            count_all,
+        )
+    } else {
+        wrap_text_lines(
+            notices.iter().chain(document_lines.iter()),
+            width,
+            offset,
+            limit,
+            count_all,
+        )
+    }
+}
+
+// Indented lines and blank lines remain literal. Only unindented prose joins.
+fn reading_lines(lines: &[Line<'static>]) -> Vec<Line<'static>> {
+    let mut result: Vec<Line<'static>> = Vec::new();
+    let mut joining = false;
+    for line in lines {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let prose =
+            !text.trim().is_empty() && !text.chars().next().is_some_and(char::is_whitespace);
+        if prose && joining {
+            let previous = result.last_mut().unwrap();
+            while let Some(span) = previous.spans.last_mut() {
+                let trimmed = span.content.trim_end().len();
+                span.content.to_mut().truncate(trimmed);
+                if !span.content.is_empty() {
+                    break;
+                }
+                previous.spans.pop();
+            }
+            previous.spans.push(Span::raw(" "));
+            previous.spans.extend(line.spans.iter().cloned());
+        } else {
+            result.push(line.clone());
+        }
+        joining = prose;
+    }
+    result
 }
 
 // Keep only the current word and whitespace in memory, and stop after the
@@ -696,21 +739,24 @@ impl WrappedRows {
 pub(crate) struct ViewerText {
     width: u16,
     source: bool,
+    reading: bool,
     rows: Vec<Line<'static>>,
 }
 
 fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Ref<'a, ViewerText> {
     let source = app.is_viewing() && app.is_markdown_source();
+    let reading = app.is_reading();
     let cache = app.viewer_text_cache();
     let needs_rebuild = cache
         .borrow()
         .as_ref()
-        .is_none_or(|text| text.width != width || text.source != source);
+        .is_none_or(|text| text.width != width || text.source != source || text.reading != reading);
     if needs_rebuild {
         let (rows, _) = preview_text_lines(app, width, palette, 0, usize::MAX, true);
         *cache.borrow_mut() = Some(ViewerText {
             width,
             source,
+            reading,
             rows,
         });
     }
@@ -761,6 +807,9 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
                 "FMD rendered"
             };
             format!(" {mode} · {}", app.preview().label())
+        } else if app.supports_reading() {
+            let mode = if app.is_reading() { "reading" } else { "raw" };
+            format!(" {mode} · {}", app.preview().label())
         } else {
             format!(" view · {}", app.preview().label())
         };
@@ -773,12 +822,18 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             header,
         );
         frame.render_widget(
-            Paragraph::new(if markdown && footer.width >= 64 {
+            Paragraph::new(if let Some(status) = app.status() {
+                status
+            } else if markdown && footer.width >= 64 {
                 " m source/rendered  q/esc back  ↑↓/jk scroll  pg↑↓ page  o open"
             } else if markdown && footer.width >= 32 {
                 " m mode  q/esc back  ↑↓  o open"
             } else if markdown {
                 "m mode  q back  ↑↓  o"
+            } else if app.supports_reading() && footer.width >= 42 {
+                " R reading/raw  q/esc back  ↑↓ scroll  o open"
+            } else if app.supports_reading() {
+                " R mode  q back  ↑↓"
             } else if footer.width >= 55 {
                 " q/esc back  ↑↓/jk scroll  pg↑↓ page  home/end  o open"
             } else if footer.width >= 30 {
@@ -1258,6 +1313,75 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
         assert!(terminal.backend().to_string().contains("last"));
         assert_eq!(viewer_scroll_max(&app, Rect::new(0, 0, 20, 10)), 0);
+    }
+
+    #[test]
+    fn reading_reflows_prose_but_preserves_raw_lines_and_block_boundaries() {
+        let temp = tempdir().unwrap();
+        let source = "alpha  \nbeta\n\n  block one\n  block two\ngamma\ndelta";
+        fs::write(temp.path().join("notes.txt"), source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let area = Rect::new(0, 0, 23, 6);
+        let palette = app.theme().palette();
+        let text = |app: &App| {
+            viewer_text(app, viewer_body(area).width, &palette)
+                .rows
+                .iter()
+                .map(|row| {
+                    row.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            text(&app),
+            [
+                "alpha  ",
+                "beta",
+                "",
+                "  block one",
+                "  block two",
+                "gamma",
+                "delta"
+            ]
+        );
+        let raw_max = viewer_scroll_max(&app, area);
+        app.set_viewer_scroll(raw_max);
+        app.toggle_reading();
+        assert_eq!(app.viewer_scroll(), 0);
+        assert_eq!(
+            text(&app),
+            [
+                "alpha beta",
+                "",
+                "  block one",
+                "  block two",
+                "gamma delta"
+            ]
+        );
+        let reading_max = viewer_scroll_max(&app, area);
+        assert!(reading_max < raw_max);
+        assert_eq!(viewer_scrollbar(&app, area).unwrap().maximum, reading_max);
+        app.toggle_reading();
+        assert_eq!(
+            text(&app),
+            [
+                "alpha  ",
+                "beta",
+                "",
+                "  block one",
+                "  block two",
+                "gamma",
+                "delta"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
+            source
+        );
     }
 
     #[test]

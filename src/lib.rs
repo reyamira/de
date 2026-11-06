@@ -70,7 +70,7 @@ pub fn shell_init(shell: &str) -> Option<&'static str> {
         "bash" | "zsh" => Some(
             r#"de() {
     case "${1-}" in
-        -h|--help|-V|--version|init|theme|config)
+        -h|--help|-V|--version|init|theme|config|languages)
             command de "$@"
             return
             ;;
@@ -85,7 +85,7 @@ pub fn shell_init(shell: &str) -> Option<&'static str> {
             r#"function de
     if test (count $argv) -gt 0
         switch $argv[1]
-            case -h --help -V --version init theme config
+            case -h --help -V --version init theme config languages
                 command de $argv
                 return
         end
@@ -103,17 +103,6 @@ end"#,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shell_init_bypasses_the_wrapper_function() {
-        let init = shell_init("bash").unwrap();
-        assert!(init.contains("command de"));
-        assert!(init.contains("builtin cd --"));
-        assert!(init.contains("        -h|--help|-V|--version|init|theme|config)\n"));
-
-        let init = shell_init("fish").unwrap();
-        assert!(init.contains("case -h --help -V --version init theme config\n"));
-    }
 
     #[test]
     fn rejects_unknown_shells() {

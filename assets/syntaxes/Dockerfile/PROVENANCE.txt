@@ -1,0 +1,3 @@
+Upstream: https://github.com/asbjornenge/Docker.tmbundle
+Commit: c001fb280561d7c16f0f2837d76af493cf6c3bf8
+Files: Syntaxes/Dockerfile.sublime-syntax, LICENSE

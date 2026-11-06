@@ -163,6 +163,12 @@ fn render(
             max_width_pt: (request.width as f32 * 0.75).max(144.0),
             ..Default::default()
         };
+        options.theme.page.margins = franken_markdown::PageMargins {
+            top_pt: 9.0,
+            right_pt: 9.0,
+            bottom_pt: 9.0,
+            left_pt: 9.0,
+        };
         options.theme.appearance = if request.dark {
             franken_markdown::SystemAppearance::Dark
         } else {
@@ -233,6 +239,40 @@ fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_margins_leave_more_width_for_text() {
+        let source = "A paragraph with enough words to wrap across several lines. ".repeat(20);
+        let request = RenderRequest {
+            path: PathBuf::from("/tmp/test.md"),
+            source: Arc::from(source),
+            width: 320,
+            height: 180,
+            scroll_y: 0,
+            dark: false,
+        };
+        let mut cache = None;
+        let page = render(&request, &mut cache, &mut || false).unwrap();
+        assert_eq!((page.image.width, page.image.height), (320, 180));
+        let compact = cache.as_ref().unwrap();
+        assert!((compact.tree.size().width() - 320.0).abs() < 0.1);
+
+        let doc = franken_markdown::parse_markdown(&request.source);
+        let options = franken_markdown::svg::SvgOptions {
+            max_width_pt: 240.0,
+            ..Default::default()
+        };
+        let (svg, _, _) = franken_markdown::svg::render_svg_with_resources(
+            &doc,
+            &options,
+            &franken_markdown::FontAssets::default(),
+            &[],
+        )
+        .unwrap();
+        let default_tree =
+            resvg::usvg::Tree::from_data(&svg, &crate::fmd_diagram::options(false)).unwrap();
+        assert!(compact.tree.size().height() < default_tree.size().height());
+    }
 
     #[test]
     fn renders_viewports_reuses_layout_and_reflows() {

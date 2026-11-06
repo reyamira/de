@@ -1,0 +1,7 @@
+Upstream: https://github.com/jonrandy/JSON5Syntax
+Commit: 31121d1140068e881a957b3b8f0db31904378a49
+Files: json5.sublime-syntax, LICENSE
+Upstream states that its grammar was converted from https://github.com/wiredmax/language-json5. See LICENSE-original.txt for its MIT license and TextMate attribution.
+Original-project license snapshot: https://github.com/wiredmax/language-json5/blob/362b80c97ea8fcc7edb9fdeb787d8c51ab04d58a/LICENSE.md
+Adaptation: corrected identifier, number, signed Infinity/NaN, and string escape patterns.
+Syntect compatibility: quoted the infinity context name and reference to prevent YAML numeric coercion; changed capture index 1 to an integer.
