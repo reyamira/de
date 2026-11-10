@@ -39,18 +39,33 @@ impl Poster {
                         .push(self.image_word(destination, alt, *style, size, width));
                     flow.trailing_break = false;
                 }
-                Piece::Math(source, display, style) => {
-                    flow.word
-                        .push(self.math_word(source, *display, *style, size, width));
+                Piece::Math(source, display, style)
+                | Piece::MappedMath(source, display, style, _) => {
+                    let mut word = self.math_word(source, *display, *style, size, width);
+                    if let Piece::MappedMath(_, _, _, logical) = piece {
+                        word.logical = logical.clone();
+                    }
+                    flow.word.push(word);
                     flow.trailing_break = false;
                 }
-                Piece::Text(text, style) => {
+                Piece::Text(text, style) | Piece::MappedText(text, style, _) => {
+                    let empty = crate::rendered_text::TextMap::default();
+                    let logical = if let Piece::MappedText(_, _, logical) = piece {
+                        logical
+                    } else {
+                        &empty
+                    };
                     let mut start = 0;
                     for (offset, ch) in text.char_indices() {
                         // Code spans preserve their internal whitespace. NBSP
                         // and narrow NBSP never become ordinary breakable glue.
                         if !style.mono && breakable_space(ch) {
-                            append_run(&mut flow, &text[start..offset], *style);
+                            append_run(
+                                &mut flow,
+                                &text[start..offset],
+                                *style,
+                                logical.slice(start..offset),
+                            );
                             self.collect_word(&mut flow, &mut paragraph, &shaper, size, width);
                             if flow.gap == 0.0 {
                                 flow.gap = self.space_width(*style, size);
@@ -58,7 +73,12 @@ impl Poster {
                             start = offset + ch.len_utf8();
                         }
                     }
-                    append_run(&mut flow, &text[start..], *style);
+                    append_run(
+                        &mut flow,
+                        &text[start..],
+                        *style,
+                        logical.slice(start..text.len()),
+                    );
                 }
             }
         }
@@ -133,12 +153,49 @@ impl Poster {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn draw_words(&mut self, words: &[Word], x: f64, baseline: f64, size: f64) {
+        let (ascent, height) = self.line_metrics(words, size * 0.85, size * self.line_height);
+        self.draw_words_at(words, x, baseline, size, ascent, height);
+    }
+
+    pub(super) fn draw_words_at(
+        &mut self,
+        words: &[Word],
+        x: f64,
+        baseline: f64,
+        size: f64,
+        ascent: f64,
+        height: f64,
+    ) {
         let mut pen = x;
         // Merge hit regions only within this physical line and across adjacent
         // runs of the same link. Never bridge unlinked text or a table cell.
         let mut previous_link = None;
+        let mut previous_end = None;
         for word in words {
+            let fallback;
+            let logical =
+                if word.logical.is_empty() && word.warning.is_some() && !word.text.is_empty() {
+                    fallback = self.text.borrow_mut().synthetic_leaf(&word.text);
+                    &fallback
+                } else {
+                    &word.logical
+                };
+            if word.gap > 0.0
+                && let Some(previous) = previous_end
+            {
+                self.text.borrow_mut().record_gap(
+                    previous,
+                    logical,
+                    crate::rendered_text::TextRect {
+                        x: pen as f32,
+                        y: (baseline - ascent) as f32,
+                        width: word.gap as f32,
+                        height: height as f32,
+                    },
+                );
+            }
             pen += word.gap;
             let start = pen;
             if let Some(warning) = &word.warning {
@@ -161,13 +218,16 @@ impl Poster {
                 }
                 pen += word.w;
             } else if let Some(prepared) = &word.shaped {
+                prepared.record(self, logical, pen, baseline - ascent, height);
                 pen = prepared.paint(self, pen, baseline, word.style, size);
             } else if !word.text.is_empty() {
                 // Compatibility for internal callers constructing a fallback
                 // word directly; normal wrapped/code lines always retain it.
                 let prepared = Shaper::new(self).shape(&word.text, word.style, size);
+                prepared.record(self, logical, pen, baseline - ascent, height);
                 pen = prepared.paint(self, pen, baseline, word.style, size);
             }
+            previous_end = logical.end();
             if word.style.link.is_some() {
                 let (ascent, height) =
                     self.line_metrics(std::slice::from_ref(word), size * 0.85, size);
@@ -188,7 +248,12 @@ impl Poster {
     }
 }
 
-fn append_run(flow: &mut TextFlow, text: &str, style: RStyle) {
+fn append_run(
+    flow: &mut TextFlow,
+    text: &str,
+    style: RStyle,
+    logical: crate::rendered_text::TextMap,
+) {
     if text.is_empty() {
         return;
     }
@@ -196,10 +261,12 @@ fn append_run(flow: &mut TextFlow, text: &str, style: RStyle) {
     if let Some(last) = flow.word.last_mut().filter(|run| {
         run.style == style && run.formula.is_none() && run.image.is_none() && run.warning.is_none()
     }) {
+        last.logical.append(&logical, last.text.len());
         last.text.push_str(text);
     } else {
         flow.word.push(Word {
             text: text.to_owned(),
+            logical,
             style,
             w: 0.0,
             gap: 0.0,

@@ -20,18 +20,10 @@ impl Poster {
         let shaper = Shaper::new(self);
         let mut lines = Vec::new();
         for source in code.lines() {
-            let mut expanded = String::new();
-            let mut column = 0usize;
-            for ch in source.chars() {
-                let count = if ch == '\t' { 4 - column % 4 } else { 1 };
-                let ch = if ch == '\t' { ' ' } else { ch };
-                for _ in 0..count {
-                    expanded.push(ch);
-                }
-                column = column.saturating_add(count);
-            }
+            let source_map = self.text.borrow().map(source);
+            let (expanded, logical) = source_map.expanded_code(source);
             let prepared = shaper.shape(&expanded, style, size);
-            let word = text_word(expanded, style, None, prepared);
+            let word = text_word(expanded, logical, style, None, prepared);
             if word.w <= width {
                 lines.push(word);
             } else {
@@ -47,7 +39,13 @@ impl Poster {
             }
         }
         if lines.is_empty() {
-            lines.push(text_word(String::new(), style, None, ShapedText::default()));
+            lines.push(text_word(
+                String::new(),
+                Default::default(),
+                style,
+                None,
+                ShapedText::default(),
+            ));
         }
         lines
     }
@@ -84,7 +82,8 @@ pub(super) fn place_shaped(
                 let bytes = source_range(shaped, start..end);
                 push_prepared(
                     flow,
-                    run.text[bytes].to_owned(),
+                    run.text[bytes.clone()].to_owned(),
+                    run.logical.slice(bytes),
                     run.style,
                     warning.take(),
                     shaped.slice(start..end),
@@ -103,7 +102,8 @@ pub(super) fn place_shaped(
         let bytes = source_range(shaped, start..end);
         push_prepared(
             flow,
-            run.text[bytes].to_owned(),
+            run.text[bytes.clone()].to_owned(),
+            run.logical.slice(bytes),
             run.style,
             warning.take(),
             shaped.slice(start..end),
@@ -154,7 +154,8 @@ fn place_contextual(
                 }
                 push_prepared(
                     flow,
-                    run.text[bytes].to_owned(),
+                    run.text[bytes.clone()].to_owned(),
+                    run.logical.slice(bytes),
                     run.style,
                     warning.take(),
                     prepared,
@@ -176,7 +177,8 @@ fn place_contextual(
                 prepared.add_wrap_warning();
                 push_prepared(
                     flow,
-                    run.text[bytes].to_owned(),
+                    run.text[bytes.clone()].to_owned(),
+                    run.logical.slice(bytes),
                     run.style,
                     warning.take(),
                     prepared,
@@ -191,12 +193,14 @@ fn place_contextual(
 
 fn text_word(
     text: String,
+    logical: crate::rendered_text::TextMap,
     style: RStyle,
     warning: Option<SvgWarning>,
     prepared: ShapedText,
 ) -> Word {
     Word {
         text,
+        logical,
         style,
         w: prepared.width(),
         gap: 0.0,
@@ -210,11 +214,12 @@ fn text_word(
 fn push_prepared(
     flow: &mut TextFlow,
     text: String,
+    logical: crate::rendered_text::TextMap,
     style: RStyle,
     warning: Option<SvgWarning>,
     prepared: ShapedText,
 ) {
-    let word = text_word(text, style, warning, prepared);
+    let word = text_word(text, logical, style, warning, prepared);
     flow.line_width += word.w;
     flow.line.push(word);
 }

@@ -1,7 +1,9 @@
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::cursor;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use de::backend::InlineBackend;
@@ -32,15 +34,23 @@ use termina::{EventReader, PlatformTerminal, Terminal as _};
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
   → or l/Tab         Open folder     ← or h/Backspace  Go to parent
-  /                  Filter          s                  Name / modified
+  /                  Recursive names + text search
   Shift+S            Ascending / descending
   v                  View file inline   Esc / q           Return to picker
+  e                  Edit original file inline (pane or viewer)
+  Ctrl-S             Save in editor; Esc/Ctrl-Q returns with Save/Discard/Cancel
+  Shift+arrows        Select; Ctrl-Z / Ctrl-Y undo / redo in editor
   m                  Toggle Markdown source / rendered inside the viewer
+  / (viewer)         Find in file; Enter accepts; Escape restores the view
+  n / N (viewer)     Next / previous match
+  y (viewer)         Send selected text to terminal clipboard (OSC52)
+  Mouse              Wheel or scrollbar scrolls; drag viewer text to select
   R                  Toggle plain-text reading / raw inside the viewer
   o                  Open file with its default application
   . / r              Hidden / refresh
   w                  Save hidden and sort settings as defaults
-  Enter              Go here         Esc / q / Ctrl-C   Cancel
+  Enter              Choose selected folder / view file
+  Ctrl-G             Choose current header folder, including empty folders
 
 Run `de theme` to preview and save a color theme, or `de theme edit` to edit one.
 Run `de config` to change settings, or `de config edit` to open the file.
@@ -526,14 +536,27 @@ fn run_inline_with_mouse<S, T>(
     let outcome: io::Result<Option<T>> = (|| {
         let mut redraw = true;
         let mut viewer_active = false;
+        let mut bracketed_paste = false;
         let mut drag = None;
         let mut origin = None;
         let mut origin_supported = true;
         loop {
             redraw |= app.poll_preview();
             redraw |= app.poll_markdown();
+            redraw |= app.poll_search();
             if redraw {
-                let viewing = app.is_viewing() || editor_mouse;
+                let paste_wanted = app.editor().is_some()
+                    || app.find_prompt()
+                    || (app.is_searching() && !app.is_viewing());
+                if paste_wanted != bracketed_paste {
+                    if paste_wanted {
+                        execute!(io::stderr(), EnableBracketedPaste)?;
+                    } else {
+                        execute!(io::stderr(), DisableBracketedPaste)?;
+                    }
+                    bracketed_paste = paste_wanted;
+                }
+                let viewing = app.is_viewing() || app.editor().is_some() || editor_mouse;
                 if viewer_active && !viewing {
                     drag = None;
                     set_mouse_capture(&mut raw_mode.mouse_capture, false, &mut io::stderr())?;
@@ -569,7 +592,11 @@ fn run_inline_with_mouse<S, T>(
                 viewer_active = viewing;
                 let area = Rect::new(0, 0, terminal_width, viewport_height);
                 let preview = preview_area(&state, area);
+                if app.editor().is_none() {
+                    app.reveal_viewer_source(area);
+                }
                 if app.is_viewing()
+                    && app.editor().is_none()
                     && let Some(preview) = preview
                 {
                     app.set_viewer_scroll(
@@ -591,7 +618,10 @@ fn run_inline_with_mouse<S, T>(
                 redraw = false;
             }
             let area = Rect::new(0, 0, terminal_width, viewport_height);
-            let image = if images && (!editor_mouse || app.is_rendered_markdown_view()) {
+            let image = if images
+                && app.editor().is_none()
+                && (!editor_mouse || app.is_rendered_markdown_view())
+            {
                 preview_area(&state, area).and_then(|preview| {
                     app.markdown_image()
                         .or_else(|| {
@@ -611,7 +641,7 @@ fn run_inline_with_mouse<S, T>(
                 if !reader.poll(Some(Duration::ZERO), |_| true)? {
                     continue;
                 }
-            } else if (app.image_pending() || app.markdown_pending())
+            } else if app.background_work_pending()
                 && !reader.poll(Some(Duration::from_millis(16)), |_| true)?
             {
                 continue;
@@ -620,24 +650,26 @@ fn run_inline_with_mouse<S, T>(
                 Event::Key(key)
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                 {
-                    let page_rows = if app.is_viewing() {
+                    let page_rows = if app.editor().is_some() {
+                        de::editor_page_rows(&app, area)
+                    } else if app.is_viewing() {
                         viewer_page_rows(area)
                     } else {
                         visible_entry_rows(&app, terminal_width, viewport_height)
                     };
                     match handle(&mut app, &mut state, key, page_rows, area) {
                         InlineResult::Continue => {
-                            if !app.is_viewing()
-                                || app.theme_sample() != ThemeSample::Picker
-                                || matches!(key.code, KeyCode::Char('m' | 'R'))
-                            {
-                                drag = None;
-                            }
+                            drag = None;
                             redraw = true;
                         }
                         InlineResult::Accept(value) => break Ok(Some(value)),
                         InlineResult::Cancel => break Ok(None),
                     }
+                }
+                Event::Paste(text) => {
+                    de::resume_editor_cursor(&app);
+                    app.paste(&text);
+                    redraw = true;
                 }
                 Event::Mouse(mouse) if viewer_active => {
                     if editor_mouse {
@@ -662,6 +694,7 @@ fn run_inline_with_mouse<S, T>(
                     let (width, height) = (size.cols, size.rows);
                     set_mouse_capture(&mut raw_mode.mouse_capture, false, &mut io::stderr())?;
                     drag = None;
+                    app.resize_viewer_interaction();
                     terminal_width = width;
                     terminal_height = height;
                     viewport_height = desired_viewport_height(&app, width, height, min_height);
@@ -670,14 +703,17 @@ fn run_inline_with_mouse<S, T>(
                         .resize_viewport(width, viewport_height)?;
                     terminal.resize(Rect::new(0, 0, width, viewport_height))?;
                     origin = None;
-                    if (app.is_viewing() || editor_mouse) && origin_supported {
+                    if (app.is_viewing() || app.editor().is_some() || editor_mouse)
+                        && origin_supported
+                    {
                         terminal.backend_mut().request_origin()?;
                         let result = read_origin(&reader, width, height, viewport_height)?;
                         origin = resolve_origin(result, &mut origin_supported);
                     }
                     set_mouse_capture(
                         &mut raw_mode.mouse_capture,
-                        (app.is_viewing() || editor_mouse) && origin.is_some(),
+                        (app.is_viewing() || app.editor().is_some() || editor_mouse)
+                            && origin.is_some(),
                         &mut io::stderr(),
                     )?;
                     redraw = true;
@@ -748,14 +784,20 @@ fn set_mouse_capture(active: &mut bool, wanted: bool, writer: &mut impl Write) -
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MouseDrag {
+    Scroll(u16),
+    Selection,
+}
+
 fn handle_viewer_mouse(
     app: &mut App,
     area: Rect,
     origin: Option<u16>,
     mouse: MouseEvent,
-    drag: &mut Option<u16>,
+    drag: &mut Option<MouseDrag>,
 ) -> bool {
-    if !app.is_viewing() {
+    if !app.is_viewing() && app.editor().is_none() {
         *drag = None;
         return false;
     }
@@ -769,58 +811,88 @@ fn handle_viewer_mouse(
     };
     let row = mouse.row.saturating_sub(origin);
     let inside = mouse.row >= origin && row < area.height && mouse.column < area.width;
-    let container = if area.height < 3 {
+    let editing = app.editor().is_some();
+    let container = if editing {
+        de::editor_body(app, area)
+    } else if area.height < 3 {
         area
     } else {
         Rect::new(area.x, area.y + 1, area.width, area.height - 2)
     };
     let point = ratatui::layout::Position::new(mouse.column, row);
+    let bar = if editing {
+        de::editor_scrollbar(app, area)
+    } else {
+        viewer_scrollbar(app, area)
+    };
+    let current = bar.map_or(app.viewer_scroll(), |bar| bar.offset);
+    let set_scroll = |app: &mut App, scroll| {
+        if editing {
+            de::set_editor_scroll(app, scroll, area);
+        } else {
+            app.set_viewer_scroll(scroll);
+        }
+    };
     match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             if inside && container.contains(point) =>
         {
-            let step = if app.is_rendered_markdown_view() {
+            let step = if !editing && app.is_rendered_markdown_view() {
                 app.markdown_scroll_step()
             } else {
                 1
             }
             .saturating_mul(3);
-            let current = app.viewer_scroll();
-            let maximum = viewer_scroll_max(app, area);
+            let maximum = bar.map_or_else(|| viewer_scroll_max(app, area), |bar| bar.maximum);
             let next = if mouse.kind == MouseEventKind::ScrollUp {
                 current.saturating_sub(step)
             } else {
                 current.saturating_add(step)
             }
             .min(maximum);
-            app.set_viewer_scroll(next);
+            set_scroll(app, next);
             next != current
         }
         MouseEventKind::Down(MouseButton::Left) if inside => {
-            if let Some(bar) = viewer_scrollbar(app, area)
+            if let Some(bar) = bar
                 && bar.track.contains(point)
             {
                 if bar.thumb.contains(point) {
-                    *drag = Some(row - bar.thumb.y);
+                    *drag = Some(MouseDrag::Scroll(row - bar.thumb.y));
                     return false;
                 }
                 let grab = bar.thumb.height / 2;
-                *drag = Some(grab);
+                *drag = Some(MouseDrag::Scroll(grab));
                 let next = bar.scroll_at(row, grab);
-                let changed = next != app.viewer_scroll();
-                app.set_viewer_scroll(next);
+                let changed = next != current;
+                set_scroll(app, next);
                 return changed;
+            }
+            if !editing && viewer_body(area).contains(point) {
+                let (width, height) = terminal_cell_pixels();
+                if let Some(byte) = app.viewer_hit_test(area, mouse.column, row, width, height) {
+                    app.begin_viewer_selection(byte);
+                    *drag = Some(MouseDrag::Selection);
+                    return true;
+                }
             }
             false
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(grab) = *drag
-                && let Some(bar) = viewer_scrollbar(app, area)
+            if let Some(MouseDrag::Scroll(grab)) = *drag
+                && let Some(bar) = bar
             {
                 let next = bar.scroll_at(row, grab);
-                let changed = next != app.viewer_scroll();
-                app.set_viewer_scroll(next);
+                let changed = next != current;
+                set_scroll(app, next);
                 return changed;
+            }
+            if matches!(drag, Some(MouseDrag::Selection)) && !editing {
+                let (width, height) = terminal_cell_pixels();
+                if let Some(byte) = app.viewer_hit_test(area, mouse.column, row, width, height) {
+                    app.extend_viewer_selection(byte);
+                    return true;
+                }
             }
             false
         }
@@ -941,7 +1013,7 @@ fn desired_viewport_height(
     terminal_height: u16,
     min_height: u16,
 ) -> u16 {
-    if app.is_viewing() {
+    if app.is_viewing() || app.editor().is_some() {
         return terminal_height.saturating_sub(1).clamp(1, 30);
     }
     let status_row = usize::from(app.status().is_some());
@@ -983,8 +1055,40 @@ fn visible_entry_rows(app: &App, terminal_width: u16, viewport_height: u16) -> u
 }
 
 fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResult {
+    if app.editor().is_some() {
+        app.handle_editor_key(key, page_rows);
+        return NavigationResult::Continue;
+    }
+    if app.is_viewing()
+        && ((!app.find_prompt() && key.code == KeyCode::Char('y'))
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('c')
+                && app.has_viewer_selection()))
+    {
+        if let Err(error) = app.copy_viewer_selection(&mut io::stderr()) {
+            app.set_status(format!("Cannot send clipboard: {error}"));
+        }
+        return NavigationResult::Continue;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return NavigationResult::Cancel;
+    }
+    if app.is_viewing() && app.find_prompt() {
+        match key.code {
+            KeyCode::Escape => app.finish_find(true),
+            KeyCode::Enter => app.finish_find(false),
+            KeyCode::Backspace => app.pop_find_char(),
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                app.push_find_char(ch)
+            }
+            _ => {}
+        }
+        return NavigationResult::Continue;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g') {
+        return app.accept_current();
     }
 
     if app.is_viewing() {
@@ -1008,12 +1112,16 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::Char('o') => return app.open_selected(),
             KeyCode::Char('m') => app.toggle_markdown_source(),
             KeyCode::Char('R') => app.toggle_reading(),
+            KeyCode::Char('e') => app.open_editor(),
+            KeyCode::Char('/') => app.begin_find(),
+            KeyCode::Char('n') => app.next_match(false),
+            KeyCode::Char('N') => app.next_match(true),
             _ => {}
         }
         return NavigationResult::Continue;
     }
 
-    if app.is_filtering() {
+    if app.is_searching() {
         match key.code {
             KeyCode::Up => app.move_up(),
             KeyCode::Down => app.move_down(),
@@ -1023,13 +1131,13 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::End => app.move_last(),
             KeyCode::Right | KeyCode::Tab => app.enter_selected(),
             KeyCode::Left => app.go_parent(),
-            KeyCode::Backspace => app.pop_filter_char(),
-            KeyCode::Enter => return app.accept(),
-            KeyCode::Escape => app.clear_filter(),
+            KeyCode::Backspace => app.pop_search_char(),
+            KeyCode::Enter => return app.activate_selected(),
+            KeyCode::Escape => app.cancel_search(),
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
-                app.push_filter_char(character);
+                app.push_search_char(character);
             }
             _ => {}
         }
@@ -1045,15 +1153,16 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
         KeyCode::End | KeyCode::Char('G') => app.move_last(),
         KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => app.enter_selected(),
         KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => app.go_parent(),
-        KeyCode::Char('/') => app.begin_filter(),
+        KeyCode::Char('/') => app.begin_search(),
         KeyCode::Char('s') => app.cycle_sort(),
         KeyCode::Char('S') => app.toggle_sort_direction(),
         KeyCode::Char('.') => app.toggle_hidden(),
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Char('w') => save_current_defaults(app),
         KeyCode::Char('v') => app.open_viewer(),
+        KeyCode::Char('e') => app.open_editor(),
         KeyCode::Char('o') => return app.open_selected(),
-        KeyCode::Enter => return app.accept(),
+        KeyCode::Enter => return app.activate_selected(),
         KeyCode::Escape | KeyCode::Char('q') => return NavigationResult::Cancel,
         _ => {}
     }
@@ -1147,6 +1256,7 @@ struct RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = execute!(io::stderr(), DisableBracketedPaste);
         if self.mouse_capture {
             let _ = execute!(io::stderr(), DisableMouseCapture);
         }
@@ -1345,7 +1455,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_enters_filter_mode_and_escape_clears_before_canceling() {
+    fn slash_starts_search_and_escape_restores_before_canceling() {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("source")).unwrap();
         fs::write(temp.path().join("notes.txt"), "notes").unwrap();
@@ -1353,20 +1463,20 @@ mod tests {
 
         let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, slash, 5), NavigationResult::Continue);
-        assert!(app.is_filtering());
+        assert!(app.is_searching());
 
         let character = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
         assert_eq!(
             handle_key(&mut app, character, 5),
             NavigationResult::Continue
         );
-        assert_eq!(app.filter_query(), "s");
-        assert_eq!(app.entries().len(), 2);
+        assert_eq!(app.search_query(), "s");
+        assert!(app.entries().is_empty());
 
         let escape = KeyEvent::new(KeyCode::Escape, KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, escape, 5), NavigationResult::Continue);
-        assert!(!app.is_filtering());
-        assert!(app.filter_query().is_empty());
+        assert!(!app.is_searching());
+        assert!(app.search_query().is_empty());
         assert_eq!(app.entries().len(), 2);
         assert_eq!(handle_key(&mut app, escape, 5), NavigationResult::Cancel);
     }
@@ -1396,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_o_opens_the_highlighted_file_and_enter_still_accepts_the_directory() {
+    fn enter_views_file_and_control_g_accepts_current_folder() {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("source")).unwrap();
         fs::write(temp.path().join("notes.txt"), "notes").unwrap();
@@ -1410,22 +1520,28 @@ mod tests {
         );
 
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(handle_key(&mut app, enter, 5), NavigationResult::Continue);
+        assert!(app.is_viewing());
         assert_eq!(
-            handle_key(&mut app, enter, 5),
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                5
+            ),
             NavigationResult::Accept(temp.path().to_path_buf())
         );
     }
 
     #[test]
-    fn o_remains_filter_text_while_filtering() {
+    fn o_remains_query_text_during_search() {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("notes.txt"), "notes").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        app.begin_filter();
+        app.begin_search();
 
         let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, open, 5), NavigationResult::Continue);
-        assert_eq!(app.filter_query(), "o");
+        assert_eq!(app.search_query(), "o");
     }
 
     #[test]
@@ -1534,6 +1650,156 @@ mod tests {
     }
 
     #[test]
+    fn viewer_drag_copies_original_tabs_clusters_and_newlines_without_gutters() {
+        let temp = tempdir().unwrap();
+        let source = "first\tCafe\u{301}\r\nsecond needle end\r\n";
+        fs::write(temp.path().join("notes.txt"), source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let area = Rect::new(0, 0, 50, 10);
+        let body = viewer_body(area);
+        let origin = 12;
+        let event = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: origin + y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut drag = None;
+        assert!(handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(origin),
+            event(
+                MouseEventKind::Down(MouseButton::Left),
+                body.x + 3 + 5,
+                body.y
+            ),
+            &mut drag
+        ));
+        assert!(handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(origin),
+            event(
+                MouseEventKind::Drag(MouseButton::Left),
+                body.x + 3 + 13,
+                body.y + 1
+            ),
+            &mut drag
+        ));
+        assert_eq!(
+            app.selected_viewer_text(),
+            Some("\tCafe\u{301}\r\nsecond needle")
+        );
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(origin),
+            event(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut drag,
+        );
+        assert!(drag.is_none());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
+            source
+        );
+    }
+
+    #[test]
+    fn editor_wheel_and_scrollbar_drag_keep_text_history_and_caret() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "line\n".repeat(100)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_editor();
+        let area = Rect::new(0, 0, 80, 12);
+        let body = de::editor_body(&app, area);
+        let origin = 14;
+        let event = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: origin + y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut drag = None;
+        let caret = app.editor().unwrap().cursor();
+        let revision = app.editor().unwrap().revision();
+        assert!(handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(origin),
+            event(MouseEventKind::ScrollDown, body.x + 1, body.y + 1),
+            &mut drag
+        ));
+        let bar = de::editor_scrollbar(&app, area).unwrap();
+        assert_eq!(bar.offset, 3);
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(origin),
+            event(
+                MouseEventKind::Down(MouseButton::Left),
+                bar.track.x,
+                bar.thumb.y,
+            ),
+            &mut drag,
+        );
+        handle_viewer_mouse(
+            &mut app,
+            area,
+            Some(origin),
+            event(
+                MouseEventKind::Drag(MouseButton::Left),
+                bar.track.x,
+                area.height + 20,
+            ),
+            &mut drag,
+        );
+        assert_eq!(
+            de::editor_scrollbar(&app, area).unwrap().offset,
+            bar.maximum
+        );
+        assert_eq!(app.editor().unwrap().cursor(), caret);
+        assert_eq!(app.editor().unwrap().revision(), revision);
+        assert!(!app.editor().unwrap().dirty());
+    }
+
+    #[test]
+    fn viewer_find_prompt_keeps_letters_local_and_escape_restores_scroll() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.txt"),
+            "zero\nneedle\nother NEEDLE\n",
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        app.set_viewer_scroll(1);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(&mut app, key(KeyCode::Char('/')), 4);
+        for ch in "needle".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)), 4);
+        }
+        assert!(app.editor().is_none());
+        assert!(app.find_status().unwrap().contains("1 / 2"));
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                4
+            ),
+            NavigationResult::Cancel
+        );
+        assert!(app.find_prompt());
+        handle_key(&mut app, key(KeyCode::Escape), 4);
+        assert!(app.is_viewing());
+        assert_eq!(app.viewer_scroll(), 1);
+        assert!(!app.find_prompt());
+        handle_key(&mut app, key(KeyCode::Escape), 4);
+        assert!(!app.is_viewing());
+    }
+
+    #[test]
     fn viewer_keys_keep_selection_and_scroll_without_navigating() {
         let temp = tempdir().unwrap();
         fs::write(
@@ -1560,17 +1826,17 @@ mod tests {
     }
 
     #[test]
-    fn v_is_filter_text_during_filter_input() {
+    fn v_remains_query_text_during_search() {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("view.txt"), "text").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        app.begin_filter();
+        app.begin_search();
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
             3,
         );
-        assert_eq!(app.filter_query(), "v");
+        assert_eq!(app.search_query(), "v");
         assert!(!app.is_viewing());
     }
 
@@ -1590,10 +1856,69 @@ mod tests {
         handle_key(&mut app, key('m'), 2);
         assert!(!app.is_markdown_source());
         handle_key(&mut app, key('q'), 2);
-        app.begin_filter();
+        app.begin_search();
         handle_key(&mut app, key('m'), 2);
-        assert_eq!(app.filter_query(), "m");
+        assert_eq!(app.search_query(), "m");
         assert!(!app.is_viewing());
+    }
+
+    #[test]
+    fn editor_routes_control_c_and_plain_picker_letters_to_buffer() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        fs::write(&path, "original").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(&mut app, key(KeyCode::Char('e')), 5);
+        assert!(app.editor().is_some());
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                5
+            ),
+            NavigationResult::Continue
+        );
+        handle_key(&mut app, key(KeyCode::Char('q')), 5);
+        assert!(app.editor().unwrap().lines()[0].starts_with('q'));
+        app.paste("λ\r\npasted");
+        assert_eq!(app.editor().unwrap().lines().len(), 2);
+        assert_eq!(fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn enter_selects_child_and_empty_enter_never_accepts() {
+        let temp = tempdir().unwrap();
+        let child = temp.path().join("empty");
+        fs::create_dir(&child).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            handle_key(&mut app, enter, 3),
+            NavigationResult::Accept(child.clone())
+        );
+        app.enter_selected();
+        assert_eq!(handle_key(&mut app, enter, 3), NavigationResult::Continue);
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                3
+            ),
+            NavigationResult::Accept(child)
+        );
+        app.begin_search();
+        app.push_search_char('z');
+        assert_eq!(handle_key(&mut app, enter, 3), NavigationResult::Continue);
+        assert_eq!(
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Escape, KeyModifiers::NONE),
+                3
+            ),
+            NavigationResult::Continue
+        );
+        assert!(!app.is_searching());
     }
 
     #[test]

@@ -24,7 +24,7 @@ pub(super) fn resolve(options: &SvgOptions) -> Geometry {
     let width = bounded(
         options.max_width_pt,
         612.0,
-        144.0,
+        1.0,
         14_400.0,
         "poster width",
         &mut warnings,
@@ -112,14 +112,16 @@ pub(super) fn resolve(options: &SvgOptions) -> Geometry {
         &mut warnings,
     );
     // Honour asymmetric margins whenever they fit. On a narrow poster reduce
-    // them proportionally, preserving at least 72pt for actual document content.
-    let available = width - 72.0;
+    // them proportionally, preserving 72pt of content or the whole page when
+    // it is narrower. Never create negative margins or zoom the typography.
+    let content_width = width.min(72.0);
+    let available = width - content_width;
     if left + right > available {
         left = available * (left / (left + right));
         right = available - left;
         adjusted(
             &mut warnings,
-            "horizontal margins reduced to retain 72pt of content",
+            "horizontal margins reduced to retain the available content width",
         );
     }
     Geometry {

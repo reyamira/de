@@ -262,6 +262,121 @@ fn image_boxes_fit_width_preserve_ratio_and_reserve_vertical_space() {
 }
 
 #[test]
+fn generated_figures_fill_content_width_preserve_ratio_and_reserve_page_flow() {
+    for code in [
+        "flowchart LR\n A[Alpha] --> B[Beta]",
+        "sequenceDiagram\n participant A as Alpha\n participant B as Beta\n A->>B: Hello\n B-->>A: Ready",
+        "pie title Storage\n \"Used\" : 3\n \"Free\" : 1",
+    ] {
+        let (svg, _) = franken_markdown::diagrams::figure_svg(code, "mermaid").unwrap();
+        let (_, intrinsic_width, intrinsic_height) = inspect(svg.as_bytes()).unwrap();
+        let mut dimensions = Vec::new();
+        for width in [96.0, 960.0] {
+            let mut options = SvgOptions {
+                max_width_pt: width,
+                ..Default::default()
+            };
+            options.theme.page.margins.left_pt = 12.0;
+            options.theme.page.margins.right_pt = 12.0;
+            let mut p = Poster::new(&options);
+            let l = p.content_left();
+            let r = p.content_right();
+            let top = p.y;
+            p.block(
+                &Block::CodeBlock {
+                    lang: Some("mermaid".into()),
+                    code: code.into(),
+                },
+                l,
+                r,
+                false,
+            );
+            let (figure_width, figure_height, bottom) = match p.ops.as_slice() {
+                [Op::Image { run, x, y }] => {
+                    assert!((*x - l).abs() < 0.00001);
+                    assert!((*y - top).abs() < 0.00001);
+                    assert!((run.width - (r - l)).abs() < 0.00001);
+                    assert!(
+                        (run.height / run.width - intrinsic_height / intrinsic_width).abs()
+                            < 0.00001
+                    );
+                    assert!(x + run.width <= p.width);
+                    (run.width, run.height, y + run.height)
+                }
+                _ => panic!("supported figure did not produce one image: {code}"),
+            };
+            assert!(p.y > bottom);
+            p.paragraph(&[Inline::Text("After".into())], l, r, false);
+            let glyphs: Vec<_> = p
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Glyph { y, size, .. } => Some((*y, *size)),
+                    _ => None,
+                })
+                .collect();
+            assert!(!glyphs.is_empty());
+            assert!(glyphs.iter().all(|(y, size)| *y > bottom && *size == 11.0));
+            assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+            dimensions.push((figure_width, figure_height));
+        }
+        assert!(dimensions[1].0 > dimensions[0].0);
+        assert!(dimensions[1].1 > dimensions[0].1);
+        assert!(
+            dimensions[1].0 > intrinsic_width,
+            "wide figure must grow: {code}"
+        );
+    }
+}
+
+#[test]
+fn generated_figure_sizing_does_not_enlarge_ordinary_svg_or_raster_images() {
+    let assets = [
+        PdfImageAsset::new(
+            "vector",
+            br#"<svg width="20pt" height="10pt"><rect width="20" height="10"/></svg>"#.to_vec(),
+        ),
+        PdfImageAsset::new("raster", png(20, 10)),
+    ];
+    for width in [96.0, 960.0] {
+        let options = SvgOptions {
+            max_width_pt: width,
+            ..Default::default()
+        };
+        let mut p = Poster::new(&options)
+            .with_resources(&FontAssets::default(), &assets)
+            .unwrap();
+        let l = p.content_left();
+        let r = p.content_right();
+        p.block(
+            &Block::CodeBlock {
+                lang: Some("mermaid".into()),
+                code: "flowchart LR\n A --> B".into(),
+            },
+            l,
+            r,
+            false,
+        );
+        let figure_bottom = p.y;
+        p.paragraph(&[image("vector", "vector")], l, r, false);
+        p.paragraph(&[image("raster", "raster")], l, r, false);
+        let images: Vec<_> = p
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Image { run, y, .. } => Some((run.width, run.height, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 3);
+        assert_eq!((images[1].0, images[1].1), (20.0, 10.0));
+        assert_eq!((images[2].0, images[2].1), (15.0, 7.5));
+        assert!(images[1].2 >= figure_bottom);
+        assert!(images[2].2 > images[1].2 + images[1].1);
+    }
+}
+
+#[test]
 fn table_image_height_is_preserved_and_failures_warn_only_at_paint() {
     let mut p = Poster::new(&SvgOptions::default())
         .with_resources(

@@ -16,10 +16,15 @@ Return to the [README](../README.md) for installation and usage. See the [releas
   version, subcommand, and error output.
 - [toml_edit](https://docs.rs/toml_edit/) reads and updates configuration while
   retaining the user's formatting and comments.
+- [ignore](https://docs.rs/ignore/) walks recursive search paths with ignore rules.
+- [unicode-segmentation](https://docs.rs/unicode-segmentation/) keeps editor movement on grapheme boundaries.
 
 The small relative-coordinate backend in `src/backend.rs` keeps the picker inline.
 Keyboard navigation does not require cursor-position queries.
 Mouse controls use an optional query to locate the viewer within the terminal.
+The editor uses the same input reader and inline surface.
+Text entry enables bracketed paste; exit disables it.
+Search and editor code never write selected-path data to stdout.
 
 The rendered viewer uses the FMD SVG backend in `vendor/franken-markdown`.
 Local changes support independent heading and code fonts, sizes, and theme colors.

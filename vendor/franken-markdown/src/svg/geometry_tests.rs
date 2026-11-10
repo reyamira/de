@@ -205,6 +205,26 @@ fn narrow_posters_reduce_margins_proportionally_not_to_a_fixed_gutter() {
 }
 
 #[test]
+fn sub_144_point_pages_reflow_without_negative_margins_or_scaled_text() {
+    for width in [1.0, 48.0, 96.0, 143.0] {
+        let mut p = Poster::new(&SvgOptions {
+            max_width_pt: width,
+            ..Default::default()
+        });
+        close(p.width, f64::from(width));
+        assert!(p.margin_left >= 0.0 && p.margin_right >= 0.0);
+        let l = p.content_left();
+        let r = p.content_right();
+        close(r - l, f64::from(width.min(72.0)));
+        p.paragraph(&[Inline::Text("A".into())], l, r, false);
+        let actual = glyphs(&p);
+        assert_eq!(actual.len(), 1);
+        close(actual[0].1, l);
+        close(actual[0].3, 11.0);
+    }
+}
+
+#[test]
 fn invalid_theme_numbers_have_finite_deterministic_fallbacks() {
     let mut opts = options(1.0);
     opts.max_width_pt = f32::INFINITY;
@@ -461,4 +481,39 @@ fn zero_margin_empty_document_still_has_a_positive_viewbox() {
             .unwrap()
             .contains("viewBox=\"0 0 612.00 1.00\"")
     );
+}
+
+#[test]
+fn repurposed_word_text_cannot_give_a_decorative_marker_source_geometry() {
+    let source = String::from("anchor");
+    let mut poster = Poster::new(&SvgOptions::default());
+    let pieces = [poster.text_piece(&source, RStyle::BODY)];
+    let mut line = poster.wrap(&pieces, 11.0, 400.0).remove(0);
+    poster.draw_words(&line, 0.0, 20.0, 11.0);
+
+    // Reuse the same owned buffer deliberately. Its new content is decoration,
+    // as in a non-hanging list marker, not another source-text occurrence.
+    let mut decoration = line.remove(0).text;
+    decoration.clear();
+    decoration.push_str("marker");
+    poster.y = 80.0;
+    poster.text_lines(
+        &[Piece::Text(decoration, RStyle::BODY)],
+        11.0,
+        0.0,
+        400.0,
+        false,
+        0.0,
+    );
+    assert!(
+        poster
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Glyph { y, .. } if *y >= 80.0))
+    );
+    let text = std::mem::take(poster.text.get_mut()).finish();
+    assert_eq!(text.text(), "anchor");
+    let rectangles = text.rectangles(&(0..6));
+    assert!(!rectangles.is_empty());
+    assert!(rectangles.iter().all(|rect| rect.y + rect.height < 40.0));
 }

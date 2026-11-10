@@ -2,14 +2,20 @@ mod app;
 pub mod backend;
 mod config;
 pub mod document;
+pub mod editor;
 mod fmd_assets;
 mod fmd_diagram;
+#[path = "../vendor/franken-markdown/src/parse/mod.rs"]
+mod fmd_parse;
 #[path = "../vendor/franken-markdown/src/svg.rs"]
 mod fmd_svg;
 mod image_loader;
 mod markdown_renderer;
+pub(crate) mod matching;
 pub mod media;
 pub mod render_theme;
+mod rendered_text;
+pub mod search;
 mod settings;
 #[path = "../vendor/franken-markdown/src/table_format.rs"]
 mod table_format;
@@ -28,8 +34,9 @@ pub use theme::{
 };
 pub use ui::{
     CONFIG_PICKER_MIN_HEIGHT, TWO_PANE_MIN_WIDTH, ViewerScrollBar, browser_sample_page_rows,
-    browser_sample_scroll_max, preview_image_area, render, render_config_picker,
-    render_theme_preview, viewer_body, viewer_page_rows, viewer_scroll_max, viewer_scrollbar,
+    browser_sample_scroll_max, editor_body, editor_page_rows, editor_scrollbar, preview_image_area,
+    render, render_config_picker, render_theme_preview, resume_editor_cursor, set_editor_scroll,
+    viewer_body, viewer_page_rows, viewer_scroll_max, viewer_scrollbar,
 };
 
 use std::ffi::OsStr;

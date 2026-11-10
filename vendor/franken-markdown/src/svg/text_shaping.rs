@@ -70,6 +70,41 @@ pub(in super::super) struct ShapedText {
 }
 
 impl ShapedText {
+    /// Record the very clusters retained by the actual line painter.
+    pub(in super::super) fn record(
+        &self,
+        poster: &Poster,
+        logical: &crate::rendered_text::TextMap,
+        x: f64,
+        top: f64,
+        height: f64,
+    ) {
+        let mut pen = x;
+        let q = |value: f64| ((value * 100.0).round() / 100.0) as f32;
+        let mut layout = poster.text.borrow_mut();
+        for (index, cluster) in self.clusters.iter().enumerate() {
+            let advance = cluster.advance
+                - if index + 1 == self.clusters.len() {
+                    cluster.trailing_kern
+                } else {
+                    0.0
+                };
+            let left = q(pen);
+            let right = q(pen + advance);
+            layout.record(
+                logical,
+                cluster.bytes.clone(),
+                crate::rendered_text::TextRect {
+                    x: left,
+                    y: q(top),
+                    width: right - left,
+                    height: q(top + height) - q(top),
+                },
+            );
+            pen += advance;
+        }
+    }
+
     /// Position of a retained glyph cluster, including the preceding pair
     /// adjustment and its actual paint offset. A virtual integer anchor omits
     /// the outgoing adjustment to a following suffix instead.

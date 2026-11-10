@@ -293,6 +293,35 @@ fn render_picker(frame: &mut Frame<'_>, app: &App, theme_preview: bool) {
 fn render_picker_in(frame: &mut Frame<'_>, app: &App, theme_preview: bool, area: Rect) {
     let palette = app.theme().palette();
     let now = SystemTime::now();
+    if app.editor().is_some() {
+        let editor_area = file_editor_area(app, area);
+        if editor_area != area {
+            frame.render_widget(Clear, area);
+            let [header, body, footer] = picker_areas(area);
+            render_header(frame, app, header, &palette, " de ");
+            let [left, divider, _] = picker_panes(body);
+            render_current_entries(frame, app, left, true, &palette, now);
+            frame.render_widget(
+                Paragraph::new(
+                    (0..divider.height)
+                        .map(|_| Line::styled("│", muted_style(&palette)))
+                        .collect::<Vec<_>>(),
+                ),
+                divider,
+            );
+            let editor = app.editor().unwrap();
+            let status = if editor.confirming() {
+                " Save changes? s Save · d Discard · c/Esc Cancel"
+            } else {
+                editor.message().unwrap_or(
+                    " Editing preview · ^S save · Esc back · Shift+arrows select · ^Z undo",
+                )
+            };
+            frame.render_widget(Paragraph::new(status).style(muted_style(&palette)), footer);
+        }
+        render_file_editor(frame, app, editor_area, &palette);
+        return;
+    }
     frame.render_widget(Clear, area);
 
     if app.is_viewing() {
@@ -319,12 +348,7 @@ fn render_picker_in(frame: &mut Frame<'_>, app: &App, theme_preview: bool, area:
         return;
     }
 
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    let [header, body, footer] = picker_areas(area);
 
     let badge = if theme_preview { " de theme " } else { " de " };
     render_header(frame, app, header, &palette, badge);
@@ -338,6 +362,107 @@ fn render_picker_in(frame: &mut Frame<'_>, app: &App, theme_preview: bool, area:
     } else {
         render_footer(frame, app, footer, &palette);
     }
+}
+
+fn picker_areas(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area)
+}
+
+fn file_editor_area(app: &App, area: Rect) -> Rect {
+    if !app.is_viewing() && area.width >= TWO_PANE_MIN_WIDTH && area.height >= 5 {
+        picker_panes(picker_areas(area)[1])[2]
+    } else {
+        area
+    }
+}
+
+fn file_editor_areas(app: &App, area: Rect) -> [Rect; 3] {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(u16::from(area.height >= 2)),
+    ])
+    .areas(area);
+    let body = if app.is_viewing() {
+        viewer_body(area).intersection(body)
+    } else {
+        Rect {
+            width: body.width.saturating_sub(u16::from(body.width >= 2)),
+            ..body
+        }
+    };
+    [header, body, footer]
+}
+
+fn file_editor_track(app: &App, area: Rect, body: Rect) -> Option<Rect> {
+    if app.is_viewing() {
+        viewer_track(area)
+    } else {
+        (area.width >= 2 && !body.is_empty())
+            .then(|| Rect::new(body.right(), body.y, 1, body.height))
+    }
+}
+
+/// Movement uses the editor's real text body, including the preview-pane chrome.
+pub fn editor_page_rows(app: &App, area: Rect) -> usize {
+    file_editor_areas(app, file_editor_area(app, area))[1]
+        .height
+        .max(1) as usize
+}
+
+pub fn editor_body(app: &App, area: Rect) -> Rect {
+    file_editor_areas(app, file_editor_area(app, area))[1]
+}
+
+pub fn resume_editor_cursor(app: &App) {
+    if let Some(text) = app.editor_cache().borrow_mut().as_mut() {
+        text.manual_scroll = false;
+    }
+}
+
+pub fn set_editor_scroll(app: &App, scroll: usize, area: Rect) {
+    if let Some(bar) = editor_scrollbar(app, area)
+        && let Some(text) = app.editor_cache().borrow_mut().as_mut()
+    {
+        text.scroll = scroll.min(bar.maximum);
+        text.manual_scroll = true;
+    }
+}
+
+pub fn editor_scrollbar(app: &App, area: Rect) -> Option<ViewerScrollBar> {
+    let editor = app.editor()?;
+    let area = file_editor_area(app, area);
+    let body = file_editor_areas(app, area)[1];
+    if body.is_empty() {
+        return None;
+    }
+    let track =
+        file_editor_track(app, area, body).unwrap_or(Rect::new(body.x, body.y, 0, body.height));
+    let gutter = source_gutter_width(editor.lines().len(), body.width);
+    let mut cache = app.editor_cache().borrow_mut();
+    let text = cache.get_or_insert_with(EditorText::new);
+    text.update(
+        editor,
+        body.width.saturating_sub(gutter).max(1),
+        &app.theme().palette(),
+    );
+    let maximum = text
+        .lines
+        .iter()
+        .map(|line| line.rows.len())
+        .sum::<usize>()
+        .saturating_sub(body.height as usize);
+    Some(scrollbar_geometry(
+        track,
+        text.scroll,
+        maximum,
+        body.height as usize,
+    ))
 }
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette, badge: &str) {
@@ -424,9 +549,21 @@ fn render_current_entries(
     let offset = app.selected().saturating_add(1).saturating_sub(entry_rows);
 
     if app.entries().is_empty() && lines.len() < list.height as usize {
-        lines.push(Line::styled("  (empty)", muted_style(palette)));
+        lines.push(Line::styled(
+            if app.is_searching() {
+                if app.search_pending() {
+                    "  Searching…"
+                } else {
+                    "  No matches"
+                }
+            } else {
+                "  (empty)"
+            },
+            muted_style(palette),
+        ));
     }
 
+    let matcher = crate::matching::LiteralMatcher::new(app.search_query());
     for (index, entry) in app
         .entries()
         .iter()
@@ -436,20 +573,37 @@ fn render_current_entries(
     {
         let selected = index == app.selected();
         let prefix = if selected { "› " } else { "  " };
-        let text = entry_row(
-            prefix,
-            entry,
-            list.width as usize,
-            modified_width,
-            app.display_settings(),
-            now,
-        );
+        let (text, first_match) = if let Some(hit) = app.search_hit(index) {
+            search_result_row(prefix, &entry.display_name(), hit, list.width as usize)
+        } else {
+            (
+                entry_row(
+                    prefix,
+                    entry,
+                    list.width as usize,
+                    modified_width,
+                    app.display_settings(),
+                    now,
+                ),
+                None,
+            )
+        };
         let style = if selected {
             emphasis_style(palette)
         } else {
             entry_style(entry, palette)
         };
-        lines.push(Line::styled(text, style));
+        if app.is_searching() {
+            lines.push(literal_highlight_line(
+                text,
+                style,
+                palette,
+                &matcher,
+                first_match,
+            ));
+        } else {
+            lines.push(Line::styled(text, style));
+        }
     }
     frame.render_widget(Paragraph::new(lines), list);
 }
@@ -478,8 +632,31 @@ fn render_preview(
     );
 
     if app.preview().document().is_some() || app.preview().message().is_some() {
-        let (lines, _) =
-            preview_text_lines(app, list.width, palette, 0, list.height as usize, false);
+        let cached = viewer_text(app, list.width, palette);
+        let preview_matches = &cached.browser_matches;
+        let offset = app
+            .search_hit(app.selected())
+            .and_then(|hit| {
+                let line = hit.line?;
+                let start = app.preview().document().and_then(|doc| {
+                    crate::document::logical_lines(&doc.source)
+                        .nth(line - 1)
+                        .map(|text| text.as_ptr() as usize - doc.source.as_ptr() as usize)
+                })?;
+                let byte = start + hit.first_match.start;
+                Some(
+                    cached
+                        .geometry
+                        .iter()
+                        .position(|cells| cells.iter().any(|cell| cell.bytes.contains(&byte)))
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or(0);
+        let lines: Vec<_> = (offset..cached.rows.len())
+            .take(list.height as usize)
+            .map(|row| highlighted_source_row(app, &cached, row, palette, preview_matches))
+            .collect();
         frame.render_widget(Paragraph::new(lines), list);
         return;
     }
@@ -687,6 +864,16 @@ fn preview_text_lines(
         .document()
         .map(|document| document.lines.as_slice())
         .unwrap_or(&[]);
+    if !app.is_reading()
+        && app
+            .preview()
+            .document()
+            .is_some_and(|document| document.source_lines)
+    {
+        let (rows, _) = numbered_source_rows(&notices, document_lines, width, palette);
+        let count = rows.len();
+        return (rows.into_iter().skip(offset).take(limit).collect(), count);
+    }
     if app.is_reading() {
         let paragraphs = reading_lines(document_lines);
         wrap_text_lines(
@@ -904,22 +1091,779 @@ impl WrappedRows {
 pub(crate) struct ViewerText {
     width: u16,
     reading: bool,
+    browser_query: String,
+    browser_matches: Vec<std::ops::Range<usize>>,
     rows: Vec<Line<'static>>,
+    source_rows: Vec<usize>,
+    geometry: Vec<Vec<SourceCell>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceCell {
+    bytes: std::ops::Range<usize>,
+    text: String,
+    style: Style,
+    width: usize,
+}
+
+fn source_geometry(
+    document: &crate::document::Document,
+    width: u16,
+    reading: bool,
+    notices: &[Line<'static>],
+    palette: &Palette,
+) -> (Vec<Line<'static>>, Vec<usize>, Vec<Vec<SourceCell>>) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let gutter = if reading {
+        0
+    } else {
+        source_gutter_width(document.lines.len(), width)
+    };
+    let capacity = width.saturating_sub(gutter).max(1) as usize;
+    let (mut rows, _) = wrap_text_lines(notices.iter(), width, 0, usize::MAX, true);
+    let mut sources = vec![0; rows.len()];
+    let mut geometry = vec![Vec::new(); rows.len()];
+    let mut paragraphs: Vec<(usize, Vec<SourceCell>)> = Vec::new();
+    let mut joining = false;
+    for (index, source) in crate::document::logical_lines(&document.source)
+        .take(document.lines.len())
+        .enumerate()
+    {
+        let offset = source.as_ptr() as usize - document.source.as_ptr() as usize;
+        let styles = &document.lines[index];
+        let mut display_byte = 0;
+        let mut cells = Vec::new();
+        for (byte, grapheme) in source.grapheme_indices(true) {
+            let mut text = String::with_capacity(grapheme.len());
+            for ch in grapheme.chars() {
+                match ch {
+                    '\t' => text.push_str("    "),
+                    ch if ch.is_control() => text.push('\u{fffd}'),
+                    ch => text.push(ch),
+                }
+            }
+            let mut span_end = 0;
+            let style = styles
+                .spans
+                .iter()
+                .find_map(|span| {
+                    span_end += span.content.len();
+                    (display_byte < span_end).then_some(styles.style.patch(span.style))
+                })
+                .unwrap_or_else(|| Style::default().fg(palette.text));
+            display_byte += text.len();
+            let cells_width = UnicodeWidthStr::width(text.as_str()).min(capacity);
+            cells.push(SourceCell {
+                bytes: offset + byte..offset + byte + grapheme.len(),
+                text,
+                style,
+                width: cells_width,
+            });
+        }
+        let prose = reading
+            && !source.trim().is_empty()
+            && !source.chars().next().is_some_and(char::is_whitespace);
+        if prose && joining {
+            let previous = &mut paragraphs.last_mut().unwrap().1;
+            while previous
+                .last()
+                .is_some_and(|cell| cell.text.chars().all(char::is_whitespace))
+            {
+                previous.pop();
+            }
+            let start = previous.last().map_or(offset, |cell| cell.bytes.end);
+            previous.push(SourceCell {
+                bytes: start..offset,
+                text: " ".into(),
+                style: Style::default().fg(palette.text),
+                width: 1,
+            });
+            previous.extend(cells);
+        } else {
+            paragraphs.push((index + 1, cells));
+        }
+        joining = prose;
+    }
+    for (line, mut cells) in paragraphs {
+        let mut wrapped: Vec<Vec<SourceCell>> = Vec::new();
+        let mut row = Vec::new();
+        let mut used = 0;
+        let mut position = 0;
+        let mut has_word = false;
+        while position < cells.len() {
+            let whitespace = cells[position].text.chars().all(char::is_whitespace);
+            let end = position
+                + cells[position..]
+                    .iter()
+                    .take_while(|cell| cell.text.chars().all(char::is_whitespace) == whitespace)
+                    .count();
+            let word_width = cells[position..end]
+                .iter()
+                .map(|cell| cell.width)
+                .sum::<usize>();
+            if !whitespace && has_word && used > 0 && used + word_width > capacity {
+                wrapped.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            for cell in &mut cells[position..end] {
+                if used > 0 && used + cell.width > capacity {
+                    wrapped.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                used += cell.width;
+                row.push(std::mem::take(cell));
+            }
+            has_word |= !whitespace;
+            position = end;
+        }
+        wrapped.push(row);
+        for (continuation, cells) in wrapped.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if gutter > 0 {
+                let label = if continuation == 0 {
+                    format!("{:>digits$} │", line, digits = gutter as usize - 2)
+                } else {
+                    " ".repeat(gutter as usize)
+                };
+                spans.push(Span::styled(label, muted_style(palette)));
+            }
+            spans.extend(
+                cells
+                    .iter()
+                    .map(|cell| Span::styled(cell.text.clone(), cell.style)),
+            );
+            rows.push(Line::from(spans));
+            sources.push(line);
+            geometry.push(cells);
+        }
+    }
+    (rows, sources, geometry)
+}
+
+pub(crate) fn source_hit_test(app: &App, width: u16, column: u16, row: usize) -> Option<usize> {
+    let cached = viewer_text(app, width, &app.theme().palette());
+    let cells = cached.geometry.get(row)?;
+    if cells.is_empty() {
+        let line = *cached.source_rows.get(row)?;
+        let source = &app.preview().document()?.source;
+        return crate::document::logical_lines(source)
+            .nth(line.checked_sub(1)?)
+            .map(|text| text.as_ptr() as usize - source.as_ptr() as usize);
+    }
+    let gutter = if app.is_reading() {
+        0
+    } else {
+        source_gutter_width(app.preview().document()?.lines.len(), width)
+    };
+    let mut x = column.saturating_sub(gutter) as usize;
+    for cell in cells {
+        if x.saturating_mul(2) < cell.width {
+            return Some(cell.bytes.start);
+        }
+        if x < cell.width {
+            return Some(cell.bytes.end);
+        }
+        x = x.saturating_sub(cell.width);
+    }
+    cells.last().map(|cell| cell.bytes.end)
+}
+
+pub(crate) fn source_byte_offset(app: &App, width: u16, byte: usize) -> usize {
+    let cached = viewer_text(app, width, &app.theme().palette());
+    cached
+        .geometry
+        .iter()
+        .position(|cells| cells.iter().any(|cell| cell.bytes.contains(&byte)))
+        .unwrap_or(0)
+}
+
+fn highlighted_source_row(
+    app: &App,
+    cached: &ViewerText,
+    row: usize,
+    palette: &Palette,
+    matches: &[std::ops::Range<usize>],
+) -> Line<'static> {
+    let Some(cells) = cached.geometry.get(row).filter(|cells| !cells.is_empty()) else {
+        return cached.rows[row].clone();
+    };
+    let mut spans = Vec::new();
+    let gutter = if app.is_reading() {
+        0
+    } else {
+        source_gutter_width(app.preview().document().unwrap().lines.len(), cached.width)
+    };
+    if gutter > 0 {
+        spans.push(cached.rows[row].spans[0].clone());
+    }
+    let selection = app.selection_range();
+    let active = app.active_match();
+    let overlaps =
+        |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| a.start < b.end && b.start < a.end;
+    for cell in cells {
+        let style = if selection
+            .as_ref()
+            .is_some_and(|range| overlaps(range, &cell.bytes))
+        {
+            emphasis_style(palette)
+        } else if active
+            .as_ref()
+            .is_some_and(|range| overlaps(range, &cell.bytes))
+        {
+            emphasis_style(palette).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else if matches
+            .get(matches.partition_point(|range| range.end <= cell.bytes.start))
+            .is_some_and(|range| range.start < cell.bytes.end)
+        {
+            cell.style
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            cell.style
+        };
+        spans.push(Span::styled(cell.text.clone(), style));
+    }
+    Line::from(spans)
+}
+
+fn literal_highlight_line(
+    text: String,
+    style: Style,
+    palette: &Palette,
+    matcher: &crate::matching::LiteralMatcher,
+    extra: Option<std::ops::Range<usize>>,
+) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut ranges = matcher.ranges(&text);
+    if let Some(extra) = extra {
+        ranges.push(extra);
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        let matched = ranges
+            .iter()
+            .any(|range| range.start < byte + grapheme.len() && byte < range.end);
+        let style = if matched {
+            style
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            style
+        };
+        if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
+            last.content.to_mut().push_str(grapheme);
+        } else {
+            spans.push(Span::styled(grapheme.to_owned(), style));
+        }
+    }
+    Line::from(spans)
+}
+
+fn search_result_row(
+    prefix: &str,
+    name: &str,
+    hit: &crate::search::SearchHit,
+    width: usize,
+) -> (String, Option<std::ops::Range<usize>>) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let available = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let location = hit
+        .line
+        .map_or_else(String::new, |line| format!(":{line}: "));
+    let label = if hit.line.is_some() {
+        shorten_left(name, available.saturating_sub(location.len()) / 3)
+    } else {
+        String::new()
+    };
+    let excerpt_width =
+        available.saturating_sub(UnicodeWidthStr::width(label.as_str()) + location.len());
+    let source = if hit.line.is_some() {
+        hit.excerpt.as_str()
+    } else {
+        name
+    };
+    let local_first = hit
+        .first_match
+        .start
+        .saturating_sub(hit.excerpt_start)
+        .min(source.len());
+    let mut window_start = source
+        .grapheme_indices(true)
+        .map(|(byte, _)| byte)
+        .take_while(|byte| *byte <= local_first)
+        .last()
+        .unwrap_or(0);
+    let mut context = 0;
+    for (byte, grapheme) in source[..window_start].grapheme_indices(true).rev() {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if context + cells > excerpt_width / 4 {
+            break;
+        }
+        context += cells;
+        window_start = byte;
+    }
+    let marker = if window_start > 0 { "…" } else { "" };
+    let excerpt = shorten_right(
+        &format!("{marker}{}", &source[window_start..]),
+        excerpt_width,
+    );
+    let base = prefix.len() + label.len() + location.len() + marker.len();
+    let first_start = hit.first_match.start.max(hit.excerpt_start + window_start);
+    let first_end = hit.first_match.end.min(hit.excerpt_start + source.len());
+    let extra = (first_start < first_end).then_some(
+        base + first_start - hit.excerpt_start - window_start
+            ..base + first_end - hit.excerpt_start - window_start,
+    );
+    (
+        fill_row(prefix, &format!("{label}{location}{excerpt}"), width),
+        extra,
+    )
+}
+
+/// Number only the first visual row of each original line.
+fn numbered_source_rows(
+    notices: &[Line<'static>],
+    lines: &[Line<'static>],
+    width: u16,
+    palette: &Palette,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let gutter = source_gutter_width(lines.len(), width);
+    let text_width = width.saturating_sub(gutter).max(1);
+    let (mut rows, _) = wrap_text_lines(notices.iter(), width, 0, usize::MAX, true);
+    let mut sources = vec![0; rows.len()];
+    for (index, line) in lines.iter().enumerate() {
+        let (wrapped, _) = wrap_text_lines(std::iter::once(line), text_width, 0, usize::MAX, true);
+        for (continuation, mut row) in wrapped.into_iter().enumerate() {
+            if gutter > 0 {
+                let label = if continuation == 0 {
+                    format!("{:>digits$} │", index + 1, digits = gutter as usize - 2)
+                } else {
+                    " ".repeat(gutter as usize)
+                };
+                row.spans
+                    .insert(0, Span::styled(label, muted_style(palette)));
+            }
+            rows.push(row);
+            sources.push(index + 1);
+        }
+    }
+    (rows, sources)
+}
+
+fn source_gutter_width(lines: usize, width: u16) -> u16 {
+    let wanted = lines.max(1).ilog10() as u16 + 3;
+    // On tiny surfaces the gutter must not consume the readable text area.
+    if width >= wanted.saturating_add(4) {
+        wanted
+    } else {
+        0
+    }
+}
+
+pub(crate) fn source_line_offset(app: &App, width: u16, line: usize) -> usize {
+    viewer_text(app, width, &app.theme().palette())
+        .source_rows
+        .iter()
+        .position(|source| *source == line)
+        .unwrap_or(0)
+}
+
+pub(crate) fn viewer_source_at_scroll(app: &App) -> Option<usize> {
+    let cache = app.viewer_text_cache().borrow();
+    cache
+        .as_ref()?
+        .source_rows
+        .get(app.viewer_scroll())
+        .copied()
+        .filter(|line| *line > 0)
+}
+
+#[derive(Debug)]
+struct EditorCell {
+    text: String,
+    start: usize,
+    end: usize,
+    width: usize,
+}
+
+#[derive(Debug, Default)]
+struct EditorRow {
+    cells: Vec<EditorCell>,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Default)]
+struct EditorLine {
+    source: String,
+    rows: Vec<EditorRow>,
+    terminated: bool,
+    styles: Vec<crate::document::SourceStyleRange>,
+    outgoing: Option<crate::document::SourceState>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EditorText {
+    width: u16,
+    revision: u64,
+    syntax: Option<crate::document::SourceSyntax>,
+    palette: Option<Palette>,
+    lines: Vec<EditorLine>,
+    scroll: usize,
+    manual_scroll: bool,
+}
+
+impl EditorLine {
+    fn style_at(&self, byte: usize, palette: &Palette) -> Style {
+        let index = self.styles.partition_point(|range| range.bytes.end <= byte);
+        self.styles
+            .get(index)
+            .filter(|range| range.bytes.contains(&byte))
+            .map_or_else(
+                || Style::default().fg(palette.syntax.text),
+                |range| range.style,
+            )
+    }
+}
+
+impl EditorText {
+    fn new() -> Self {
+        Self {
+            width: 0,
+            revision: u64::MAX,
+            syntax: None,
+            palette: None,
+            lines: Vec::new(),
+            scroll: 0,
+            manual_scroll: false,
+        }
+    }
+
+    fn update(&mut self, editor: &crate::editor::Editor, width: u16, palette: &Palette) {
+        let changed = self.revision != editor.revision();
+        let adjacent = self.syntax.is_some() && self.revision.wrapping_add(1) == editor.revision();
+        let syntax = match self.syntax {
+            Some(syntax) if !changed || (adjacent && editor.changed_line() != 0) => syntax,
+            _ => crate::document::SourceSyntax::for_path(
+                editor.path(),
+                editor.lines().first().map_or("", String::as_str),
+            ),
+        };
+        let restyle = self
+            .palette
+            .is_none_or(|old| old.syntax != palette.syntax || old.markdown != palette.markdown);
+        let reset = self.syntax != Some(syntax) || restyle || (changed && !adjacent);
+        let resized = self.width != width;
+        if changed || reset {
+            let first = if reset { 0 } else { editor.changed_line() };
+            // A replacement can change several lines with no net line-count change.
+            // Align the untouched tail, then locate all changed source before convergence.
+            if editor.lines().len() > self.lines.len() {
+                let gap = (first + 1).min(self.lines.len());
+                let extra = editor.lines().len() - self.lines.len();
+                self.lines.splice(
+                    gap..gap,
+                    std::iter::repeat_with(EditorLine::default).take(extra),
+                );
+            } else if editor.lines().len() < self.lines.len() {
+                let removed = self.lines.len() - editor.lines().len();
+                // Keep the old ending-line boundary beside the untouched tail.
+                // Keeping the starting line can falsely converge after a merged line.
+                self.lines.drain(first..first + removed);
+            }
+            let last = editor.lines().len() - 1;
+            let suffix = (first..editor.lines().len())
+                .rfind(|&index| {
+                    let cached = &self.lines[index];
+                    cached.outgoing.is_none()
+                        || cached.source != editor.lines()[index]
+                        || cached.terminated != (index < last)
+                })
+                .map_or(first, |index| index + 1);
+            let mut state = if first == 0 {
+                syntax.state()
+            } else {
+                self.lines[first - 1].outgoing.as_ref().unwrap().clone()
+            };
+            // Syntect's newline grammars need a break, but editor source excludes it.
+            // Reuse one scratch line rather than concatenate or copy the whole buffer.
+            let mut input = String::new();
+            for (index, source) in editor.lines().iter().enumerate().skip(first) {
+                let cached = &mut self.lines[index];
+                let terminated = index < last;
+                let same_source = cached.source == *source && cached.terminated == terminated;
+                let parser_input = if terminated {
+                    input.clear();
+                    input.push_str(source);
+                    input.push('\n');
+                    input.as_str()
+                } else {
+                    source.as_str()
+                };
+                let styles = state.line(parser_input, source.len(), palette);
+                let converged = same_source && cached.outgoing.as_ref() == Some(&state);
+                if cached.source != *source || cached.rows.is_empty() {
+                    cached.source.clone_from(source);
+                    if !resized {
+                        cached.rows = editor_line_rows(source, width as usize);
+                    }
+                }
+                cached.terminated = terminated;
+                cached.styles = styles;
+                if !converged {
+                    cached.outgoing = Some(state.clone());
+                }
+                if !reset && index >= suffix && converged {
+                    break;
+                }
+            }
+        }
+        if resized {
+            for cached in &mut self.lines {
+                cached.rows = editor_line_rows(&cached.source, width as usize);
+            }
+        }
+        self.width = width;
+        self.revision = editor.revision();
+        self.syntax = Some(syntax);
+        self.palette = Some(*palette);
+    }
+}
+
+fn editor_line_rows(source: &str, width: usize) -> Vec<EditorRow> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut rows = Vec::new();
+    let mut row = EditorRow::default();
+    let mut used = 0;
+    let mut source_column = 0;
+    for (start, grapheme) in source.grapheme_indices(true) {
+        let text = if grapheme == "\t" {
+            " ".repeat(
+                crate::editor::EDITOR_TAB_WIDTH - source_column % crate::editor::EDITOR_TAB_WIDTH,
+            )
+        } else {
+            grapheme
+                .chars()
+                .map(|ch| if ch.is_control() { '\u{fffd}' } else { ch })
+                .collect()
+        };
+        source_column += UnicodeWidthStr::width(text.as_str());
+        let cells = UnicodeWidthStr::width(text.as_str()).min(width);
+        if used > 0 && used + cells > width {
+            row.end = start;
+            rows.push(row);
+            row = EditorRow {
+                start,
+                ..EditorRow::default()
+            };
+            used = 0;
+        }
+        row.cells.push(EditorCell {
+            text,
+            start,
+            end: start + grapheme.len(),
+            width: cells,
+        });
+        row.end = start + grapheme.len();
+        used += cells;
+        if used >= width {
+            rows.push(row);
+            row = EditorRow {
+                start: start + grapheme.len(),
+                end: start + grapheme.len(),
+                ..EditorRow::default()
+            };
+            used = 0;
+        }
+    }
+    rows.push(row);
+    rows
+}
+
+fn render_file_editor(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+    let editor = app.editor().unwrap();
+    frame.render_widget(Clear, area);
+    if area.is_empty() {
+        return;
+    }
+    let [header, body, footer] = file_editor_areas(app, area);
+    if app.is_viewing() {
+        let outer = viewer_outer(area);
+        if viewer_inner(outer) != outer {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(muted_style(palette)),
+                outer,
+            );
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(shorten_left(
+            &format!(
+                " edit{} · {}",
+                if editor.dirty() { "*" } else { "" },
+                editor.path().display()
+            ),
+            header.width as usize,
+        ))
+        .style(
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        ),
+        header,
+    );
+    let gutter = source_gutter_width(editor.lines().len(), body.width);
+    let width = body.width.saturating_sub(gutter).max(1);
+    let mut cache = app.editor_cache().borrow_mut();
+    let text = cache.get_or_insert_with(EditorText::new);
+    text.update(editor, width, palette);
+    let (cursor_line, cursor_byte) = editor.cursor();
+    let mut cursor_row = 0;
+    let mut cursor_column = 0;
+    for (line, cached) in text.lines.iter().enumerate() {
+        if line == cursor_line {
+            let row = cached
+                .rows
+                .iter()
+                .rposition(|row| row.start <= cursor_byte)
+                .unwrap_or(0);
+            cursor_row += row;
+            cursor_column = cached.rows[row]
+                .cells
+                .iter()
+                .take_while(|cell| cell.end <= cursor_byte)
+                .map(|cell| cell.width)
+                .sum::<usize>();
+            break;
+        }
+        cursor_row += cached.rows.len();
+    }
+    if !text.manual_scroll {
+        if cursor_row < text.scroll {
+            text.scroll = cursor_row;
+        }
+        if cursor_row >= text.scroll.saturating_add(body.height as usize) {
+            text.scroll = cursor_row
+                .saturating_add(1)
+                .saturating_sub(body.height as usize);
+        }
+    }
+    let maximum = text
+        .lines
+        .iter()
+        .map(|line| line.rows.len())
+        .sum::<usize>()
+        .saturating_sub(body.height as usize);
+    text.scroll = text.scroll.min(maximum);
+    let selection = editor
+        .selection()
+        .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+    let mut visual = 0;
+    let mut visible = Vec::with_capacity(body.height as usize);
+    'lines: for (index, cached) in text.lines.iter().enumerate() {
+        for (continuation, row) in cached.rows.iter().enumerate() {
+            if visual >= text.scroll && visible.len() < body.height as usize {
+                let label = if gutter == 0 {
+                    String::new()
+                } else if continuation == 0 {
+                    format!("{:>digits$} │", index + 1, digits = gutter as usize - 2)
+                } else {
+                    " ".repeat(gutter as usize)
+                };
+                let mut spans = vec![Span::styled(label, muted_style(palette))];
+                spans.extend(row.cells.iter().map(|cell| {
+                    Span::styled(
+                        cell.text.clone(),
+                        if selection.is_some_and(|(a, b)| {
+                            (index, cell.start) >= a && (index, cell.start) < b
+                        }) {
+                            emphasis_style(palette)
+                        } else {
+                            cached.style_at(cell.start, palette)
+                        },
+                    )
+                }));
+                // A selected newline remains visible even when the line is empty.
+                if selection.is_some_and(|(a, b)| (index, row.end) >= a && (index, row.end) < b)
+                    && row.end == cached.source.len()
+                {
+                    spans.push(Span::styled(" ", emphasis_style(palette)));
+                }
+                visible.push(Line::from(spans));
+            }
+            visual += 1;
+            if visible.len() >= body.height as usize {
+                break 'lines;
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(visible), body);
+    if let Some(track) = file_editor_track(app, area, body) {
+        render_scrollbar(
+            frame,
+            scrollbar_geometry(track, text.scroll, maximum, body.height as usize),
+            palette,
+        );
+    }
+    if body.height > 0
+        && body.width > 0
+        && cursor_row >= text.scroll
+        && cursor_row < text.scroll + body.height as usize
+    {
+        frame.set_cursor_position((
+            body.x + gutter + (cursor_column as u16).min(width - 1),
+            body.y
+                + cursor_row
+                    .saturating_sub(text.scroll)
+                    .min(body.height as usize - 1) as u16,
+        ));
+    }
+    let hint = if editor.confirming() {
+        " Save changes?  s Save  d Discard  c/Esc Cancel"
+    } else {
+        " ^S save  Esc/^Q back  Shift+arrows select  ^Z undo  ^Y redo  ^C/^X/^V copy/cut/paste"
+    };
+    let status = editor.message().unwrap_or(hint);
+    frame.render_widget(Paragraph::new(status).style(muted_style(palette)), footer);
 }
 
 fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Ref<'a, ViewerText> {
     let reading = app.is_reading();
     let cache = app.viewer_text_cache();
-    let needs_rebuild = cache
-        .borrow()
-        .as_ref()
-        .is_none_or(|text| text.width != width || text.reading != reading);
+    let needs_rebuild = cache.borrow().as_ref().is_none_or(|text| {
+        text.width != width || text.reading != reading || text.browser_query != app.search_query()
+    });
     if needs_rebuild {
-        let (rows, _) = preview_text_lines(app, width, palette, 0, usize::MAX, true);
+        let (rows, source_rows, geometry) = if app
+            .preview()
+            .document()
+            .is_some_and(|document| document.source_lines)
+        {
+            let document = app.preview().document().unwrap();
+            let notices: Vec<_> = app
+                .preview()
+                .message()
+                .into_iter()
+                .chain(document.notice.as_deref())
+                .map(|text| Line::styled(text.to_owned(), muted_style(palette)))
+                .collect();
+            source_geometry(document, width, reading, &notices, palette)
+        } else {
+            let (rows, _) = preview_text_lines(app, width, palette, 0, usize::MAX, true);
+            (rows, Vec::new(), Vec::new())
+        };
         *cache.borrow_mut() = Some(ViewerText {
             width,
             reading,
             rows,
+            source_rows,
+            geometry,
+            browser_query: app.search_query().to_owned(),
+            browser_matches: app.preview().document().map_or_else(Vec::new, |doc| {
+                crate::matching::LiteralMatcher::new(app.search_query()).ranges(&doc.source)
+            }),
         });
     }
     std::cell::Ref::map(cache.borrow(), |cache| cache.as_ref().unwrap())
@@ -987,29 +1931,32 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             ),
             header,
         );
+        let find_status = app.find_status();
         frame.render_widget(
             Paragraph::new(if let Some(status) = app.status() {
+                status
+            } else if let Some(status) = find_status.as_deref() {
                 status
             } else if app.theme_sample() != crate::ThemeSample::Picker && footer.width >= 64 {
                 " tab sample  m mode  ←→/↑↓ theme  pg↑↓ scroll  enter save  esc cancel"
             } else if app.theme_sample() != crate::ThemeSample::Picker {
                 " tab sample  m mode  arrows theme  ↵ save  esc"
             } else if markdown && footer.width >= 64 {
-                " m source/rendered  q/esc back  ↑↓/jk scroll  pg↑↓ page  o open"
+                " / find  n/N next  y copy  e edit  m mode  q/esc back  ↑↓ scroll"
             } else if markdown && footer.width >= 32 {
-                " m mode  q/esc back  ↑↓  o open"
+                " e edit  m mode  q/esc back  ↑↓"
             } else if markdown {
-                "m mode  q back  ↑↓  o"
+                "e edit  m mode  q back"
             } else if app.supports_reading() && footer.width >= 42 {
-                " R reading/raw  q/esc back  ↑↓ scroll  o open"
+                " e edit  R reading/raw  q/esc back  ↑↓ scroll"
             } else if app.supports_reading() {
-                " R mode  q back  ↑↓"
+                " e edit  R mode  q back"
             } else if footer.width >= 55 {
-                " q/esc back  ↑↓/jk scroll  pg↑↓ page  home/end  o open"
+                " / find  n/N next  y copy  e edit  q/esc back  ↑↓ scroll"
             } else if footer.width >= 30 {
-                " q/esc back  ↑↓ scroll  o open"
+                " e edit  q/esc back  ↑↓"
             } else {
-                " q back  ↑↓  o open"
+                " e edit  q back"
             })
             .style(muted_style(palette)),
             footer,
@@ -1039,151 +1986,58 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         return;
     }
     let cached = viewer_text(app, body.width, palette);
-    let lines = cached
-        .rows
-        .iter()
-        .skip(app.viewer_scroll())
+    let lines = (app.viewer_scroll()..cached.rows.len())
         .take(body.height as usize)
-        .cloned()
+        .map(|row| highlighted_source_row(app, &cached, row, palette, app.viewer_matches()))
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), body);
 }
 
-fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
-    if app.is_filtering() {
-        let line = Line::from(vec![
-            key(" / ", palette),
-            hint("filter: ", palette),
-            Span::styled(
-                app.filter_query().to_owned(),
-                Style::default().fg(palette.text),
-            ),
-            Span::styled("▏", Style::default().fg(palette.accent)),
-            hint(
-                format!(
-                    "  {}/{} matches  esc clear",
-                    app.entries().len(),
-                    app.total_entry_count()
-                ),
-                palette,
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
+fn render_scrollbar(frame: &mut Frame<'_>, bar: ViewerScrollBar, palette: &Palette) {
+    let lines = (0..bar.track.height)
+        .map(|row| {
+            let y = bar.track.y + row;
+            if y >= bar.thumb.y && y < bar.thumb.bottom() {
+                Line::styled("┃", Style::default().fg(palette.accent))
+            } else {
+                Line::styled("│", muted_style(palette))
+            }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), bar.track);
+}
 
-    let hidden = if app.show_hidden() { "on" } else { "off" };
-    let sort = app.sort_mode().label();
-    let direction = app.sort_direction().symbol();
-    let line = if area.width >= 99 {
-        Line::from(vec![
-            key(" ↑↓", palette),
-            hint(" select  ", palette),
-            key("pg↑↓", palette),
-            hint(" jump  ", palette),
-            key("→", palette),
-            hint(" folder  ", palette),
-            key("←", palette),
-            hint(" parent  ", palette),
-            key("/", palette),
-            hint(" find  ", palette),
-            key("v", palette),
-            hint(" view  ", palette),
-            key("o", palette),
-            hint(" open  ", palette),
-            key("↵", palette),
-            hint(" go  ", palette),
-            key("s", palette),
-            hint(format!(" sort:{sort}{direction}  "), palette),
-            key(".", palette),
-            hint(format!(" hidden:{hidden}"), palette),
-        ])
+fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+    let line = if app.is_searching() {
+        format!(
+            " / {}▏  {}  {} hits · {} scanned{}  Esc restore",
+            app.search_query(),
+            if app.search_pending() {
+                "searching…"
+            } else {
+                "complete"
+            },
+            app.entries().len(),
+            app.search_scanned(),
+            if app.search_truncated() {
+                " · result limit"
+            } else {
+                ""
+            }
+        )
     } else if area.width >= 85 {
-        Line::from(vec![
-            key(" ↑↓", palette),
-            hint(" select  ", palette),
-            key("pg↑↓", palette),
-            hint(" jump  ", palette),
-            key("→", palette),
-            hint(" folder  ", palette),
-            key("←", palette),
-            hint(" parent  ", palette),
-            key("/", palette),
-            hint(" find  ", palette),
-            key("v", palette),
-            hint(" view  ", palette),
-            key("o", palette),
-            hint(" open  ", palette),
-            key("↵", palette),
-            hint(" go  ", palette),
-            key("s", palette),
-            hint(format!(" sort:{sort}{direction}"), palette),
-        ])
-    } else if area.width >= 57 {
-        Line::from(vec![
-            key(" ↑↓", palette),
-            hint("  ", palette),
-            key("pg↑↓", palette),
-            hint("  ", palette),
-            key("→", palette),
-            hint("dir  ", palette),
-            key("←", palette),
-            hint("back  ", palette),
-            key("/", palette),
-            hint("find  ", palette),
-            key("v", palette),
-            hint("view  ", palette),
-            key("o", palette),
-            hint("open  ", palette),
-            key("s", palette),
-            hint(format!(":{sort}{direction}  "), palette),
-            key("↵", palette),
-            hint("go", palette),
-        ])
-    } else if area.width >= 38 {
-        Line::from(vec![
-            key(" ↑↓", palette),
-            hint(" ", palette),
-            key("pg↑↓", palette),
-            hint(" ", palette),
-            key("/", palette),
-            hint("find ", palette),
-            key("v", palette),
-            hint("view ", palette),
-            key("o", palette),
-            hint("open ", palette),
-            key("s", palette),
-            hint(format!(":{sort}{direction} "), palette),
-            key("↵", palette),
-            hint("go", palette),
-        ])
-    } else if area.width >= 30 {
-        Line::from(vec![
-            key(" ↑↓", palette),
-            hint(" ", palette),
-            key("v", palette),
-            hint("view ", palette),
-            key("o", palette),
-            hint("open ", palette),
-            key("↵", palette),
-            hint("go ", palette),
-            key("→", palette),
-            hint("dir ", palette),
-            key("←", palette),
-            hint("back", palette),
-        ])
+        format!(
+            " ↑↓ select  → browse  ← parent  / search  e edit  ↵ choose/view  ^G current  s:{}{}  . hidden:{}",
+            app.sort_mode().label(),
+            app.sort_direction().symbol(),
+            if app.show_hidden() { "on" } else { "off" }
+        )
+    } else if area.width >= 48 {
+        " ↑↓  → browse  / search  e edit  ↵ choose/view  ^G current".to_owned()
     } else {
-        Line::from(vec![
-            key(" ↑↓ ", palette),
-            key("v", palette),
-            hint("view ", palette),
-            key("o", palette),
-            hint("open ", palette),
-            key("↵", palette),
-            hint("go", palette),
-        ])
+        " / find  e edit  ↵ choose/view  ^G here".to_owned()
     };
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(line).style(muted_style(palette)), area);
 }
 
 fn render_theme_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
@@ -1510,17 +2364,17 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+        let raw_rows = text(&app);
+        assert_eq!(raw_rows.len(), source.split('\n').count());
+        assert!(
+            raw_rows
+                .iter()
+                .zip(source.split('\n'))
+                .all(|(row, line)| row.ends_with(line))
+        );
         assert_eq!(
-            text(&app),
-            [
-                "alpha  ",
-                "beta",
-                "",
-                "  block one",
-                "  block two",
-                "gamma",
-                "delta"
-            ]
+            viewer_text(&app, viewer_body(area).width, &palette).source_rows,
+            (1..=7).collect::<Vec<_>>()
         );
         let raw_max = viewer_scroll_max(&app, area);
         app.set_viewer_scroll(raw_max);
@@ -1540,18 +2394,7 @@ mod tests {
         assert!(reading_max < raw_max);
         assert_eq!(viewer_scrollbar(&app, area).unwrap().maximum, reading_max);
         app.toggle_reading();
-        assert_eq!(
-            text(&app),
-            [
-                "alpha  ",
-                "beta",
-                "",
-                "  block one",
-                "  block two",
-                "gamma",
-                "delta"
-            ]
-        );
+        assert_eq!(text(&app), raw_rows);
         assert_eq!(
             fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
             source
@@ -1628,7 +2471,14 @@ mod tests {
         app.set_viewer_scroll(1);
         let mut terminal = Terminal::new(TestBackend::new(10, 6)).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
-        assert!(terminal.backend().to_string().contains("three"));
+        let body = viewer_body(area);
+        let cached = viewer_text(&app, body.width, &app.theme().palette());
+        let expected = cached.rows[1].to_string();
+        let actual: String = (body.x..body.right())
+            .map(|x| terminal.backend().buffer()[(x, body.y)].symbol())
+            .collect();
+        assert_eq!(actual.trim_end(), expected.trim_end());
+        drop(cached);
         assert_eq!(
             cached_rows,
             app.viewer_text_cache()
@@ -1747,20 +2597,22 @@ mod tests {
         fs::write(temp.path().join("notes.md"), "abcdefghij").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         app.open_viewer();
-        let area = Rect::new(0, 0, 8, 5);
+        let area = Rect::new(0, 0, 11, 5);
         assert!(viewer_scrollbar(&app, area).is_none());
         app.toggle_markdown_source();
         let bar = viewer_scrollbar(&app, area).unwrap();
-        assert_eq!(viewer_body(area).width, 5);
+        assert_eq!(viewer_body(area).width, 8);
         assert_eq!(bar.maximum, 1);
         assert_eq!(bar.viewport, 1);
-        let mut terminal = Terminal::new(TestBackend::new(8, 5)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(11, 5)).unwrap();
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let screen = terminal.backend().to_string();
-        assert!(screen.contains("abcde┃"));
+        assert!(screen.contains("1 │abcde┃"));
         app.set_viewer_scroll(1);
         terminal.draw(|frame| render(frame, &app)).unwrap();
-        assert!(terminal.backend().to_string().contains("fghij┃"));
+        let continued = terminal.backend().to_string();
+        assert!(continued.contains("   fghij┃"));
+        assert!(!continued.contains("1 │fghij"));
     }
 
     #[test]
@@ -1823,18 +2675,35 @@ mod tests {
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("current"));
         assert!(rendered.contains("next · project/"));
-        assert!(rendered.contains("modified"));
         assert!(rendered.contains("main.rs"));
         assert!(rendered.contains('│'));
-        assert!(rendered.contains("hidden:off"));
-        assert!(rendered.contains("sort:name↑"));
-        assert!(rendered.contains("o open"));
+        let [_, body, _] = picker_areas(Rect::new(0, 0, 100, 8));
+        let [left, _, right] = picker_panes(body);
+        let pane_text = |area: Rect| {
+            (area.y..area.bottom())
+                .map(|y| {
+                    (area.x..area.right())
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(pane_text(left).contains("project/"));
+        assert!(!pane_text(left).contains("main.rs"));
+        assert!(pane_text(right).contains("main.rs"));
     }
 
     #[test]
     fn narrow_render_collapses_to_one_pane_without_wrapping() {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("a-very-long-directory-name")).unwrap();
+        fs::write(
+            temp.path()
+                .join("a-very-long-directory-name/child-only.txt"),
+            "text",
+        )
+        .unwrap();
         let app = App::new(temp.path().to_path_buf()).unwrap();
         let backend = TestBackend::new(24, 5);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1843,31 +2712,689 @@ mod tests {
 
         let rendered = terminal.backend().to_string();
         assert_eq!(terminal.backend().buffer().area.width, 24);
-        assert!(rendered.contains("↵go"));
-        assert!(!rendered.contains("next ·"));
-        assert!(!rendered.contains("modified"));
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "›");
+        assert!(!rendered.contains("child-only.txt"));
+        for row in 2..4 {
+            assert!(
+                (0..24).all(|column| terminal.backend().buffer()[(column, row)].symbol() == " ")
+            );
+        }
     }
 
     #[test]
-    fn filter_mode_renders_the_query_and_match_count() {
+    fn search_footer_distinguishes_pending_and_complete_results() {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("Cargo-project")).unwrap();
         fs::write(temp.path().join("Cargo.toml"), "[package]").unwrap();
         fs::write(temp.path().join("README.md"), "hello").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        app.begin_filter();
+        app.begin_search();
         for character in "cargo".chars() {
-            app.push_filter_char(character);
+            app.push_search_char(character);
         }
         let backend = TestBackend::new(78, 8);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
+        let pending = terminal.backend().to_string();
+        assert!(pending.contains("cargo"));
+        assert!(!pending.contains("(empty)"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.search_pending() {
+            app.poll_search();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        app.poll_search();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
 
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("filter: cargo"));
-        assert!(rendered.contains("2/3 matches"));
+        assert!(rendered.contains("/ cargo"));
+        assert!(rendered.contains("complete") && rendered.contains("2 hits"));
         assert!(!rendered.contains("README.md"));
+    }
+
+    #[test]
+    fn picker_editor_keeps_wide_directory_pane_and_uses_real_body_geometry() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("keep-listed.txt"), "other").unwrap();
+        fs::write(
+            temp.path().join("notes.txt"),
+            (0..40)
+                .map(|line| format!("line-{line:02}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        for width in [TWO_PANE_MIN_WIDTH - 1, TWO_PANE_MIN_WIDTH, 100] {
+            let mut app = App::new(temp.path().to_path_buf()).unwrap();
+            app.move_last();
+            app.open_editor();
+            let area = Rect::new(0, 0, width, 12);
+            let editor_area = file_editor_area(&app, area);
+            let body = file_editor_areas(&app, editor_area)[1];
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let rendered = terminal.backend().to_string();
+            assert_eq!(
+                rendered.contains("keep-listed.txt"),
+                width >= TWO_PANE_MIN_WIDTH
+            );
+            assert_eq!(editor_area == area, width < TWO_PANE_MIN_WIDTH);
+            assert!(body.contains(terminal.get_cursor_position().unwrap()));
+            let rows = editor_page_rows(&app, area);
+            assert_eq!(rows, if width >= TWO_PANE_MIN_WIDTH { 8 } else { 10 });
+            app.handle_editor_key(termina::event::KeyCode::PageDown.into(), rows);
+            assert_eq!(app.editor().unwrap().cursor().0, rows);
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert!(body.contains(terminal.get_cursor_position().unwrap()));
+            assert!(app.editor_cache().borrow().as_ref().unwrap().scroll > 0);
+            app.handle_editor_key(termina::event::KeyCode::Escape.into(), rows);
+            assert!(!app.is_viewing() && app.editor().is_none());
+            assert_eq!(app.selected_entry().unwrap().name, "notes.txt");
+        }
+    }
+
+    #[test]
+    fn viewer_editor_stays_full_width_even_when_picker_could_show_two_panes() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("keep-listed.txt"), "other").unwrap();
+        fs::write(
+            temp.path().join("notes.md"),
+            (0..40)
+                .map(|line| format!("# Heading-{line:02}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        for source in [false, true] {
+            for (width, height, expected_body) in [
+                (100, 12, Rect::new(1, 2, 97, 8)),
+                (8, 5, Rect::new(1, 2, 5, 1)),
+                (3, 5, Rect::new(1, 2, 1, 1)),
+                (2, 4, Rect::new(0, 1, 1, 2)),
+                (1, 3, Rect::new(0, 1, 1, 1)),
+                (1, 2, Rect::new(0, 1, 1, 0)),
+                (1, 1, Rect::new(0, 1, 1, 0)),
+            ] {
+                let mut app = App::new(temp.path().to_path_buf()).unwrap();
+                app.move_last();
+                app.open_viewer();
+                if source {
+                    app.toggle_markdown_source();
+                }
+                app.open_editor();
+                let area = Rect::new(0, 0, width, height);
+                let [header, body, footer] = file_editor_areas(&app, area);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                assert!(!terminal.backend().to_string().contains("keep-listed.txt"));
+                assert_eq!(file_editor_area(&app, area), area);
+                let rows = editor_page_rows(&app, area);
+                assert_eq!(rows, body.height.max(1) as usize);
+                assert_eq!(body, expected_body);
+                assert!(body.is_empty() || body.intersection(header).is_empty());
+                assert!(body.is_empty() || body.intersection(footer).is_empty());
+                if !body.is_empty() {
+                    assert_eq!(body, viewer_body(area));
+                    assert!(body.contains(terminal.get_cursor_position().unwrap()));
+                    let gutter =
+                        source_gutter_width(app.editor().unwrap().lines().len(), body.width);
+                    assert_eq!(
+                        app.editor_cache().borrow().as_ref().unwrap().width,
+                        body.width.saturating_sub(gutter).max(1)
+                    );
+                }
+                let outer = viewer_outer(area);
+                if viewer_inner(outer) != outer {
+                    let buffer = terminal.backend().buffer();
+                    assert_eq!(buffer[(outer.x, outer.y)].symbol(), "┌");
+                    assert_eq!(buffer[(outer.right() - 1, outer.y)].symbol(), "┐");
+                    assert_eq!(buffer[(outer.x, outer.bottom() - 1)].symbol(), "└");
+                    assert_eq!(
+                        buffer[(outer.right() - 1, outer.bottom() - 1)].symbol(),
+                        "┘"
+                    );
+                    for y in body.y..body.bottom() {
+                        assert_eq!(buffer[(outer.x, y)].symbol(), "│");
+                        assert_eq!(buffer[(outer.right() - 1, y)].symbol(), "│");
+                    }
+                }
+                app.handle_editor_key(termina::event::KeyCode::PageDown.into(), rows);
+                assert_eq!(app.editor().unwrap().cursor().0, rows);
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                if !body.is_empty() {
+                    assert!(body.contains(terminal.get_cursor_position().unwrap()));
+                    assert!(app.editor_cache().borrow().as_ref().unwrap().scroll > 0);
+                }
+                app.handle_editor_key(termina::event::KeyCode::Escape.into(), rows);
+                assert!(app.editor().is_none() && app.is_viewing());
+                assert_eq!(app.is_markdown_source(), source);
+            }
+        }
+    }
+
+    fn syntax_editor(
+        name: &str,
+        source: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::editor::Editor,
+        EditorText,
+        Palette,
+    ) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join(name);
+        fs::write(&path, source).unwrap();
+        let editor = crate::editor::Editor::open(path, 1).unwrap();
+        let mut palette = crate::Theme::auto().palette();
+        palette.syntax.text = ratatui::style::Color::White;
+        palette.syntax.comment = ratatui::style::Color::Cyan;
+        palette.syntax.keyword = ratatui::style::Color::Red;
+        palette.syntax.string = ratatui::style::Color::Blue;
+        palette.syntax.number = ratatui::style::Color::Magenta;
+        let mut cache = EditorText::new();
+        cache.update(&editor, 30, &palette);
+        (directory, editor, cache, palette)
+    }
+
+    fn editor_syntax_key(
+        editor: &mut crate::editor::Editor,
+        code: termina::event::KeyCode,
+        modifiers: termina::event::Modifiers,
+    ) {
+        editor.handle_key(termina::event::KeyEvent::new(code, modifiers), 8);
+    }
+
+    fn assert_editor_syntax_matches_fresh(
+        cache: &EditorText,
+        editor: &crate::editor::Editor,
+        palette: &Palette,
+    ) {
+        let mut fresh = EditorText::new();
+        fresh.update(editor, cache.width, palette);
+        assert_eq!(cache.lines.len(), fresh.lines.len());
+        for (index, (cached, expected)) in cache.lines.iter().zip(&fresh.lines).enumerate() {
+            assert_eq!(cached.source, expected.source, "source line {index}");
+            assert_eq!(cached.terminated, expected.terminated, "break at {index}");
+            assert_eq!(cached.styles, expected.styles, "styles at {index}");
+        }
+    }
+
+    #[test]
+    fn editor_syntax_matches_source_preview_associations_and_styles() {
+        for (name, source) in [
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"example\"\nversion = \"1\"\n",
+            ),
+            ("Dockerfile.dev", "FROM alpine\nRUN echo \"hello\"\n"),
+            (
+                "tsconfig.build.json",
+                "{\n// note\n\"compilerOptions\": {}\n}\n",
+            ),
+            ("module.mts", "const value: number = 42;\n"),
+            ("script", "#!/usr/bin/env python\nprint(\"hello\") # note\n"),
+            ("notes.md", "# Heading\n```rust\nlet value = 42;\n```\n"),
+            ("unknown.no-syntax-here", "plain source\n"),
+        ] {
+            let (_directory, editor, cache, palette) = syntax_editor(name, source);
+            let preview = crate::document::load_source(editor.path(), &palette).unwrap();
+            assert_eq!(cache.lines.len(), preview.lines.len(), "{name}");
+            for (cached, line) in cache.lines.iter().zip(&preview.lines) {
+                let mut offset = 0;
+                for span in &line.spans {
+                    for (byte, _) in span.content.char_indices() {
+                        assert_eq!(
+                            cached.style_at(offset + byte, &palette),
+                            span.style,
+                            "{name}"
+                        );
+                    }
+                    offset += span.content.len();
+                }
+                assert_eq!(offset, cached.source.len(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn editor_syntax_tracks_eof_breaks_without_changing_bom_or_crlf() {
+        use termina::event::{KeyCode, Modifiers};
+        let (_directory, mut editor, mut cache, palette) =
+            syntax_editor("source.rs", "\u{feff}let value = 1;\r\n// tail");
+        assert!(cache.lines[0].terminated);
+        assert!(!cache.lines[1].terminated);
+        assert!(editor.has_bom() && editor.uses_crlf());
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::CONTROL);
+        editor_syntax_key(&mut editor, KeyCode::Enter, Modifiers::NONE);
+        cache.update(&editor, 30, &palette);
+        assert!(cache.lines[1].terminated);
+        assert!(!cache.lines[2].terminated);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        for character in ['z', 'y'] {
+            editor_syntax_key(&mut editor, KeyCode::Char(character), Modifiers::CONTROL);
+            cache.update(&editor, 30, &palette);
+            assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        }
+        editor.save().unwrap();
+        assert_eq!(
+            fs::read(editor.path()).unwrap(),
+            "\u{feff}let value = 1;\r\n// tail\r\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn editor_syntax_propagates_comments_and_survives_cursor_movement_and_resize() {
+        use termina::event::{KeyCode, Modifiers};
+        let (_directory, mut editor, mut cache, palette) = syntax_editor(
+            "source.rs",
+            "let first = 1;\nlet second = 2;\n*/ let third = 3;\nlet fourth = 4;\n",
+        );
+        editor_syntax_key(&mut editor, KeyCode::Right, Modifiers::NONE);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        cache.update(&editor, 8, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert!(cache.lines[1].rows.len() > 1);
+        assert_eq!(
+            cache.lines[1]
+                .rows
+                .iter()
+                .flat_map(|row| row.cells.iter().map(|cell| cell.text.as_str()))
+                .collect::<String>(),
+            editor.lines()[1]
+        );
+        editor_syntax_key(&mut editor, KeyCode::Home, Modifiers::NONE);
+        editor.paste("/*");
+        cache.update(&editor, 8, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        assert_eq!(
+            cache.lines[3].style_at(0, &palette).fg,
+            Some(palette.syntax.keyword)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 8, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.keyword)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('y'), Modifiers::CONTROL);
+        cache.update(&editor, 8, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        // A local edit after the closed comment must keep later source styles correct.
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::CONTROL);
+        editor_syntax_key(&mut editor, KeyCode::Up, Modifiers::NONE);
+        editor_syntax_key(&mut editor, KeyCode::Home, Modifiers::NONE);
+        editor.paste(" ");
+        cache.update(&editor, 8, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+    }
+
+    #[test]
+    fn editor_syntax_aligns_insert_delete_undo_and_missed_revisions() {
+        use termina::event::{KeyCode, Modifiers};
+        let (_directory, mut editor, mut cache, palette) = syntax_editor(
+            "source.rs",
+            "let first = 1;\nlet second = 2;\nlet third = 3;",
+        );
+        editor_syntax_key(&mut editor, KeyCode::Down, Modifiers::NONE);
+        editor.paste("/* open\nbody\n");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[4].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        for character in ['z', 'y', 'z'] {
+            editor_syntax_key(&mut editor, KeyCode::Char(character), Modifiers::CONTROL);
+            cache.update(&editor, 30, &palette);
+            assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        }
+        // Join two lines, then restore them through history.
+        editor_syntax_key(&mut editor, KeyCode::Home, Modifiers::NONE);
+        editor_syntax_key(&mut editor, KeyCode::Backspace, Modifiers::NONE);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        // Edits between frames must still produce the same colors as a fresh preview.
+        editor_syntax_key(&mut editor, KeyCode::Home, Modifiers::CONTROL);
+        editor.paste("/*");
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::CONTROL);
+        editor.paste("\n*/\n");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        editor.save().unwrap();
+        assert_eq!(
+            fs::read_to_string(editor.path()).unwrap(),
+            editor.lines().join("\n")
+        );
+
+        // Removing a comment between identical blank lines changes the unchanged tail.
+        let (_directory, mut editor, mut cache, palette) =
+            syntax_editor("source.rs", "let a = 1;\n\n/*\n\nlet b = 2;");
+        assert_eq!(
+            cache.lines[4].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Down, Modifiers::NONE);
+        editor_syntax_key(&mut editor, KeyCode::Down, Modifiers::SHIFT);
+        editor_syntax_key(&mut editor, KeyCode::Down, Modifiers::SHIFT);
+        editor_syntax_key(&mut editor, KeyCode::Delete, Modifiers::NONE);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[2].style_at(0, &palette).fg,
+            Some(palette.syntax.keyword)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[4].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('y'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[2].style_at(0, &palette).fg,
+            Some(palette.syntax.keyword)
+        );
+
+        // Joining an HTML block to its blank separator changes later Markdown.
+        let (_directory, mut editor, mut cache, mut palette) =
+            syntax_editor("notes.md", "<div>\n\n# Heading");
+        palette.markdown.heading = ratatui::style::Color::Yellow;
+        palette.markdown.text = ratatui::style::Color::White;
+        cache.update(&editor, 30, &palette);
+        assert_eq!(
+            cache.lines[2].style_at(2, &palette).fg,
+            Some(palette.markdown.heading)
+        );
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::NONE);
+        editor_syntax_key(&mut editor, KeyCode::Delete, Modifiers::NONE);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_ne!(
+            cache.lines[1].style_at(2, &palette).fg,
+            Some(palette.markdown.heading)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[2].style_at(2, &palette).fg,
+            Some(palette.markdown.heading)
+        );
+    }
+
+    #[test]
+    fn editor_syntax_checks_all_replaced_lines_before_convergence() {
+        use termina::event::{KeyCode, Modifiers};
+        let (_directory, mut editor, mut cache, palette) = syntax_editor(
+            "source.rs",
+            "let first = 1;\nlet same = 2;\nlet last = 3;\n",
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('a'), Modifiers::CONTROL);
+        editor.paste("let first = 9;\nlet same = 2;\n/* let last = 3;\n");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[2].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+    }
+
+    #[test]
+    fn editor_syntax_propagates_multiline_strings_and_fence_language_changes() {
+        use termina::event::{KeyCode, Modifiers};
+        let (_directory, mut editor, mut cache, palette) = syntax_editor(
+            "source.rs",
+            "let text = r#\"first\nsecond\n\"#;\nlet last = 1;\n",
+        );
+        assert_eq!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.string)
+        );
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::NONE);
+        editor.paste("\"#;");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_ne!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.string)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+
+        let (_directory, mut editor, mut cache, palette) = syntax_editor(
+            "notes.md",
+            "```rust\nlet value = 42; // note\n```\n# Heading\n",
+        );
+        let comment = editor.lines()[1].find("//").unwrap();
+        assert_eq!(
+            cache.lines[1].style_at(comment, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::SHIFT);
+        editor.paste("```python");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_ne!(
+            cache.lines[1].style_at(comment, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        assert_eq!(
+            cache.lines[3].style_at(2, &palette).fg,
+            Some(palette.markdown.heading)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::SHIFT);
+        editor.paste("```no-such-language");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[1].style_at(comment, &palette).fg,
+            Some(palette.syntax.text)
+        );
+    }
+
+    #[test]
+    fn editor_syntax_invalidates_shebang_and_theme_without_changing_source() {
+        use termina::event::{KeyCode, Modifiers};
+        let (_directory, mut editor, mut cache, mut palette) = syntax_editor(
+            "script",
+            "#!/usr/bin/env python\n# note\nprint(\"hello\")\n",
+        );
+        let python = cache.syntax;
+        assert_eq!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        palette.syntax.comment = ratatui::style::Color::Yellow;
+        let source = editor.lines().to_vec();
+        let revision = editor.revision();
+        cache.update(&editor, 30, &palette);
+        assert_eq!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.comment)
+        );
+        assert_eq!(editor.lines(), source);
+        assert_eq!(editor.revision(), revision);
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::SHIFT);
+        editor.paste("#!/bin/sh");
+        cache.update(&editor, 30, &palette);
+        assert_ne!(cache.syntax, python);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        editor_syntax_key(&mut editor, KeyCode::Home, Modifiers::NONE);
+        editor_syntax_key(&mut editor, KeyCode::End, Modifiers::SHIFT);
+        editor.paste("not a shebang");
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+        assert_eq!(
+            cache.lines[1].style_at(0, &palette).fg,
+            Some(palette.syntax.text)
+        );
+        editor_syntax_key(&mut editor, KeyCode::Char('z'), Modifiers::CONTROL);
+        cache.update(&editor, 30, &palette);
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+
+        let (_directory, editor, mut cache, mut palette) =
+            syntax_editor("notes.md", "# Heading\n\n`code`\n");
+        palette.markdown.heading = ratatui::style::Color::Yellow;
+        palette.markdown.code = ratatui::style::Color::Green;
+        cache.update(&editor, 30, &palette);
+        assert_eq!(
+            cache.lines[0].style_at(2, &palette).fg,
+            Some(palette.markdown.heading)
+        );
+        assert_eq!(
+            cache.lines[2].style_at(1, &palette).fg,
+            Some(palette.markdown.code)
+        );
+        assert_editor_syntax_matches_fresh(&cache, &editor, &palette);
+    }
+
+    #[test]
+    fn editor_syntax_uses_source_bytes_for_graphemes_and_selection_in_both_origins() {
+        use ratatui::style::Color;
+        use termina::event::{KeyCode, KeyEvent, Modifiers};
+        let directory = tempdir().unwrap();
+        let source =
+            "let text = \"\t界e\u{301}\"\u{301}; // note with a long continuation for wrapping\n\n";
+        fs::write(directory.path().join("source.rs"), source).unwrap();
+        for viewer in [false, true] {
+            let mut app = App::new(directory.path().to_path_buf()).unwrap();
+            if viewer {
+                app.open_viewer();
+            }
+            app.open_editor();
+            let mut palette = app.theme().palette();
+            palette.syntax.string = Color::Blue;
+            palette.syntax.comment = Color::Cyan;
+            palette.emphasis_foreground = Color::Black;
+            palette.emphasis_background = Color::Yellow;
+            palette.reverse_emphasis = false;
+            let area = Rect::new(0, 0, 80, 16);
+            let editor_area = file_editor_area(&app, area);
+            let body = file_editor_areas(&app, editor_area)[1];
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            for selected in [false, true] {
+                if selected {
+                    app.handle_editor_key(KeyEvent::new(KeyCode::Char('a'), Modifiers::CONTROL), 8);
+                }
+                terminal
+                    .draw(|frame| render_file_editor(frame, &app, editor_area, &palette))
+                    .unwrap();
+                let cache = app.editor_cache().borrow();
+                let cache = cache.as_ref().unwrap();
+                let gutter = source_gutter_width(cache.lines.len(), body.width);
+                let buffer = terminal.backend().buffer();
+                let mut y = body.y;
+                for line in &cache.lines {
+                    for row in &line.rows {
+                        let mut x = body.x + gutter;
+                        for cell in &row.cells {
+                            let expected = if selected {
+                                emphasis_style(&palette)
+                            } else {
+                                line.style_at(cell.start, &palette)
+                            };
+                            assert_eq!(buffer[(x, y)].fg, expected.fg.unwrap());
+                            if selected {
+                                assert_eq!(buffer[(x, y)].bg, palette.emphasis_background);
+                            }
+                            if cell.text == "界" {
+                                assert_eq!(cell.width, 2);
+                            } else if cell.text == "e\u{301}" {
+                                assert_eq!(cell.end - cell.start, 3);
+                                assert_eq!(cell.width, 1);
+                                assert_eq!(buffer[(x, y)].symbol(), "e\u{301}");
+                            } else if cell.text == "\"\u{301}" {
+                                // The closing quote and following mark cross a token boundary.
+                                assert_eq!(cell.width, 1);
+                                assert_eq!(buffer[(x, y)].symbol(), "\"\u{301}");
+                                if !selected {
+                                    assert_eq!(buffer[(x, y)].fg, palette.syntax.string);
+                                }
+                            }
+                            if line.source.as_bytes().get(cell.start) == Some(&b'\t') {
+                                assert_eq!(cell.end - cell.start, 1);
+                                if !selected {
+                                    assert_eq!(buffer[(x, y)].fg, palette.syntax.string);
+                                }
+                            }
+                            x += cell.width as u16;
+                        }
+                        if selected && row.end == line.source.len() && line.terminated {
+                            assert_eq!(buffer[(x, y)].bg, palette.emphasis_background);
+                        }
+                        y += 1;
+                    }
+                }
+                assert!(body.contains(terminal.get_cursor_position().unwrap()));
+                assert_eq!(app.editor().unwrap().lines().join("\n"), source);
+                assert_eq!(app.editor().unwrap().revision(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn editor_rewraps_changed_lines_and_shows_new_empty_source_lines() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "one").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_editor();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        app.handle_editor_key(termina::event::KeyCode::End.into(), 6);
+        app.handle_editor_key(termina::event::KeyCode::Enter.into(), 6);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("1 │one"));
+        assert!(rendered.contains("2 │"));
+        app.paste("λ pasted");
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(terminal.backend().to_string().contains("2 │λ pasted"));
+    }
+
+    #[test]
+    fn source_gutters_number_only_first_wrapped_row_and_skip_notices() {
+        let palette = crate::Theme::auto().palette();
+        let notices = [Line::raw("notice")];
+        let lines = [Line::raw("abcdefgh"), Line::raw("β next")];
+        let (rows, sources) = numbered_source_rows(&notices, &lines, 7, &palette);
+        assert_eq!(sources, vec![0, 1, 1, 2, 2]);
+        let strings: Vec<_> = rows.iter().map(ToString::to_string).collect();
+        assert_eq!(strings[0], "notice");
+        assert!(strings[1].starts_with("1 │"));
+        assert!(strings[2].starts_with("   "));
+        assert!(strings[3].starts_with("2 │"));
+    }
+
+    #[test]
+    fn formatted_json_rows_do_not_claim_original_line_numbers() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("data.json");
+        fs::write(&path, "{\"a\":1,\"b\":2}").unwrap();
+        let app = App::new(temp.path().to_path_buf()).unwrap();
+        assert!(!app.preview().document().unwrap().source_lines);
+        let cached = viewer_text(&app, 30, &app.theme().palette());
+        assert!(cached.source_rows.is_empty());
+        assert!(
+            crate::document::load_source(&path, &app.theme().palette())
+                .unwrap()
+                .source_lines
+        );
     }
 
     #[test]
@@ -1920,21 +3447,6 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         assert!(!terminal.backend().to_string().contains("modified"));
-    }
-
-    #[test]
-    fn footer_reflects_the_active_sort_mode() {
-        let temp = tempdir().unwrap();
-        fs::create_dir(temp.path().join("project")).unwrap();
-        let mut app = App::new(temp.path().to_path_buf()).unwrap();
-        app.cycle_sort();
-        app.toggle_sort_direction();
-        let backend = TestBackend::new(88, 6);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        assert!(terminal.backend().to_string().contains("sort:time↓"));
     }
 
     #[test]
@@ -1995,5 +3507,116 @@ mod tests {
         assert!(rendered.contains("tab sample"));
         assert!(rendered.contains("m mode"));
         assert!(rendered.contains("enter save"));
+    }
+
+    #[test]
+    fn source_geometry_keeps_original_bytes_through_tabs_clusters_wrapping_and_resize() {
+        let temp = tempdir().unwrap();
+        let source = "\u{feff}prefix\tCafe\u{301} long words\r\n第二 needle end\r\n";
+        fs::write(temp.path().join("notes.txt"), source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let target = source.find("needle").unwrap();
+        let wide = source_byte_offset(&app, 40, target);
+        let narrow = source_byte_offset(&app, 12, target);
+        assert!(narrow > wide);
+        let cache = viewer_text(&app, 12, &app.theme().palette());
+        let (row, cells) = cache
+            .geometry
+            .iter()
+            .enumerate()
+            .find(|(_, cells)| cells.iter().any(|cell| cell.bytes.contains(&target)))
+            .unwrap();
+        let gutter = source_gutter_width(app.preview().document().unwrap().lines.len(), 12);
+        let x = cells
+            .iter()
+            .take_while(|cell| cell.bytes.end <= target)
+            .map(|cell| cell.width)
+            .sum::<usize>();
+        assert_eq!(
+            source_hit_test(&app, 12, gutter + x as u16, row),
+            Some(target)
+        );
+        let cluster = cache
+            .geometry
+            .iter()
+            .flatten()
+            .find(|cell| cell.text == "e\u{301}")
+            .unwrap();
+        assert_eq!(&source[cluster.bytes.clone()], "e\u{301}");
+        let tab = cache
+            .geometry
+            .iter()
+            .flatten()
+            .find(|cell| &source[cell.bytes.clone()] == "\t")
+            .unwrap();
+        assert_eq!(tab.width, 4);
+        for cell in cache.geometry.iter().flatten() {
+            assert!(source.is_char_boundary(cell.bytes.start));
+            assert!(source.is_char_boundary(cell.bytes.end));
+        }
+        drop(cache);
+        app.begin_viewer_selection(source.find('\t').unwrap());
+        app.extend_viewer_selection(target + "needle".len());
+        assert_eq!(
+            app.selected_viewer_text(),
+            Some("\tCafe\u{301} long words\r\n第二 needle")
+        );
+        let _ = viewer_text(&app, 24, &app.theme().palette());
+        assert_eq!(
+            app.selected_viewer_text(),
+            Some("\tCafe\u{301} long words\r\n第二 needle")
+        );
+    }
+
+    #[test]
+    fn manual_editor_scroll_keeps_caret_and_history_until_keyboard_movement() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.rs"),
+            "let value = 42;\n".repeat(100),
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_editor();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let area = Rect::new(0, 0, 80, 12);
+        let caret = app.editor().unwrap().cursor();
+        let revision = app.editor().unwrap().revision();
+        let maximum = editor_scrollbar(&app, area).unwrap().maximum;
+        set_editor_scroll(&app, maximum, area);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert_eq!(editor_scrollbar(&app, area).unwrap().offset, maximum);
+        assert_eq!(app.editor().unwrap().cursor(), caret);
+        assert_eq!(app.editor().unwrap().revision(), revision);
+        assert!(!app.editor().unwrap().dirty());
+        let rows = editor_page_rows(&app, area);
+        app.handle_editor_key(
+            termina::event::KeyEvent::new(
+                termina::event::KeyCode::Down,
+                termina::event::Modifiers::NONE,
+            ),
+            rows,
+        );
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert!(editor_scrollbar(&app, area).unwrap().offset < maximum);
+        assert_eq!(app.editor().unwrap().revision(), revision);
+    }
+
+    #[test]
+    fn clipped_long_browser_query_still_marks_the_visible_first_match() {
+        let palette = crate::Theme::auto().palette();
+        let query = "needle".repeat(80);
+        let matcher = crate::matching::LiteralMatcher::new(&query);
+        let line = literal_highlight_line(
+            "  file:1: needleneedle…".into(),
+            Style::default(),
+            &palette,
+            &matcher,
+            Some(10..490),
+        );
+        assert!(line.spans.iter().any(|span| span.content.contains("needle")
+            && span.style.add_modifier.contains(Modifier::UNDERLINED)));
     }
 }

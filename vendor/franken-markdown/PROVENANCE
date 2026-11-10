@@ -1,8 +1,45 @@
-The SVG backend and table_format.rs are adapted from franken_markdown 0.7.0,
-https://crates.io/crates/franken_markdown/0.7.0, upstream commit
-ddbdefd8c35770766838a735c554119ff0ef39e3. The parser, fonts, and layout
-remain dependencies on the published crate. Local changes add independent SVG
-heading and code typography and colors and adapt imports for this crate.
+The SVG backend, table_format.rs, and native parser subset come from
+franken_markdown 0.7.0, https://crates.io/crates/franken_markdown/0.7.0,
+upstream commit ddbdefd8c35770766838a735c554119ff0ef39e3.
+LICENSE in this directory applies to these upstream files.
+The published crate still supplies AST types, fonts, shaping primitives,
+line-breaking primitives, and the diagram/math engines.
+
+The local SVG changes add independent heading/code typography and colors.
+Generated vector figures fill local content width at their original aspect
+ratio. Ordinary images retain intrinsic sizing. Narrow pages reduce margins.
+The painter records the same retained shaping clusters and physical line
+advances that it paints, including ligatures, composition, code tab expansion,
+table cells, and emergency wrapping. These coordinates start in SVG user units.
+The native renderer converts them through the emitted viewBox, resolved usvg
+dimensions, and raster scale into full-page raster pixels. Viewport overlays
+subtract the actual clamped viewport scroll, without changing cached geometry.
+Images, diagrams, and successfully typeset vector math are graphics, not text
+clusters. Actual visible fallback text still has text geometry.
+
+src/parse contains the pinned native grammar with source-provenance hooks.
+It carries original UTF-8 source spans through accepted inline tokens,
+entities, escapes, emphasis resolution, links, code normalization, containers,
+tables, normalized line endings, host image fallback text, and endnote copies.
+It does not reparse with another grammar, search source text for equal strings,
+or infer source identity from text occurrence order. Source soft breaks become
+source-owned logical spaces after the same native break recognition.
+The parser's internal copied-prefix tracker also retains original tab columns.
+The endnote adapter uses structural AST copy identities, including moved notes.
+Layout pieces and words own explicit logical-byte maps through coalescing,
+wrapping, tab expansion, and painting. Only document-owned AST leaves retain
+address identities. Generated markers cannot inherit dropped word mappings.
+
+vendor_parser.py reproduces the parser subset from an unmodified 0.7.0 src
+directory. It requires Python 3 and Pygments only for regeneration, not builds.
+Run: python vendor/franken-markdown/vendor_parser.py /path/to/franken_markdown-0.7.0/src
+The script checks SHA-256 of the original parser and an ordered digest of all
+original helper inputs before extraction. It excludes upstream test fixtures,
+CLI entry points, external profiling APIs, HTML lowering/sanitizing, and
+page-note/heading metadata paths. The private HTML URL-tokenizer closure remains
+for the parser tracker. Local provenance modules are maintained beside it.
+The generated source is checked in and ships under Cargo's existing vendor/**
+include. No registry file is changed and no path dependency is required.
 
 fmd-font/fonts/test-shaping/FmdShaping.ttf is from fmd-font 0.4.0,
 https://crates.io/crates/fmd-font/0.4.0, and supports upstream SVG tests.

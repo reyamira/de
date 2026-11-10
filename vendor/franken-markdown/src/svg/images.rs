@@ -237,6 +237,7 @@ impl Poster {
                 let height = image.height * (width / image.width);
                 Word {
                     text: String::new(),
+                    logical: Default::default(),
                     style,
                     w: width,
                     gap: 0.0,
@@ -264,6 +265,7 @@ impl Poster {
                 Word {
                     w: self.measure(&text, style, size),
                     text,
+                    logical: Default::default(),
                     style,
                     gap: 0.0,
                     formula: None,
@@ -273,6 +275,36 @@ impl Poster {
                 }
             }
         }
+    }
+
+    /// Generated vector figures fill their local measure, unlike ordinary
+    /// images, which keep their intrinsic size unless they need to shrink.
+    pub(super) fn figure(&mut self, svg: &str, alt: &str, l: f64, r: f64, quote: bool) {
+        let destination = format!(
+            "data:image/svg+xml;base64,{}",
+            franken_markdown::html::base64_encode(svg.as_bytes())
+        );
+        let size = f64::from(self.scale.body);
+        let width = (r - l).max(1.0);
+        let mut word = self.image_word(
+            &destination,
+            alt,
+            RStyle {
+                ink: Self::default_ink(quote),
+                ..RStyle::BODY
+            },
+            size,
+            width,
+        );
+        if let Some(run) = &mut word.image {
+            run.width = width;
+            run.height = run.image.height * (width / run.image.width);
+            word.w = width;
+        }
+        let line = std::slice::from_ref(&word);
+        let (ascent, height) = self.line_metrics(line, size * 0.85, size * self.line_height);
+        self.draw_words_at(line, l, self.y + ascent, size, ascent, height);
+        self.y += height + size * 0.7;
     }
 
     pub(super) fn draw_image(&mut self, run: &ImageRun, x: f64, baseline: f64) {

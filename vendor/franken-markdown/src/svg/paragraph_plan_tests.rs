@@ -12,6 +12,7 @@ fn group(width: f64, gap: f64) -> Group {
     Group {
         runs: vec![Word {
             text: "word".to_owned(),
+            logical: Default::default(),
             style: RStyle::BODY,
             w: width,
             gap: 0.0,

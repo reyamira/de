@@ -115,9 +115,7 @@ impl<'a> Assets<'a> {
                     if let Some(key) = self.load(dest) {
                         *dest = key;
                     } else {
-                        *inline = Inline::Text(format!(
-                            "[Image unavailable or image budget exceeded: {alt}]"
-                        ));
+                        *inline = Inline::Text(crate::fmd_parse::image_fallback(alt));
                     }
                 }
                 Inline::Html(html) => *inline = Inline::Text(std::mem::take(html)),

@@ -38,6 +38,7 @@ impl Poster {
                 let size = fitted_size(&formula, size, width);
                 Word {
                     text: String::new(),
+                    logical: Default::default(),
                     style,
                     w: formula.width * size,
                     gap: 0.0,
@@ -53,7 +54,8 @@ impl Poster {
                     ..style
                 };
                 Word {
-                    text: source.to_string(),
+                    text: source.to_owned(),
+                    logical: Default::default(),
                     style,
                     w: self.measure(source, style, size),
                     gap: 0.0,
@@ -66,7 +68,23 @@ impl Poster {
         }
     }
 
-    fn typeset_formula(&self, source: &str, display: bool) -> Result<Rc<Formula>, SvgWarning> {
+    pub(super) fn typeset_formula(
+        &self,
+        source: &str,
+        display: bool,
+    ) -> Result<Rc<Formula>, SvgWarning> {
+        let cache = &self.math_cache[usize::from(display)];
+        if let Some(prepared) = cache.borrow().get(source) {
+            return prepared.clone();
+        }
+        let prepared = self.typeset_uncached(source, display);
+        cache
+            .borrow_mut()
+            .insert(source.to_owned(), prepared.clone());
+        prepared
+    }
+
+    fn typeset_uncached(&self, source: &str, display: bool) -> Result<Rc<Formula>, SvgWarning> {
         if source.len() > MAX_FORMULA_BYTES {
             return Err(warning(
                 "svg_math_limit",

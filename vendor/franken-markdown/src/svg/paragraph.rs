@@ -215,6 +215,7 @@ fn limit_warning(group: &mut Group) {
         // run remains inside this word, so it creates no space or word break.
         group.runs.push(Word {
             text: String::new(),
+            logical: Default::default(),
             style: RStyle::BODY,
             w: 0.0,
             gap: 0.0,

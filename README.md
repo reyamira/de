@@ -11,9 +11,20 @@ pane previews the highlighted directory or file. Below 58 columns, `de` shows
 one pane. Press `v` on a file to use the full-width inline viewer at any width.
 Directory listings show modification times when enough space is available.
 
-It is intentionally not a full file manager. Press `o` to open the highlighted
-file in its default application. There are no delete, rename, copy, or built-in
-edit commands.
+Press `e` to edit a regular UTF-8 file with the built-in editor.
+Press `o` to open a file in its default application.
+`de` has no file delete, rename, or copy commands.
+
+## Unreleased changes
+
+- Mermaid diagrams and charts fit the rendered content width and reflow on resize.
+- Press `e` for live syntax colors in the preview pane or full-width viewer. The editor supports undo, redo, and explicit save.
+- Source views show original line numbers; wrapped continuation rows keep the same source identity.
+- Viewer text supports drag selection and `y` copying through the terminal clipboard.
+- In the viewer, `/` finds text, `n`/`N` moves between matches, and `Escape` cancels the find prompt.
+- Mouse wheel and scrollbar scrolling now work in the editor without moving the caret.
+- `/` searches names and text contents below the current folder. `Escape` restores the starting selection.
+- `Enter` accepts the selected folder or views a file. `Ctrl-G` accepts the displayed folder.
 
 ## What's new in v0.5.0
 
@@ -101,22 +112,30 @@ asks the parent shell to `cd` there.
 | `PageUp` / `PageDown` | Jump one visible page through the entries |
 | `Right`, `l`, `Tab` | Make the previewed directory current |
 | `Left`, `h`, `Backspace` | Go to the parent directory |
-| `/` | Filter entries in the current directory |
+| `/` | Search names and text recursively under the current folder |
 | `s` | Toggle sorting by name or modification time |
 | `Shift+S` | Toggle ascending or descending order |
 | `v` | View the highlighted file inline |
+| `e` (picker or viewer) | Edit the original file inline |
+| `Ctrl-S` (editor) | Save the file |
+| `Escape`, `Ctrl-Q` (editor) | Return; choose Save, Discard, or Cancel for changed text |
 | `m` (Markdown viewer) | Toggle source and rendered Markdown |
 | `R` (plain text viewer) | Toggle raw and reading layouts |
+| `/` (viewer) | Find literal text in the current file |
+| `n`, `N` (viewer) | Move to the next or previous match |
+| `y` (viewer) | Send selected text to the terminal clipboard |
 | `o` | Open the highlighted file with its default application |
-| `Enter` | Change to the directory currently displayed |
+| `Enter` | Choose the highlighted folder, or view the highlighted file |
+| `Ctrl-G` | Choose the current header folder, including an empty folder |
 | `.` | Toggle hidden entries |
 | `w` | Save the current hidden and sort settings as defaults |
 | `r` | Refresh |
 | `Escape`, `q`, `Ctrl-C` | Cancel without changing directory |
 
-The important distinction is that `Enter` accepts the directory in the header,
-not the highlighted child. Use `Right` to explore and `Enter` when you have
-arrived.
+`Enter` chooses the highlighted folder and exits.
+`Right`, `Tab`, or `l` browses into that folder without exiting.
+`Ctrl-G` chooses the folder in the header.
+If nothing is selected, `Enter` does not exit.
 
 Press `o` on a file to open it with the operating system's default application.
 On Linux, `de` uses `xdg-open`; on macOS, it uses `open`. Opening a file exits
@@ -133,12 +152,28 @@ or `j`/`k` to scroll. Press `Escape` or `q` to return to the same selection.
 The [viewer guide](docs/viewer.md) covers supported formats, controls, graphics
 requirements, Markdown rendering, and size limits.
 
-### Filtering and sorting
+### Recursive search
 
-Filtering uses a case-insensitive substring match. Type after pressing `/`, use
-the normal arrow and page keys to move through matches, and press `Backspace` to
-edit the query. `Escape` clears an active filter first; press it again to cancel
-`de`.
+Press `/` to search names and text under the current folder.
+The search uses literal, case-insensitive text, not a regular expression.
+Results show relative paths and original source lines with excerpts.
+Name matches and matching text lines are separate results.
+Arrow and page keys select results while the search continues in the background.
+`Enter` chooses a folder result or opens the exact first match in a file.
+Visible Markdown text opens in rendered mode; hidden Markdown syntax opens in source mode.
+`Right` or `Tab` browses into a folder result.
+The same query then searches the folder in the header.
+To edit a search result, press `Enter`, then `e`.
+`Escape` restores the exact folder and selection from before the search.
+From a viewer, `Escape` first returns to the search.
+
+The search respects `.gitignore`, `.ignore`, and the hidden-file setting.
+It does not follow directory symlinks or read symlink contents.
+It skips binary, non-UTF-8, and oversized text files.
+The footer distinguishes an active search from completed results.
+See the [viewer guide](docs/viewer.md) for search limits and editor safety rules.
+
+### Sorting
 
 Name sorting is case-insensitive and alphabetical. Sort criterion and direction
 are independent, so modification time can show either oldest or newest first.

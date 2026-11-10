@@ -17,9 +17,13 @@ use crate::Palette;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Document {
     pub lines: Vec<Line<'static>>,
+    /// Original UTF-8 bytes, before terminal sanitization or JSON formatting.
+    pub source: Arc<str>,
     pub markdown_source: Option<Arc<str>>,
     pub supports_reading: bool,
     pub notice: Option<String>,
+    /// True only when display rows retain original source line boundaries.
+    pub source_lines: bool,
 }
 
 // Bound both input and the number of independently allocated display lines.
@@ -28,6 +32,22 @@ const MAX_LINES: usize = 20_000;
 
 /// Load a regular UTF-8 file for display without interpreting executable content.
 pub fn load(path: &Path, palette: &Palette) -> Result<Document, String> {
+    load_mode(path, palette, false)
+}
+
+/// Load original source layout, including JSON, for source-line search targets.
+pub fn load_source(path: &Path, palette: &Palette) -> Result<Document, String> {
+    load_mode(path, palette, true)
+}
+
+/// Build source rows from the same loaded snapshot, without reading the file again.
+pub(crate) fn source_from_text(path: &Path, text: &Arc<str>, palette: &Palette) -> Document {
+    let mut document = source_document(path, &sanitize(text), palette);
+    document.source = Arc::clone(text);
+    document
+}
+
+fn load_mode(path: &Path, palette: &Palette, raw: bool) -> Result<Document, String> {
     let metadata =
         std::fs::metadata(path).map_err(|error| format!("Cannot read file metadata: {error}"))?;
     if !metadata.is_file() {
@@ -66,7 +86,9 @@ pub fn load(path: &Path, palette: &Palette) -> Result<Document, String> {
     if text.is_empty() {
         return Ok(Document {
             lines: vec![Line::default()],
+            source: Arc::from(text),
             notice: Some("Empty file.".into()),
+            source_lines: true,
             markdown_source: is_markdown.then(|| Arc::from(text)),
             supports_reading: !is_markdown
                 && !extension.eq_ignore_ascii_case("json")
@@ -74,33 +96,50 @@ pub fn load(path: &Path, palette: &Palette) -> Result<Document, String> {
                     .is_none_or(|syntax| syntax.name == "Plain Text"),
         });
     }
-    if extension.eq_ignore_ascii_case("json") && !is_jsonc_config(path) {
-        return Ok(json_document(text, palette));
-    }
-    if is_markdown {
-        Ok(markdown_document(text, palette))
+    let mut document = if !raw && extension.eq_ignore_ascii_case("json") && !is_jsonc_config(path) {
+        json_document(text, palette)
+    } else if is_markdown {
+        markdown_document(text, palette)
     } else {
-        Ok(source_document(path, &sanitize(text), palette))
-    }
+        source_document(path, &sanitize(text), palette)
+    };
+    document.source = Arc::from(text);
+    Ok(document)
+}
+
+/// Borrow source lines with the display policy: CRLF, LF, and CR each break a
+/// line; a trailing break leaves an empty final line.
+pub(crate) fn logical_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut remaining = Some(text);
+    std::iter::from_fn(move || {
+        let text = remaining.take()?;
+        match text.bytes().position(|byte| byte == b'\r' || byte == b'\n') {
+            Some(end) => {
+                let delimiter = 1 + usize::from(
+                    text.as_bytes()[end] == b'\r' && text.as_bytes().get(end + 1) == Some(&b'\n'),
+                );
+                remaining = Some(&text[end + delimiter..]);
+                Some(&text[..end])
+            }
+            None => Some(text),
+        }
+    })
 }
 
 // Never allow C0/C1 controls, including terminal escape sequences, through to the backend.
 // Preserve line breaks and expand tabs so terminal tab stops cannot affect the layout.
 fn sanitize(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                }
-                clean.push('\n');
+    for (index, line) in logical_lines(text).enumerate() {
+        if index != 0 {
+            clean.push('\n');
+        }
+        for ch in line.chars() {
+            match ch {
+                '\t' => clean.push_str("    "),
+                c if c.is_control() => clean.push('\u{fffd}'),
+                c => clean.push(c),
             }
-            '\n' => clean.push('\n'),
-            '\t' => clean.push_str("    "),
-            c if c.is_control() => clean.push('\u{fffd}'),
-            c => clean.push(c),
         }
     }
     clean
@@ -162,8 +201,10 @@ impl Lines {
         };
         Document {
             lines: self.lines,
+            source: Arc::from(""),
             markdown_source: None,
             supports_reading: false,
+            source_lines: false,
             notice,
         }
     }
@@ -491,14 +532,110 @@ fn syntax_style(stack: &ScopeStack, assets: &SyntaxAssets, palette: &Palette) ->
     style
 }
 
+/// Grammar identity shared by source previews and the live editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SourceSyntax(Option<usize>);
+
+impl SourceSyntax {
+    pub(crate) fn for_path(path: &Path, first_line: &str) -> Self {
+        let assets = &*SYNTAX_ASSETS;
+        Self(syntax_for(assets, path, first_line).map(|selected| {
+            assets
+                .syntaxes
+                .syntaxes()
+                .iter()
+                .position(|syntax| std::ptr::eq(syntax, selected))
+                .expect("selected syntax belongs to the shared syntax set")
+        }))
+    }
+
+    pub(crate) fn state(self) -> SourceState {
+        SourceState {
+            parser: self
+                .0
+                .map(|index| ParseState::new(&SYNTAX_ASSETS.syntaxes.syntaxes()[index])),
+            stack: ScopeStack::new(),
+        }
+    }
+
+    fn supports_reading(self) -> bool {
+        self.0
+            .is_none_or(|index| SYNTAX_ASSETS.syntaxes.syntaxes()[index].name == "Plain Text")
+    }
+}
+
+/// The outgoing lexical boundary of a line, including embedded grammar state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceState {
+    parser: Option<ParseState>,
+    stack: ScopeStack,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SourceStyleRange {
+    pub(crate) bytes: std::ops::Range<usize>,
+    pub(crate) style: Style,
+}
+
+impl SourceState {
+    /// `input` includes its real line break; ranges exclude that line break.
+    /// The caller retains the original bytes and owns any display substitution.
+    pub(crate) fn line(
+        &mut self,
+        input: &str,
+        visible_len: usize,
+        palette: &Palette,
+    ) -> Vec<SourceStyleRange> {
+        let assets = &*SYNTAX_ASSETS;
+        let operations = self
+            .parser
+            .as_mut()
+            .and_then(|parser| parser.parse_line(input, &assets.syntaxes).ok());
+        let mut ranges = Vec::new();
+        if let Some(operations) = operations {
+            let mut position = 0;
+            let mut valid = true;
+            for (index, operation) in operations {
+                let end = index.min(visible_len);
+                if position < end {
+                    ranges.push(SourceStyleRange {
+                        bytes: position..end,
+                        style: syntax_style(&self.stack, assets, palette),
+                    });
+                }
+                position = end;
+                if self.stack.apply(&operation).is_err() {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                if position < visible_len {
+                    ranges.push(SourceStyleRange {
+                        bytes: position..visible_len,
+                        style: syntax_style(&self.stack, assets, palette),
+                    });
+                }
+                return ranges;
+            }
+        }
+        // Retain the source preview's readable fallback after a parser failure.
+        self.parser = None;
+        ranges.clear();
+        ranges.push(SourceStyleRange {
+            bytes: 0..visible_len,
+            style: Style::default().fg(palette.syntax.text),
+        });
+        ranges
+    }
+}
+
 // The input has already been sanitized. Parse once per document, retaining lexer
 // state across lines; unknown syntaxes and parser errors remain readable as text.
 fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
-    let assets = &*SYNTAX_ASSETS;
-    let syntax = syntax_for(assets, path, text);
-    let supports_reading = syntax.is_none_or(|syntax| syntax.name == "Plain Text");
-    let mut parser = syntax.map(ParseState::new);
-    let mut stack = ScopeStack::new();
+    let syntax = SourceSyntax::for_path(path, text.lines().next().unwrap_or(""));
+    let supports_reading = syntax.supports_reading();
+    let mut state = syntax.state();
     let mut lines = Vec::new();
     let mut offset = 0;
     let mut parts = text.split('\n');
@@ -506,56 +643,20 @@ fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
         let end = offset + line.len();
         let input_end = end + usize::from(text.as_bytes().get(end) == Some(&b'\n'));
         let input = &text[offset..input_end];
-        let mut spans = Vec::new();
-        let operations = parser
-            .as_mut()
-            .and_then(|state| state.parse_line(input, &assets.syntaxes).ok());
-        if let Some(operations) = operations {
-            let mut position = 0;
-            let mut valid = true;
-            for (index, operation) in operations {
-                let visible_end = index.min(line.len());
-                if position < visible_end {
-                    spans.push(Span::styled(
-                        line[position..visible_end].to_owned(),
-                        syntax_style(&stack, assets, palette),
-                    ));
-                }
-                position = visible_end;
-                if stack.apply(&operation).is_err() {
-                    valid = false;
-                    break;
-                }
-            }
-            if valid {
-                if position < line.len() {
-                    spans.push(Span::styled(
-                        line[position..].to_owned(),
-                        syntax_style(&stack, assets, palette),
-                    ));
-                }
-            } else {
-                parser = None;
-                spans.clear();
-                spans.push(Span::styled(
-                    line.to_owned(),
-                    Style::default().fg(palette.syntax.text),
-                ));
-            }
-        } else {
-            parser = None;
-            spans.push(Span::styled(
-                line.to_owned(),
-                Style::default().fg(palette.syntax.text),
-            ));
-        }
+        let spans = state
+            .line(input, line.len(), palette)
+            .into_iter()
+            .map(|range| Span::styled(line[range.bytes].to_owned(), range.style))
+            .collect::<Vec<_>>();
         lines.push(Line::from(spans));
         offset = input_end;
     }
     Document {
         lines,
+        source: Arc::from(""),
         markdown_source: None,
         supports_reading,
+        source_lines: true,
         notice: parts
             .next()
             .map(|_| format!("Preview is limited to {MAX_LINES} lines.")),
@@ -565,6 +666,7 @@ fn source_document(path: &Path, text: &str, palette: &Palette) -> Document {
 fn markdown_document(text: &str, palette: &Palette) -> Document {
     let mut doc = source_document(Path::new("source.md"), &sanitize(text), palette);
     doc.markdown_source = Some(Arc::from(text));
+    doc.source = Arc::from(text);
     doc.supports_reading = false;
     doc
 }
@@ -719,6 +821,7 @@ fn format_json(text: &str, palette: &Palette) -> Document {
         .join("\n");
     let mut doc = source_document(Path::new("source.json"), &text, palette);
     doc.supports_reading = false;
+    doc.source_lines = false;
     doc.notice = formatted.notice;
     doc
 }

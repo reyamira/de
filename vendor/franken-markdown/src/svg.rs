@@ -100,7 +100,7 @@ pub struct SvgOptions {
     /// Visual theme (palette, page margins, font family).
     pub theme: Theme,
     /// Page width in points; the height grows to fit the content.
-    /// Values outside 144..=14400 points fall back to US Letter width, with
+    /// Values outside 1..=14400 points fall back to US Letter width, with
     /// an `svg_layout_adjusted` diagnostic from the diagnostic APIs.
     pub max_width_pt: f32,
     /// Multiplier applied to each existing heading size.
@@ -187,12 +187,39 @@ pub fn render_svg_with_diagnostics(
 /// 32 MiB; input/encoded image budgets
 /// and aggregate supplied fonts are bounded to 128 MiB each. At most 4096
 /// images are admitted. Existing option/report structures stay unchanged.
+#[cfg(test)]
 pub fn render_svg_with_resources(
     doc: &Document,
     opts: &SvgOptions,
     fonts: &franken_markdown::FontAssets,
     images: &[franken_markdown::PdfImageAsset],
 ) -> franken_markdown::Result<(Vec<u8>, SvgReport, Vec<SvgWarning>)> {
+    let (svg, report, warnings, _, _) = render_svg_with_text(
+        doc,
+        opts,
+        fonts,
+        images,
+        crate::fmd_parse::Provenance::default(),
+    )?;
+    Ok((svg, report, warnings))
+}
+
+type SvgTextOutput = (
+    Vec<u8>,
+    SvgReport,
+    Vec<SvgWarning>,
+    crate::rendered_text::RenderedText,
+    (f32, f32),
+);
+
+/// Capture native text at the same shape and paint sites as the SVG.
+pub(crate) fn render_svg_with_text(
+    doc: &Document,
+    opts: &SvgOptions,
+    fonts: &franken_markdown::FontAssets,
+    images: &[franken_markdown::PdfImageAsset],
+    provenance: crate::fmd_parse::Provenance,
+) -> franken_markdown::Result<SvgTextOutput> {
     if opts
         .heading_font
         .as_ref()
@@ -203,6 +230,7 @@ pub fn render_svg_with_resources(
         ));
     }
     let mut poster = Poster::new(opts).with_resources(fonts, images)?;
+    poster.text = RefCell::new(crate::rendered_text::TextLayout::new(provenance));
     if opts.heading_font.is_some() && poster.faces[SLOT_HEADING].is_none() {
         return Err(franken_markdown::RenderError::InvalidInput(
             "svg_resources: invalid heading font".to_owned(),
@@ -210,7 +238,13 @@ pub fn render_svg_with_resources(
     }
     let height = poster.layout(doc);
     poster.validate_cff_glyphs()?;
-    Ok(poster.emit(height))
+    let text = std::mem::take(poster.text.get_mut()).finish();
+    let dimensions = (
+        (poster.width * 100.0).round() as f32 / 100.0,
+        (height * 100.0).round() as f32 / 100.0,
+    );
+    let (svg, report, warnings) = poster.emit(height);
+    Ok((svg, report, warnings, text, dimensions))
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +478,8 @@ impl RStyle {
 enum Piece {
     Text(String, RStyle),
     Math(String, bool, RStyle),
+    MappedText(String, RStyle, crate::rendered_text::TextMap),
+    MappedMath(String, bool, RStyle, crate::rendered_text::TextMap),
     Image(String, String, RStyle),
     Break,
 }
@@ -452,6 +488,7 @@ enum Piece {
 #[derive(Debug, Clone)]
 struct Word {
     text: String,
+    logical: crate::rendered_text::TextMap,
     style: RStyle,
     w: f64,
     /// Actual source whitespace before this run; zero across style boundaries.
@@ -468,6 +505,8 @@ struct Word {
 // The poster painter.
 // ---------------------------------------------------------------------------
 
+type MathCache = RefCell<BTreeMap<String, Result<std::rc::Rc<math::Formula>, SvgWarning>>>;
+
 struct Poster {
     /// Body regular/bold/italic/bold-italic, mono, symbol fallback. `None`
     /// only if a bundled face failed to parse (the registry tests make that
@@ -479,8 +518,10 @@ struct Poster {
     /// face's static ranges, so posters without CJK text never parse it.
     cjk: OnceCell<Option<&'static Font>>,
     math_engine: OnceCell<Option<franken_markdown::math::Engine>>,
+    math_cache: [MathCache; 2],
     images: images::ImageStore,
     navigation: RefCell<links::Navigation>,
+    text: RefCell<crate::rendered_text::TextLayout>,
     warnings: Vec<SvgWarning>,
     colors: ThemeColors,
     heading_color: Option<String>,
@@ -523,8 +564,10 @@ impl Poster {
             ],
             cjk: OnceCell::new(),
             math_engine: OnceCell::new(),
+            math_cache: std::array::from_fn(|_| RefCell::default()),
             images: images::ImageStore::default(),
             navigation: RefCell::new(links::Navigation::default()),
+            text: RefCell::default(),
             warnings: geometry.warnings,
             colors: theme.effective_colors(false, false).clone(),
             heading_color: opts.heading_color.clone(),
@@ -738,18 +781,59 @@ impl Poster {
     }
 
     // -- inline flattening and wrapping -------------------------------------
+    fn text_piece(&self, text: &str, style: RStyle) -> Piece {
+        let mut layout = self.text.borrow_mut();
+        layout.leaf(text);
+        Piece::MappedText(text.to_owned(), style, layout.map(text))
+    }
+
+    fn synthetic_piece(&self, text: String, style: RStyle) -> Piece {
+        let logical = self.text.borrow_mut().synthetic_leaf(&text);
+        Piece::MappedText(text, style, logical)
+    }
+
+    fn reading_inlines(&self, inlines: &[Inline]) {
+        for inline in inlines {
+            match inline {
+                Inline::Text(s) | Inline::Code(s) | Inline::Html(s) => {
+                    self.text.borrow_mut().leaf(s)
+                }
+                Inline::Emphasis(inner)
+                | Inline::Strong(inner)
+                | Inline::Strikethrough(inner)
+                | Inline::Link { content: inner, .. } => self.reading_inlines(inner),
+                Inline::HardBreak => self
+                    .text
+                    .borrow_mut()
+                    .boundary(inline as *const Inline as usize, '\n'),
+                Inline::SoftBreak => self
+                    .text
+                    .borrow_mut()
+                    .boundary(inline as *const Inline as usize, ' '),
+                Inline::Math(source) | Inline::DisplayMath(source) => {
+                    if self
+                        .typeset_formula(source, matches!(inline, Inline::DisplayMath(_)))
+                        .is_err()
+                    {
+                        self.text.borrow_mut().leaf(source);
+                    }
+                }
+                Inline::Image { .. } | Inline::FootnoteRef { .. } => {}
+            }
+        }
+    }
 
     fn flatten(&self, inlines: &[Inline], st: RStyle, out: &mut Vec<Piece>) {
         for inline in inlines {
             match inline {
-                Inline::Text(s) => out.push(Piece::Text(s.clone(), st)),
+                Inline::Text(s) => out.push(self.text_piece(s, st)),
                 Inline::Emphasis(inner) => self.flatten(inner, RStyle { italic: true, ..st }, out),
                 Inline::Strong(content) => self.flatten(content, RStyle { bold: true, ..st }, out),
                 Inline::Strikethrough(inner) => {
                     self.flatten(inner, RStyle { strike: true, ..st }, out);
                 }
-                Inline::Code(s) => out.push(Piece::Text(
-                    s.clone(),
+                Inline::Code(s) => out.push(self.text_piece(
+                    s,
                     RStyle {
                         mono: true,
                         ink: if self.code_text_color.is_some() {
@@ -782,20 +866,38 @@ impl Poster {
                 Inline::Image { alt, dest, .. } => {
                     out.push(Piece::Image(dest.clone(), alt.clone(), st));
                 }
-                Inline::SoftBreak => out.push(Piece::Text(" ".to_string(), st)),
-                Inline::HardBreak => out.push(Piece::Break),
-                Inline::Html(s) => {
-                    out.push(Piece::Text(s.clone(), RStyle { mono: true, ..st }));
+                Inline::SoftBreak => {
+                    self.text
+                        .borrow_mut()
+                        .boundary(inline as *const Inline as usize, ' ');
+                    out.push(Piece::Text(" ".to_string(), st));
                 }
-                Inline::FootnoteRef { id } => out.push(Piece::Text(
+                Inline::HardBreak => {
+                    self.text
+                        .borrow_mut()
+                        .boundary(inline as *const Inline as usize, '\n');
+                    out.push(Piece::Break);
+                }
+                Inline::Html(s) => {
+                    out.push(self.text_piece(s, RStyle { mono: true, ..st }));
+                }
+                Inline::FootnoteRef { id } => out.push(self.synthetic_piece(
                     format!("[^{id}]"),
                     RStyle {
                         ink: Ink::FgMuted,
                         ..st
                     },
                 )),
-                Inline::Math(s) => out.push(Piece::Math(s.clone(), false, st)),
-                Inline::DisplayMath(s) => out.push(Piece::Math(s.clone(), true, st)),
+                Inline::Math(s) | Inline::DisplayMath(s) => {
+                    let display = matches!(inline, Inline::DisplayMath(_));
+                    if self.typeset_formula(s, display).is_err() {
+                        let mut layout = self.text.borrow_mut();
+                        layout.leaf(s);
+                        out.push(Piece::MappedMath(s.clone(), display, st, layout.map(s)));
+                    } else {
+                        out.push(Piece::Math(s.clone(), display, st));
+                    }
+                }
             }
         }
     }
@@ -809,18 +911,7 @@ impl Poster {
             Block::CodeBlock { lang, code } => {
                 // Mermaid diagrams draw as figures, as in HTML and PDF.
                 match franken_markdown::diagrams::figure_svg(code, lang.as_deref().unwrap_or("")) {
-                    Some((svg, alt)) => {
-                        let dest = format!(
-                            "data:image/svg+xml;base64,{}",
-                            franken_markdown::html::base64_encode(svg.as_bytes())
-                        );
-                        let image = Inline::Image {
-                            dest,
-                            title: None,
-                            alt: alt.to_owned(),
-                        };
-                        self.paragraph(std::slice::from_ref(&image), l, r, quote);
-                    }
+                    Some((svg, alt)) => self.figure(&svg, alt, l, r, quote),
                     None => self.code_panel(code, l, r),
                 }
             }
@@ -847,6 +938,7 @@ impl Poster {
                 let body_size = f64::from(self.scale.body);
                 for item in items {
                     for term in &item.terms {
+                        self.text.borrow_mut().separator('\n');
                         let mut pieces = Vec::new();
                         self.flatten(
                             term,
@@ -859,6 +951,7 @@ impl Poster {
                         self.text_lines(&pieces, body_size, l, r, quote, body_size * 0.4);
                     }
                     for def in &item.definitions {
+                        self.text.borrow_mut().separator('\n');
                         let mut pieces = Vec::new();
                         self.flatten(def, RStyle::BODY, &mut pieces);
                         let inset = self.inset(l, r, 18.0 * self.unit_scale());
@@ -891,13 +984,14 @@ impl Poster {
         for line in &lines {
             let (ascent, height) = self.line_metrics(line, size * 0.85, leading);
             let baseline = self.y + ascent;
-            self.draw_words(line, l, baseline, size);
+            self.draw_words_at(line, l, baseline, size, ascent, height);
             self.y += height;
         }
         self.y += gap_after;
     }
 
     fn heading(&mut self, level: u8, inlines: &[Inline], l: f64, r: f64, quote: bool) {
+        self.text.borrow_mut().separator('\n');
         let idx = usize::from(level.clamp(1, 6) - 1);
         let size = f64::from(self.scale.h[idx]);
         if self.y > self.top + 0.01 {
@@ -925,7 +1019,7 @@ impl Poster {
         for line in &lines {
             let (ascent, height) = self.line_metrics(line, size * 0.85, leading);
             let baseline = self.y + ascent;
-            self.draw_words(line, l, baseline, size);
+            self.draw_words_at(line, l, baseline, size, ascent, height);
             self.y += height;
         }
         if level == 1 {
@@ -960,6 +1054,7 @@ impl Poster {
     }
 
     fn paragraph(&mut self, inlines: &[Inline], l: f64, r: f64, quote: bool) {
+        self.text.borrow_mut().separator('\n');
         let size = f64::from(self.scale.body);
         let ink = Self::default_ink(quote);
         let mut pieces = Vec::new();
@@ -976,6 +1071,8 @@ impl Poster {
 
     /// Fenced code and unsupported math: mono face on a themed panel.
     fn code_panel(&mut self, code: &str, l: f64, r: f64) {
+        self.text.borrow_mut().separator('\n');
+        self.text.borrow_mut().leaf(code);
         let size = f64::from(self.scale.code);
         let leading = size * 1.45;
         let pad = 8.0 * self.unit_scale();
@@ -1001,7 +1098,7 @@ impl Poster {
         for line in &lines {
             let row = std::slice::from_ref(line);
             let (ascent, height) = self.line_metrics(row, size * 0.8, leading);
-            self.draw_words(row, l + inset, ly + ascent, size);
+            self.draw_words_at(row, l + inset, ly + ascent, size, ascent, height);
             ly += height;
         }
         self.y += h + f64::from(self.scale.body) * 0.7;

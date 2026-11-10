@@ -37,22 +37,58 @@ uses the rightmost content column when there is enough space.
 In the viewer, use arrows or `j`/`k` to scroll. Use `PageUp`/`PageDown` for pages
 and `Home`/`End` for the beginning or end. For Markdown, press `m` to switch
 between the rendered page and source. The header shows the current mode.
-Press `Escape` or `q` to return to the same selection. Press `o` to open the
-file externally. During filter input, `v` and `m` remain query text.
+Press `Escape` or `q` to return to the same selection or search result.
+Press `e` to edit the original source, including from rendered Markdown.
+Press `o` to open the file externally.
+During search input, letters such as `v`, `e`, and `m` remain query text.
 
 The full-width plain text viewer starts in raw layout, which preserves hard
 newlines. Press uppercase `R` to switch to reading layout and back. Reading
 layout reflows paragraph lines without changing the file. Code and Markdown
 source keep their newlines.
 
-Use the mouse wheel over the viewer to scroll three rows per notch. Click the
-scrollbar track to jump, or drag the thumb to scroll. Mouse capture is active
-only while the viewer is open. The viewer stays next to the prompt, subject to
-normal terminal scrolling when it needs more rows. Mouse controls require a
-terminal that answers cursor-position queries. If it does not answer promptly,
-mouse capture stays off for that session; keyboard controls remain available.
-After the terminal width shrinks, reflow can leave a fragment of the old frame
-above the viewer.
+Source previews, raw source viewers, and the editor show original line numbers.
+Only the first wrapped row has a number.
+Very narrow text areas omit the gutter to keep text readable.
+Notice rows, reading layout, formatted JSON, images, and rendered Markdown have no source numbers.
+Content-search results open at the exact first matching byte, including wrapped continuation rows.
+Visible Markdown matches open in rendered mode.
+Hidden Markdown syntax opens in source mode.
+JSON content results use original source layout.
+
+Use the mouse wheel over the viewer or editor to scroll three rows per notch.
+Click the scrollbar track to jump, or drag the thumb to scroll.
+Editor scrolling keeps the caret, selection, text, and undo history unchanged.
+Keyboard movement or editing brings the caret back into view.
+Mouse capture runs only while the viewer or editor is open.
+Mouse controls require a terminal that answers cursor-position queries.
+If the terminal does not answer promptly, mouse capture stays off for that session.
+Keyboard controls remain available.
+After the terminal width shrinks, reflow can leave an old frame fragment above the viewer.
+
+Drag source or rendered text to select it.
+Press `y` to send selected text through OSC52 to the terminal clipboard.
+With a selection, `Ctrl-C` does the same action.
+Without a selection, `Ctrl-C` retains normal cancellation.
+The terminal must support and permit OSC52.
+The status reports transmission, not clipboard acceptance.
+Copying has a 100,000-byte limit and never writes to directory-selection stdout.
+Source copying preserves original UTF-8 bytes, tabs, and line endings.
+Gutters and soft wraps are not part of copied text.
+Rendered copying uses visible plain text, without Markdown delimiters or hidden link destinations.
+
+In the viewer, press `/` to start in-file find.
+Type literal, case-insensitive text to highlight matches and show the current match count.
+Press `Enter` to accept the find.
+Use `n` and `N` for the next and previous matches.
+Matches wrap at the end or beginning.
+During the find prompt, `Escape` cancels find and restores the previous mode and scroll.
+Outside the prompt, `Escape` returns to the picker or existing browser results.
+Find uses original source layout for formatted JSON.
+It does not index formatted rows with raw source offsets.
+Closing the viewer restores the formatted JSON snapshot, including after an accepted find.
+It does not read a changed file again for this restoration.
+In-file find does not change the browser query, results, or selected result.
 
 Image previews require the Kitty graphics protocol. They are unavailable in
 other terminals and inside tmux, GNU Screen, or Zellij. When `de` cannot show a
@@ -60,9 +96,13 @@ file, it explains the reason and shows the external-open option. Video playback
 remains external.
 
 The native FMD Markdown view requires Kitty or Ghostty without a terminal
-multiplexer. It does not require a browser. The page is a raster image, so text
-selection and clickable links are not available. Source mode does not require
-terminal graphics support.
+multiplexer. It does not require a browser.
+Native text supports selection, copying, and find through the renderer's text geometry.
+Mouse events identify terminal cells.
+Rendered hit testing uses each cell's center, not exact pointer pixels within that cell.
+Images, diagrams, and typeset vector math remain graphics, not selectable text.
+Links are not clickable.
+Source mode does not require terminal graphics support.
 
 Themes can set separate colors for source syntax, Markdown source, and rendered
 Markdown. Rendered Markdown also supports separate body, heading, and code fonts,
@@ -79,6 +119,10 @@ document is limited to 128 image occurrences, 32 MiB of image source data, and
 FMD supports some Mermaid diagrams. Unsupported diagrams remain as source.
 Rendering runs in the background. The viewer keeps the last viewport while it
 prepares a new one. New requests replace queued work.
+Supported Mermaid figures fill their local content width and preserve their aspect ratio.
+Their layout reserves the scaled height, including after a resize.
+Ordinary images keep their intrinsic sizing.
+The renderer reflows narrow pages without scaling the body text.
 
 Text previews accept regular UTF-8 files up to 1 MiB. Styled text and source
 previews show at most 20,000 lines. Image previews accept files up to 16 MiB
@@ -92,3 +136,82 @@ the image is prepared, and navigation remains available. New selections replace
 queued work, and results from old selections do not replace the current preview.
 The viewer sends compressed image data in bounded batches between input checks.
 
+## Built-in file editor
+
+Press `e` on a selected file or inside its viewer.
+At normal widths, picker-origin editing stays in the right preview pane and keeps the directory list visible.
+Viewer-origin editing keeps the full-width viewer frame in rendered and source modes.
+The editor keeps the same content width and leaves the scrollbar column clear.
+Wrapping, cursor movement, and page movement use the area inside the frame.
+Small areas omit the frame when it cannot fit.
+Below 58 columns, the preview editor uses full width.
+It loads the original file, not highlighted, formatted, or truncated preview rows.
+Leaving the editor returns to the same picker or viewer.
+
+The editor highlights unsaved source with the same grammars and theme colors as source previews.
+This includes Markdown fences and filename, extension, and first-line grammar selection.
+Unknown types use the theme's plain source color.
+JSON stays in its original layout while you edit it.
+
+Highlighting updates after typing, paste, undo, and redo, including changes to multiline comments and strings.
+The cache keeps unchanged line states and updates later lines until their syntax state matches again.
+Cursor movement reuses highlighting; resizing only changes wrapping.
+Selections override syntax colors without changing source bytes, tabs, or grapheme boundaries.
+
+| Key | Action |
+| --- | --- |
+| Arrows, `Home`, `End`, `PageUp`, `PageDown` | Move the cursor |
+| `Ctrl-Left`, `Ctrl-Right` | Move by word |
+| `Ctrl-Home`, `Ctrl-End` | Move to the buffer start or end |
+| `Shift` with movement keys | Extend the selection |
+| `Ctrl-A` | Select all |
+| `Backspace`, `Delete` | Delete the selection or adjacent text |
+| `Enter`, `Tab` | Insert a newline or tab |
+| `Ctrl-C`, `Ctrl-X`, `Ctrl-V` | Copy, cut, or paste with the editor's internal clipboard |
+| `Ctrl-Z`, `Ctrl-Y`, `Ctrl-Shift-Z` | Undo or redo |
+| `Ctrl-S` | Save |
+| `Escape`, `Ctrl-Q` | Return, with a changed-buffer prompt when needed |
+
+Ordinary letters, including `q`, insert text.
+`Ctrl-C` does not cancel the application while editing.
+Terminal bracketed paste inserts text as one edit.
+The editor does not access the system clipboard.
+For terminal clipboard paste, use your terminal's paste command.
+
+If the buffer changed, choose `s` to save, `d` to discard, or `c`/`Escape` to keep editing.
+Save errors and external-change conflicts keep the changed buffer open.
+The editor does not force an overwrite or silently reload a changed file.
+
+### File safety policy
+
+The editor accepts existing, writable, regular UTF-8 files up to 1 MiB and 20,000 logical lines.
+It rejects symbolic links, multiply linked files, binary text, and unsupported control characters.
+It rejects source files with mixed newline styles or lone carriage returns.
+It preserves UTF-8 content, the byte-order mark, LF or CRLF style, the final-newline state, and permissions.
+Inserted newlines and pasted CR, CRLF, or LF line breaks use the file's newline style.
+Edits can intentionally add or remove the final newline.
+
+Saving checks the original file identity and contents before replacement.
+It writes a temporary file in the same folder, then replaces the original atomically.
+This requires write access to the containing folder.
+The editor does not provide autosave, backup files, multiple buffers, or a force-save command.
+Atomic replacement does not preserve ownership, inode identity, extended attributes, ACLs, or hard-link relationships.
+The final external-change check cannot lock out another process that writes during replacement.
+File data is synced before replacement; directory-entry crash durability is not guaranteed.
+
+## Search limits
+
+Search runs in one background worker under the current header folder.
+New queries cancel old work, and stale results cannot replace current results.
+Names and text use literal case-insensitive matching.
+Each matching original line produces one content result.
+Results highlight matching excerpt text and retain exact original-byte activation targets.
+Each excerpt contains up to 240 source characters around the first match.
+Source and rendered previews highlight all matches in the loaded document.
+The search skips file contents above 1 MiB or 20,000 logical lines, including an empty final line.
+It skips binary, non-UTF-8, and symlink contents without hiding matching names.
+It respects ignore rules and hides dotfiles unless the current hidden setting enables them.
+It does not traverse directory symlinks.
+Results are ordered by path, then source line.
+The result limit is 10,000; the footer reports when the limit applies.
+The footer also shows search progress and completion.

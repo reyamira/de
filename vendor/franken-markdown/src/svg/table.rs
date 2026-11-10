@@ -22,6 +22,22 @@ impl Poster {
             Some(rows) => rows.iter().map(|row| row.cells).collect(),
             None => table.rows.iter().map(Vec::as_slice).collect(),
         };
+        self.text.borrow_mut().separator('\n');
+        for (column, cell) in table.head.iter().enumerate() {
+            if column > 0 {
+                self.text.borrow_mut().cell_separator();
+            }
+            self.reading_inlines(cell);
+        }
+        for row in &rows {
+            self.text.borrow_mut().row_separator();
+            for (column, cell) in row.iter().enumerate() {
+                if column > 0 {
+                    self.text.borrow_mut().cell_separator();
+                }
+                self.reading_inlines(cell);
+            }
+        }
         let aligns: Vec<Align> = (0..ncols)
             .map(|c| table.align.get(c).copied().unwrap_or(Align::None))
             .collect();
@@ -185,7 +201,7 @@ impl Poster {
                             Align::None | Align::Left => cx + padding,
                         };
                         let (ascent, height) = poster.line_metrics(line, size * 0.8, leading);
-                        poster.draw_words(line, x, line_top + ascent, size);
+                        poster.draw_words_at(line, x, line_top + ascent, size, ascent, height);
                         line_top += height;
                     }
                     cx += widths[c];

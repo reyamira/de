@@ -122,6 +122,24 @@ impl SortDirection {
 }
 
 #[derive(Debug)]
+struct SearchSnapshot {
+    current_dir: PathBuf,
+    entries: Vec<Entry>,
+    all_entries: Vec<Entry>,
+    selected: usize,
+}
+
+#[derive(Debug, Default)]
+struct ViewerFind {
+    query: String,
+    matches: Arc<[std::ops::Range<usize>]>,
+    active: Option<usize>,
+    prompt: bool,
+    saved: Option<(bool, bool, usize, crate::document::Document)>,
+    preview_document: Option<crate::document::Document>,
+}
+
+#[derive(Debug)]
 pub struct App {
     current_dir: PathBuf,
     all_entries: Vec<Entry>,
@@ -130,8 +148,16 @@ pub struct App {
     show_hidden: bool,
     status: Option<String>,
     preview: Preview,
-    filtering: bool,
-    filter: String,
+    search_query: String,
+    search_snapshot: Option<SearchSnapshot>,
+    search_worker: crate::search::SearchWorker,
+    search_generation: Option<u64>,
+    search_hits: Vec<crate::search::SearchHit>,
+    search_scanned: usize,
+    search_truncated: bool,
+    viewer_source_line: Option<usize>,
+    editor: Option<crate::editor::Editor>,
+    editor_cache: RefCell<Option<crate::ui::EditorText>>,
     sort_mode: SortMode,
     sort_direction: SortDirection,
     theme: Theme,
@@ -146,10 +172,15 @@ pub struct App {
     markdown_renderer: Option<crate::markdown_renderer::MarkdownRenderer>,
     markdown_request: Option<u64>,
     markdown_key: Option<(u32, u32, u32, Arc<crate::render_theme::RenderedTheme>)>,
+    markdown_layout: Option<(u32, u32, Arc<crate::render_theme::RenderedTheme>)>,
     markdown_page: Option<crate::markdown_renderer::RenderedPage>,
     markdown_error: Option<String>,
     markdown_cell_height: usize,
     theme_sample: ThemeSample,
+    find: ViewerFind,
+    viewer_selection: Option<(usize, usize)>,
+    reveal_match: bool,
+    browser_target: Option<std::ops::Range<usize>>,
 }
 
 impl App {
@@ -186,8 +217,16 @@ impl App {
                 document: None,
                 image: None,
             },
-            filtering: false,
-            filter: String::new(),
+            search_query: String::new(),
+            search_snapshot: None,
+            search_worker: crate::search::SearchWorker::new(),
+            search_generation: None,
+            search_hits: Vec::new(),
+            search_scanned: 0,
+            search_truncated: false,
+            viewer_source_line: None,
+            editor: None,
+            editor_cache: RefCell::new(None),
             sort_mode,
             sort_direction,
             theme: Theme::auto(),
@@ -202,10 +241,15 @@ impl App {
             markdown_renderer: None,
             markdown_request: None,
             markdown_key: None,
+            markdown_layout: None,
             markdown_page: None,
             markdown_error: None,
             markdown_cell_height: 16,
             theme_sample: ThemeSample::Picker,
+            find: ViewerFind::default(),
+            viewer_selection: None,
+            reveal_match: false,
+            browser_target: None,
         };
         app.refresh_preview();
         Ok(app)
@@ -313,6 +357,8 @@ impl App {
             self.reading = !self.reading;
             self.viewer_scroll = 0;
             self.status = None;
+            self.viewer_selection = None;
+            self.update_find_matches();
         } else {
             self.status = Some("reading mode is available for plain text only".into());
         }
@@ -330,6 +376,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|document| document.markdown_source.is_some())
         {
+            self.browser_target = None;
             self.markdown_source = !self.markdown_source;
             self.reading = false;
             self.status = None;
@@ -342,6 +389,8 @@ impl App {
                 };
             }
             self.cancel_markdown();
+            self.viewer_selection = None;
+            self.update_find_matches();
         }
     }
 
@@ -372,6 +421,7 @@ impl App {
 
     pub fn is_rendered_markdown_view(&self) -> bool {
         self.viewing
+            && self.editor.is_none()
             && !self.markdown_source
             && self
                 .preview
@@ -425,9 +475,9 @@ impl App {
             return;
         }
         if self
-            .markdown_key
+            .markdown_layout
             .as_ref()
-            .is_some_and(|old| old.0 != width || old.1 != height || !Arc::ptr_eq(&old.3, &style))
+            .is_some_and(|old| old.0 != width || old.1 != height || !Arc::ptr_eq(&old.2, &style))
         {
             self.markdown_page = None;
         }
@@ -442,6 +492,7 @@ impl App {
         else {
             return;
         };
+        let annotations = self.text_annotations();
         let renderer = self
             .markdown_renderer
             .get_or_insert_with(crate::markdown_renderer::MarkdownRenderer::new);
@@ -452,7 +503,9 @@ impl App {
             height,
             scroll_y: scroll,
             style: Arc::clone(&style),
+            annotations,
         }));
+        self.markdown_layout = Some((width, height, Arc::clone(&style)));
         self.markdown_key = Some((width, height, scroll, style));
         self.markdown_error = None;
     }
@@ -471,12 +524,27 @@ impl App {
         self.markdown_request = None;
         match result {
             Ok(page) => {
+                let layout_changed = self
+                    .markdown_page
+                    .as_ref()
+                    .is_none_or(|old| !Arc::ptr_eq(&old.text, &page.text));
                 self.viewer_scroll = page.scroll_y as usize;
                 if let Some(key) = &mut self.markdown_key {
                     key.2 = page.scroll_y;
                 }
                 self.markdown_error = None;
                 self.markdown_page = Some(page);
+                if layout_changed {
+                    self.update_find_matches();
+                }
+                if layout_changed && self.browser_target.is_some() && self.active_match().is_none()
+                {
+                    // Only genuinely hidden Markdown syntax opens in source mode.
+                    self.markdown_source = true;
+                    self.viewer_text_cache.get_mut().take();
+                    self.update_find_matches();
+                    self.reveal_match = true;
+                }
             }
             Err(error) => {
                 self.markdown_page = None;
@@ -492,6 +560,7 @@ impl App {
         }
         self.markdown_request = None;
         self.markdown_key = None;
+        self.markdown_layout = None;
         self.markdown_page = None;
         self.markdown_error = None;
     }
@@ -505,8 +574,23 @@ impl App {
             Some(entry) if !entry.is_dir => {
                 self.viewing = true;
                 self.viewer_scroll = 0;
+                self.find = ViewerFind::default();
+                self.viewer_selection = None;
+                self.browser_target = self.selected_search_hit().and_then(|hit| {
+                    let line = hit.line?;
+                    let range = hit.first_match.clone();
+                    let source = &self.preview.document.as_ref()?.source;
+                    let start = source_line_start(source, line)?;
+                    Some(start + range.start..start + range.end)
+                });
+                self.viewer_source_line = self.selected_search_hit().and_then(|hit| hit.line);
                 self.markdown_source = false;
                 self.reading = false;
+                if self.is_searching() {
+                    self.find.query = self.search_query.clone();
+                    self.update_find_matches();
+                    self.reveal_match = self.browser_target.is_some();
+                }
                 self.status = None;
             }
             _ => self.status = Some("select a file to view".into()),
@@ -514,10 +598,24 @@ impl App {
     }
 
     pub fn close_viewer(&mut self) {
+        let original = self.find.preview_document.take().or_else(|| {
+            self.find
+                .saved
+                .take()
+                .map(|(_, _, _, document)| document)
+                .filter(|document| !document.source_lines)
+        });
+        if let Some(document) = original {
+            self.preview.document = Some(document);
+            self.viewer_text_cache.get_mut().take();
+        }
         self.viewing = false;
         self.viewer_scroll = 0;
         self.reading = false;
         self.status = None;
+        self.find = ViewerFind::default();
+        self.viewer_selection = None;
+        self.browser_target = None;
         self.cancel_markdown();
     }
 
@@ -532,12 +630,414 @@ impl App {
         self.viewer_scroll = scroll;
     }
 
-    pub fn is_filtering(&self) -> bool {
-        self.filtering
+    pub fn is_searching(&self) -> bool {
+        self.search_snapshot.is_some()
     }
 
-    pub fn filter_query(&self) -> &str {
-        &self.filter
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    pub fn search_pending(&self) -> bool {
+        self.search_worker.is_pending()
+    }
+
+    /// Wake the inline loop only for workers whose results it can consume.
+    pub fn background_work_pending(&self) -> bool {
+        self.image_pending()
+            || self.markdown_pending()
+            || (!self.viewing && self.editor.is_none() && self.search_pending())
+    }
+
+    pub fn search_scanned(&self) -> usize {
+        self.search_scanned
+    }
+
+    pub fn search_truncated(&self) -> bool {
+        self.search_truncated
+    }
+
+    pub fn search_hit(&self, index: usize) -> Option<&crate::search::SearchHit> {
+        self.search_hits.get(index)
+    }
+
+    fn selected_search_hit(&self) -> Option<&crate::search::SearchHit> {
+        self.search_hit(self.selected)
+    }
+
+    pub fn editor(&self) -> Option<&crate::editor::Editor> {
+        self.editor.as_ref()
+    }
+
+    pub(crate) fn editor_cache(&self) -> &RefCell<Option<crate::ui::EditorText>> {
+        &self.editor_cache
+    }
+
+    pub fn open_editor(&mut self) {
+        let Some(entry) = self.selected_entry().filter(|entry| !entry.is_dir) else {
+            self.set_status("Select a regular text file to edit.");
+            return;
+        };
+        let path = entry.path.clone();
+        let line = self
+            .selected_search_hit()
+            .and_then(|hit| hit.line)
+            .unwrap_or_else(|| {
+                if self.viewing && !self.is_rendered_markdown_view() {
+                    crate::ui::viewer_source_at_scroll(self).unwrap_or(1)
+                } else {
+                    1
+                }
+            });
+        match crate::editor::Editor::open(path, line) {
+            Ok(editor) => {
+                self.cancel_image_request();
+                self.cancel_markdown();
+                self.viewer_selection = None;
+                self.editor = Some(editor);
+                self.editor_cache.get_mut().take();
+                self.status = None;
+            }
+            Err(error) => self.set_status(error),
+        }
+    }
+
+    pub fn handle_editor_key(&mut self, key: termina::event::KeyEvent, rows: usize) {
+        crate::ui::resume_editor_cursor(self);
+        if let Some(editor) = &mut self.editor
+            && matches!(
+                editor.handle_key(key, rows),
+                crate::editor::EditorOutcome::Close
+            )
+        {
+            self.editor = None;
+            self.editor_cache.get_mut().take();
+            let scroll = self.viewer_scroll;
+            let source = self.markdown_source;
+            let reading = self.reading;
+            self.preview.path = None;
+            self.find.preview_document = None;
+            self.refresh_preview();
+            self.viewer_scroll = scroll;
+            self.markdown_source = source;
+            self.reading = reading;
+            self.browser_target = None;
+            self.update_find_matches();
+        }
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        if let Some(editor) = &mut self.editor {
+            editor.paste(text);
+        } else if self.find.prompt {
+            self.find
+                .query
+                .extend(text.chars().filter(|ch| !ch.is_control()));
+            self.update_find_matches();
+            self.reveal_match = true;
+            self.status = None;
+        } else if self.is_searching() && !self.viewing {
+            self.search_query
+                .extend(text.chars().filter(|ch| !ch.is_control()));
+            self.request_search();
+        }
+    }
+
+    pub fn reveal_viewer_source(&mut self, area: ratatui::layout::Rect) {
+        if self.is_rendered_markdown_view() {
+            if self.reveal_match
+                && let (Some(page), Some(range)) =
+                    (self.markdown_page.as_ref(), self.active_match())
+                && let Some(rect) = page.text.rectangles(&range).first()
+            {
+                self.set_viewer_scroll((rect.y.max(0.0) as usize).min(self.markdown_scroll_max()));
+                self.reveal_match = false;
+                self.viewer_source_line = None;
+            }
+        } else if self.reveal_match {
+            if let Some(range) = self.active_match() {
+                self.viewer_scroll = crate::ui::source_byte_offset(
+                    self,
+                    crate::ui::viewer_body(area).width,
+                    range.start,
+                );
+            }
+            self.reveal_match = false;
+            self.viewer_source_line = None;
+        } else if let Some(line) = self.viewer_source_line.take() {
+            self.viewer_scroll =
+                crate::ui::source_line_offset(self, crate::ui::viewer_body(area).width, line);
+        }
+    }
+
+    pub fn resize_viewer_interaction(&mut self) {
+        self.reveal_match = self.active_match().is_some();
+        // No coordinates from an old native layout may survive a resize.
+        self.markdown_page = None;
+        self.markdown_key = None;
+        self.markdown_layout = None;
+        if let Some(renderer) = self.markdown_renderer.as_mut() {
+            renderer.cancel();
+        }
+        self.markdown_request = None;
+    }
+
+    pub fn find_prompt(&self) -> bool {
+        self.find.prompt
+    }
+
+    pub fn begin_find(&mut self) {
+        if self.preview.document.is_none() {
+            return;
+        }
+        self.invalidate_annotations();
+        self.find.saved = self
+            .preview
+            .document
+            .clone()
+            .map(|doc| (self.markdown_source, self.reading, self.viewer_scroll, doc));
+        self.find.prompt = true;
+        self.viewer_selection = None;
+        self.find.query.clear();
+        self.browser_target = None;
+        self.status = None;
+        // Formatted JSON has no original-byte row geometry. Find uses its raw source.
+        if self
+            .preview
+            .document
+            .as_ref()
+            .is_some_and(|doc| !doc.source_lines)
+            && let Some(path) = self.preview.path.as_ref()
+        {
+            let source = &self.preview.document.as_ref().unwrap().source;
+            self.preview.document = Some(crate::document::source_from_text(
+                path,
+                source,
+                &self.theme.palette(),
+            ));
+        }
+        self.reading = false;
+        self.viewer_text_cache.get_mut().take();
+        self.update_find_matches();
+    }
+
+    pub fn push_find_char(&mut self, ch: char) {
+        self.find.query.push(ch);
+        self.update_find_matches();
+        self.reveal_match = true;
+        self.status = None;
+    }
+
+    pub fn pop_find_char(&mut self) {
+        self.find.query.pop();
+        self.update_find_matches();
+        self.reveal_match = true;
+        self.status = None;
+    }
+
+    pub fn finish_find(&mut self, cancel: bool) {
+        self.find.prompt = false;
+        if cancel {
+            if let Some((source, reading, scroll, document)) = self.find.saved.take() {
+                self.markdown_source = source;
+                self.reading = reading;
+                self.preview.document = Some(document);
+                self.set_viewer_scroll(scroll);
+                self.viewer_text_cache.get_mut().take();
+            }
+            self.find.query.clear();
+            self.find.matches = Arc::from([]);
+            self.find.active = None;
+            self.reveal_match = false;
+            self.invalidate_annotations();
+        } else if let Some((_, _, _, document)) = self.find.saved.take()
+            && !document.source_lines
+        {
+            self.find.preview_document.get_or_insert(document);
+        }
+    }
+
+    fn update_find_matches(&mut self) {
+        let matcher = crate::matching::LiteralMatcher::new(&self.find.query);
+        let text = if self.is_rendered_markdown_view() {
+            self.markdown_page.as_ref().map(|page| page.text.text())
+        } else {
+            self.preview.document.as_ref().map(|doc| {
+                let end =
+                    source_line_start(&doc.source, doc.lines.len() + 1).unwrap_or(doc.source.len());
+                &doc.source[..end]
+            })
+        };
+        let ranges = text.map_or_else(Vec::new, |text| matcher.ranges(text));
+        let previous = self.active_match();
+        let active = self
+            .browser_target
+            .as_ref()
+            .and_then(|source| {
+                if self.is_rendered_markdown_view() {
+                    self.markdown_page
+                        .as_ref()?
+                        .text
+                        .source_match(source.clone(), &ranges)
+                } else {
+                    Some(source.clone())
+                }
+            })
+            .or_else(|| {
+                self.browser_target
+                    .is_none()
+                    .then(|| previous.clone())
+                    .flatten()
+            });
+        self.find.active = active
+            .as_ref()
+            .and_then(|range| ranges.iter().position(|candidate| candidate == range))
+            .or_else(|| (self.browser_target.is_none() && !ranges.is_empty()).then_some(0));
+        let changed = self.find.matches.as_ref() != ranges.as_slice();
+        self.find.matches = ranges.into();
+        if changed || previous != self.active_match() {
+            self.reveal_match = true;
+            self.invalidate_annotations();
+        }
+    }
+
+    pub fn next_match(&mut self, backwards: bool) {
+        let count = self.find.matches.len();
+        if count == 0 {
+            return;
+        }
+        let index = self.find.active.unwrap_or(0);
+        self.find.active = Some(if backwards {
+            (index + count - 1) % count
+        } else {
+            (index + 1) % count
+        });
+        self.browser_target = None;
+        self.reveal_match = true;
+        self.status = None;
+        self.invalidate_annotations();
+    }
+
+    pub(crate) fn active_match(&self) -> Option<std::ops::Range<usize>> {
+        self.find
+            .active
+            .and_then(|index| self.find.matches.get(index))
+            .cloned()
+    }
+
+    pub(crate) fn viewer_matches(&self) -> &[std::ops::Range<usize>] {
+        &self.find.matches
+    }
+
+    pub fn find_status(&self) -> Option<String> {
+        if self.find.query.is_empty() && !self.find.prompt {
+            return None;
+        }
+        Some(format!(
+            " / {}{}  {} / {}{}  n/N next  Esc {}",
+            self.find.query,
+            if self.find.prompt { "▏" } else { "" },
+            self.find.active.map_or(0, |index| index + 1),
+            self.find.matches.len(),
+            if self.find.matches.is_empty() {
+                " · no matches"
+            } else {
+                ""
+            },
+            if self.find.prompt { "restore" } else { "back" }
+        ))
+    }
+
+    pub(crate) fn selection_range(&self) -> Option<std::ops::Range<usize>> {
+        self.viewer_selection
+            .and_then(|(a, b)| (a != b).then_some(a.min(b)..a.max(b)))
+    }
+
+    pub fn begin_viewer_selection(&mut self, byte: usize) {
+        self.viewer_selection = Some((byte, byte));
+        self.invalidate_annotations();
+    }
+
+    pub fn extend_viewer_selection(&mut self, byte: usize) {
+        if let Some((_, end)) = &mut self.viewer_selection {
+            *end = byte;
+        }
+        self.invalidate_annotations();
+    }
+
+    pub fn has_viewer_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    pub fn selected_viewer_text(&self) -> Option<&str> {
+        let range = self.selection_range()?;
+        let text = if self.is_rendered_markdown_view() {
+            self.markdown_page.as_ref()?.text.text()
+        } else {
+            &self.preview.document.as_ref()?.source
+        };
+        text.get(range)
+    }
+
+    pub fn copy_viewer_selection(&mut self, writer: &mut impl io::Write) -> io::Result<()> {
+        use base64::Engine as _;
+        const LIMIT: usize = 100_000;
+        let Some(text) = self.selected_viewer_text() else {
+            self.set_status("Select text before copying.");
+            return Ok(());
+        };
+        if text.len() > LIMIT {
+            self.set_status("Selection exceeds the 100000-byte clipboard limit.");
+            return Ok(());
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        write!(writer, "\x1b]52;c;{encoded}\x07")?;
+        writer.flush()?;
+        self.set_status("Selection sent to terminal clipboard.");
+        Ok(())
+    }
+
+    pub fn viewer_hit_test(
+        &self,
+        area: ratatui::layout::Rect,
+        column: u16,
+        row: u16,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> Option<usize> {
+        let body = crate::ui::viewer_body(area);
+        if body.is_empty() {
+            return None;
+        }
+        let x = column.clamp(body.x, body.right() - 1) - body.x;
+        let y = row.clamp(body.y, body.bottom() - 1) - body.y;
+        if self.is_rendered_markdown_view() {
+            let layout = self.markdown_layout.as_ref()?;
+            if layout.0 != u32::from(body.width) * cell_width
+                || layout.1 != u32::from(body.height) * cell_height
+            {
+                return None;
+            }
+            let page = self.markdown_page.as_ref()?;
+            page.text.hit_test(
+                (x as f32 + 0.5) * cell_width as f32,
+                (y as f32 + 0.5) * cell_height as f32 + page.scroll_y as f32,
+            )
+        } else {
+            crate::ui::source_hit_test(self, body.width, x, self.viewer_scroll + y as usize)
+        }
+    }
+
+    fn text_annotations(&self) -> crate::rendered_text::TextAnnotations {
+        crate::rendered_text::TextAnnotations {
+            selection: self.selection_range(),
+            matches: Arc::clone(&self.find.matches),
+            active: self.active_match(),
+        }
+    }
+
+    fn invalidate_annotations(&mut self) {
+        self.markdown_key = None;
     }
 
     pub fn sort_mode(&self) -> SortMode {
@@ -628,42 +1128,131 @@ impl App {
         self.refresh_preview();
     }
 
-    pub fn begin_filter(&mut self) {
-        self.filtering = true;
+    pub fn begin_search(&mut self) {
+        if self.is_searching() {
+            return;
+        }
+        self.search_snapshot = Some(SearchSnapshot {
+            current_dir: self.current_dir.clone(),
+            entries: self.entries.clone(),
+            all_entries: self.all_entries.clone(),
+            selected: self.selected,
+        });
+        self.search_query.clear();
+        self.request_search();
+    }
+
+    pub fn push_search_char(&mut self, character: char) {
+        self.search_query.push(character);
+        self.request_search();
+    }
+
+    pub fn pop_search_char(&mut self) {
+        self.search_query.pop();
+        self.request_search();
+    }
+
+    pub fn cancel_search(&mut self) {
+        self.search_worker.cancel();
+        self.search_generation = None;
+        self.search_hits.clear();
+        self.search_query.clear();
+        if let Some(snapshot) = self.search_snapshot.take() {
+            self.current_dir = snapshot.current_dir;
+            self.entries = snapshot.entries;
+            self.all_entries = snapshot.all_entries;
+            self.selected = snapshot.selected;
+            self.status = None;
+            self.refresh_preview();
+        }
+    }
+
+    fn request_search(&mut self) {
+        self.search_generation = Some(self.search_worker.request(
+            self.current_dir.clone(),
+            self.search_query.clone(),
+            self.show_hidden,
+        ));
+        self.search_hits.clear();
+        self.entries.clear();
+        self.selected = 0;
+        self.search_scanned = 0;
+        self.search_truncated = false;
         self.status = None;
+        self.refresh_preview();
     }
 
-    pub fn push_filter_char(&mut self, character: char) {
-        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
-        self.filter.push(character);
-        self.apply_filter(selected_name.as_deref());
-    }
-
-    pub fn pop_filter_char(&mut self) {
-        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
-        self.filter.pop();
-        self.apply_filter(selected_name.as_deref());
-    }
-
-    pub fn clear_filter(&mut self) {
-        let selected_name = self.selected_entry().map(|entry| entry.name.clone());
-        self.filter.clear();
-        self.filtering = false;
-        self.apply_filter(selected_name.as_deref());
+    pub fn poll_search(&mut self) -> bool {
+        if self.viewing || self.editor.is_some() {
+            return false;
+        }
+        let mut changed = false;
+        let selected = self
+            .selected_search_hit()
+            .map(|hit| (hit.path.clone(), hit.line));
+        for _ in 0..4 {
+            let Some(batch) = self.search_worker.poll() else {
+                break;
+            };
+            if Some(batch.generation) != self.search_generation || !self.is_searching() {
+                continue;
+            }
+            self.search_scanned = batch.scanned;
+            self.search_truncated |= batch.truncated;
+            for hit in batch.hits {
+                let position = self.search_hits.binary_search_by(|existing| {
+                    existing
+                        .path
+                        .cmp(&hit.path)
+                        .then(existing.line.cmp(&hit.line))
+                });
+                let Err(index) = position else {
+                    continue;
+                };
+                self.entries.insert(
+                    index,
+                    Entry {
+                        name: hit
+                            .path
+                            .strip_prefix(&self.current_dir)
+                            .unwrap_or(&hit.path)
+                            .as_os_str()
+                            .to_owned(),
+                        path: hit.path.clone(),
+                        is_dir: hit.is_dir,
+                        is_symlink: hit.is_symlink,
+                        modified: None,
+                    },
+                );
+                self.search_hits.insert(index, hit);
+            }
+            changed = true;
+        }
+        if changed {
+            self.selected = selected
+                .and_then(|identity| {
+                    self.search_hits.iter().position(|hit| {
+                        (hit.path.as_path(), hit.line) == (identity.0.as_path(), identity.1)
+                    })
+                })
+                .unwrap_or(0);
+            self.refresh_preview();
+        }
+        changed
     }
 
     pub fn cycle_sort(&mut self) {
         let selected_name = self.selected_entry().map(|entry| entry.name.clone());
         self.sort_mode = self.sort_mode.next();
         sort_entries(&mut self.all_entries, self.sort_mode, self.sort_direction);
-        self.apply_filter(selected_name.as_deref());
+        self.apply_sort(selected_name.as_deref());
     }
 
     pub fn toggle_sort_direction(&mut self) {
         let selected_name = self.selected_entry().map(|entry| entry.name.clone());
         self.sort_direction = self.sort_direction.opposite();
         sort_entries(&mut self.all_entries, self.sort_mode, self.sort_direction);
-        self.apply_filter(selected_name.as_deref());
+        self.apply_sort(selected_name.as_deref());
     }
 
     pub fn enter_selected(&mut self) {
@@ -671,7 +1260,7 @@ impl App {
             return;
         };
         if !entry.is_dir {
-            self.status = Some("use o to open files; de only enters directories".into());
+            self.open_viewer();
             return;
         }
 
@@ -703,8 +1292,22 @@ impl App {
         self.reload_preserving_selection();
     }
 
-    pub fn accept(&self) -> NavigationResult {
+    pub fn accept_current(&self) -> NavigationResult {
         NavigationResult::Accept(self.current_dir.clone())
+    }
+
+    pub fn activate_selected(&mut self) -> NavigationResult {
+        match self.selected_entry() {
+            Some(entry) if entry.is_dir => NavigationResult::Accept(entry.path.clone()),
+            Some(_) => {
+                self.open_viewer();
+                NavigationResult::Continue
+            }
+            None => {
+                self.set_status("Nothing selected.");
+                NavigationResult::Continue
+            }
+        }
     }
 
     pub fn open_selected(&mut self) -> NavigationResult {
@@ -729,8 +1332,9 @@ impl App {
         ) {
             Ok(entries) => {
                 self.current_dir = target;
-                self.filter.clear();
-                self.filtering = false;
+                self.search_worker.cancel();
+                self.search_generation = None;
+                self.search_hits.clear();
                 self.all_entries = entries;
                 self.entries = self.all_entries.clone();
                 self.selected = select_name
@@ -738,6 +1342,9 @@ impl App {
                     .unwrap_or(0);
                 self.status = None;
                 self.refresh_preview();
+                if self.is_searching() {
+                    self.request_search();
+                }
             }
             Err(error) => {
                 self.status = Some(format!("cannot open {}: {error}", target.display()));
@@ -755,7 +1362,7 @@ impl App {
         ) {
             Ok(entries) => {
                 self.all_entries = entries;
-                self.apply_filter(selected_name.as_deref());
+                self.apply_sort(selected_name.as_deref());
                 self.status = None;
             }
             Err(error) => {
@@ -767,17 +1374,8 @@ impl App {
         }
     }
 
-    fn apply_filter(&mut self, selected_name: Option<&OsStr>) {
-        let query = self.filter.to_lowercase();
-        self.entries = if query.is_empty() {
-            self.all_entries.clone()
-        } else {
-            self.all_entries
-                .iter()
-                .filter(|entry| entry.name.to_string_lossy().to_lowercase().contains(&query))
-                .cloned()
-                .collect()
-        };
+    fn apply_sort(&mut self, selected_name: Option<&OsStr>) {
+        self.entries = self.all_entries.clone();
         self.selected = selected_name
             .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
             .unwrap_or(0);
@@ -807,7 +1405,16 @@ impl App {
         let label = entry.display_name();
         let path = entry.path.clone();
         let is_dir = entry.is_dir;
-        if !is_dir && self.preview.path.as_deref() == Some(path.as_path()) {
+        let source_line = self.selected_search_hit().and_then(|hit| hit.line);
+        if !is_dir
+            && self.preview.path.as_deref() == Some(path.as_path())
+            && (source_line.is_none()
+                || self
+                    .preview
+                    .document
+                    .as_ref()
+                    .is_some_and(|doc| doc.source_lines))
+        {
             return;
         }
         self.cancel_image_request();
@@ -847,7 +1454,12 @@ impl App {
         }) {
             preview.message = Some("video playback is external · press o to open".into());
         } else {
-            match crate::document::load(&path, &self.theme.palette()) {
+            let loaded = if source_line.is_some() {
+                crate::document::load_source(&path, &self.theme.palette())
+            } else {
+                crate::document::load(&path, &self.theme.palette())
+            };
+            match loaded {
                 Ok(document) => preview.document = Some(document),
                 Err(error) => {
                     preview.message = Some(format!("{error} · press o to open externally"))
@@ -863,6 +1475,12 @@ impl App {
         }
         self.image_request = None;
     }
+}
+
+fn source_line_start(source: &str, line: usize) -> Option<usize> {
+    crate::document::logical_lines(source)
+        .nth(line.checked_sub(1)?)
+        .map(|text| text.as_ptr() as usize - source.as_ptr() as usize)
 }
 
 fn read_entries(
@@ -972,6 +1590,209 @@ mod tests {
     }
 
     #[test]
+    fn explicit_rendered_mode_survives_a_hidden_browser_hit_after_rerender() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("notes.md"),
+            "[visible label](https://hidden.example/path)\n",
+        )
+        .unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "hidden.example".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        app.open_viewer();
+        let finish_render = |app: &mut App| {
+            app.update_markdown_view(320, 160, 16);
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while app.markdown_pending() {
+                app.poll_markdown();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Markdown render timed out"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            app.poll_markdown();
+        };
+        finish_render(&mut app);
+        assert!(app.is_markdown_source());
+        app.toggle_markdown_source();
+        assert!(app.is_rendered_markdown_view());
+        finish_render(&mut app);
+        assert!(app.is_rendered_markdown_view());
+        assert!(app.markdown_image().is_some());
+    }
+
+    #[test]
+    fn accepted_json_find_restores_formatted_snapshot_on_close_and_reopen() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("data.json");
+        let raw = "{\"nested\":{\"text\":\"needle\"}}";
+        fs::write(&path, raw).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let formatted = app.preview.document.clone().unwrap();
+        app.open_viewer();
+        fs::write(&path, "{\"changed\":true}").unwrap();
+        app.begin_find();
+        for ch in "needle".chars() {
+            app.push_find_char(ch);
+        }
+        app.finish_find(false);
+        assert!(app.preview.document.as_ref().unwrap().source_lines);
+        assert_eq!(app.preview.document.as_ref().unwrap().source.as_ref(), raw);
+        app.begin_find();
+        for ch in "nested".chars() {
+            app.push_find_char(ch);
+        }
+        app.finish_find(true);
+        assert!(app.preview.document.as_ref().unwrap().source_lines);
+        app.close_viewer();
+        assert_eq!(app.preview.document.as_ref(), Some(&formatted));
+        app.open_viewer();
+        assert_eq!(app.preview.document.as_ref(), Some(&formatted));
+        assert!(!app.preview.document.as_ref().unwrap().source_lines);
+    }
+
+    #[test]
+    fn browser_activation_reveals_the_matching_wrapped_row_beyond_the_excerpt_prefix() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let temp = tempdir().unwrap();
+        let source = format!("{}NEEDLE tail\n", "padding ".repeat(80));
+        fs::write(temp.path().join("notes.txt"), &source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        assert!(app.selected_search_hit().unwrap().excerpt_start > 240);
+        let entries = app.entries.clone();
+        app.open_viewer();
+        assert_eq!(&source[app.active_match().unwrap()], "NEEDLE");
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 30, 8));
+        assert!(app.viewer_scroll() > 0);
+        let mut terminal = Terminal::new(TestBackend::new(30, 8)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        assert!(terminal.backend().to_string().contains("NEEDLE"));
+        app.close_viewer();
+        assert_eq!(app.entries, entries);
+        assert_eq!(app.search_query(), "needle");
+    }
+
+    #[test]
+    fn local_find_navigates_source_bytes_and_restores_view_without_touching_browser_results() {
+        let temp = tempdir().unwrap();
+        let source = format!("first copper\n{}\nlast COPPER İ\n", "padding ".repeat(80));
+        fs::write(temp.path().join("notes.txt"), &source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "copper".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        let hits = app.search_hits.clone();
+        let selected = app.selected;
+        app.open_viewer();
+        app.toggle_reading();
+        app.set_viewer_scroll(3);
+        app.begin_find();
+        for ch in "copper".chars() {
+            app.push_find_char(ch);
+        }
+        assert_eq!(app.viewer_matches().len(), 2);
+        let first = app.active_match().unwrap();
+        app.finish_find(false);
+        app.next_match(false);
+        let second = app.active_match().unwrap();
+        assert!(second.start > first.start);
+        assert_eq!(&source[second], "COPPER");
+        app.next_match(false);
+        assert_eq!(app.active_match(), Some(first));
+        app.begin_find();
+        for ch in "missing".chars() {
+            app.push_find_char(ch);
+        }
+        assert!(app.find_status().unwrap().contains("no matches"));
+        app.finish_find(true);
+        assert_eq!(app.search_hits, hits);
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.search_query(), "copper");
+        app.close_viewer();
+        assert_eq!(app.search_hits, hits);
+    }
+
+    #[test]
+    fn find_cancel_restores_reading_scroll_and_formatted_json() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "one\ntwo\nneedle\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        app.toggle_reading();
+        app.set_viewer_scroll(7);
+        app.begin_find();
+        for ch in "needle".chars() {
+            app.push_find_char(ch);
+        }
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 16, 5));
+        assert!(!app.is_reading());
+        app.finish_find(true);
+        assert!(app.is_reading());
+        assert_eq!(app.viewer_scroll(), 7);
+
+        let temp = tempdir().unwrap();
+        let raw = "{\"duplicate\":\"needle\",\"nested\":{\"text\":\"NEEDLE\"}}";
+        fs::write(temp.path().join("data.json"), raw).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let formatted = app.preview.document.clone().unwrap();
+        app.open_viewer();
+        fs::write(temp.path().join("data.json"), "{\"changed\":true}").unwrap();
+        app.begin_find();
+        for ch in "needle".chars() {
+            app.push_find_char(ch);
+        }
+        assert!(app.preview.document.as_ref().unwrap().source_lines);
+        assert_eq!(&raw[app.active_match().unwrap()], "needle");
+        app.finish_find(true);
+        assert_eq!(app.preview.document.as_ref(), Some(&formatted));
+    }
+
+    #[test]
+    fn viewer_copy_preserves_selected_bytes_and_only_writes_osc52_to_supplied_writer() {
+        use base64::Engine as _;
+        let temp = tempdir().unwrap();
+        let source = "\u{feff}first\tCafe\u{301}\r\n第二 line\r\n";
+        fs::write(temp.path().join("notes.txt"), source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let start = source.find('\t').unwrap();
+        let end = source.find(" line").unwrap();
+        app.begin_viewer_selection(end);
+        app.extend_viewer_selection(start);
+        let expected = &source[start..end];
+        assert_eq!(app.selected_viewer_text(), Some(expected));
+        let mut output = Vec::new();
+        app.copy_viewer_selection(&mut output).unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "\x1b]52;c;{}\x07",
+                base64::engine::general_purpose::STANDARD.encode(expected)
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("notes.txt")).unwrap(),
+            source
+        );
+        assert_eq!(app.status(), Some("Selection sent to terminal clipboard."));
+    }
+
+    #[test]
     fn sample_reuses_real_viewer_and_invalidates_render_on_theme_change() {
         let temp = tempdir().unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
@@ -1026,6 +1847,7 @@ mod tests {
             },
             scroll_y: 0,
             max_scroll: 250,
+            text: Arc::new(crate::rendered_text::RenderedText::default()),
         });
         assert_eq!(app.markdown_scroll_max(), 250);
         assert!(app.markdown_image().is_some());
@@ -1104,15 +1926,19 @@ mod tests {
         app.move_last();
         app.enter_selected();
         assert_eq!(app.current_dir(), temp.path());
-        assert!(app.status().unwrap().contains("only enters directories"));
+        assert!(app.is_viewing());
     }
 
     #[test]
-    fn accept_returns_the_displayed_directory_not_the_highlighted_child() {
-        let (temp, app) = fixture();
+    fn current_folder_accept_and_selected_folder_activation_are_distinct() {
+        let (temp, mut app) = fixture();
         assert_eq!(
-            app.accept(),
+            app.accept_current(),
             NavigationResult::Accept(temp.path().to_path_buf())
+        );
+        assert_eq!(
+            app.activate_selected(),
+            NavigationResult::Accept(temp.path().join("Alpha"))
         );
     }
 
@@ -1166,8 +1992,7 @@ mod tests {
 
         app.move_down();
         app.cycle_sort();
-        app.begin_filter();
-        app.push_filter_char('n');
+        // Moving and sorting the same selection do not reload its source.
         assert_eq!(app.preview().document(), Some(&original));
 
         app.refresh();
@@ -1198,27 +2023,197 @@ mod tests {
         assert!(app.preview().document().is_none());
     }
 
-    #[test]
-    fn filter_is_case_insensitive_scoped_and_reversible() {
-        let (_temp, mut app) = fixture();
-        app.begin_filter();
-        for character in "ALP".chars() {
-            app.push_filter_char(character);
+    fn finish_search(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.search_pending() {
+            app.poll_search();
+            assert!(std::time::Instant::now() < deadline, "search timed out");
+            std::thread::sleep(Duration::from_millis(1));
         }
+        app.poll_search();
+    }
 
-        assert!(app.is_filtering());
-        assert_eq!(app.filter_query(), "ALP");
-        assert_eq!(app.total_entry_count(), 3);
+    #[test]
+    fn search_recurses_and_cancel_restores_exact_folder_and_selection() {
+        let (temp, mut app) = fixture();
+        app.move_down();
+        let selected = app.selected_entry().unwrap().clone();
+        fs::write(temp.path().join("Alpha/inside.txt"), "zero\nNeedle here\n").unwrap();
+        app.begin_search();
+        for character in "NEEDLE".chars() {
+            app.push_search_char(character);
+        }
+        finish_search(&mut app);
+        assert!(app.is_searching());
+        assert_eq!(app.search_query(), "NEEDLE");
         assert_eq!(app.entries().len(), 1);
-        assert_eq!(app.selected_entry().unwrap().display_name(), "Alpha/");
-        assert_eq!(app.preview().label(), "Alpha/");
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(2));
+        assert_eq!(app.activate_selected(), NavigationResult::Continue);
+        assert!(app.is_viewing());
+        assert_eq!(app.viewer_source_line, Some(2));
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 40, 10));
+        assert_eq!(crate::ui::viewer_source_at_scroll(&app), Some(2));
+        app.close_viewer();
+        assert!(app.is_searching());
+        app.cancel_search();
+        assert_eq!(app.current_dir(), temp.path());
+        assert_eq!(app.selected_entry(), Some(&selected));
+        assert!(!app.is_searching());
+    }
 
-        app.pop_filter_char();
-        assert_eq!(app.filter_query(), "AL");
-        app.clear_filter();
-        assert!(!app.is_filtering());
-        assert!(app.filter_query().is_empty());
-        assert_eq!(app.entries().len(), 3);
+    #[test]
+    fn content_activation_uses_logical_source_line_after_lone_cr() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "a\rb\nneedle\r\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
+        assert_eq!(app.activate_selected(), NavigationResult::Continue);
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 40, 10));
+        assert_eq!(crate::ui::viewer_source_at_scroll(&app), Some(3));
+        assert_eq!(
+            app.preview().document().unwrap().lines[2].to_string(),
+            "needle"
+        );
+        app.close_viewer();
+        app.cancel_search();
+        assert_eq!(app.selected_entry().unwrap().name, "notes.txt");
+    }
+
+    #[test]
+    fn search_suspends_idle_wakeups_in_viewer_and_editor_then_resumes() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "needle\n".repeat(300)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.entries().is_empty() {
+            app.poll_search();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(app.search_pending());
+        assert!(app.background_work_pending());
+        app.open_viewer();
+        assert!(!app.background_work_pending());
+        assert!(!app.poll_search());
+        app.close_viewer();
+        assert!(app.background_work_pending());
+        app.open_editor();
+        assert!(!app.background_work_pending());
+        assert!(!app.poll_search());
+        app.handle_editor_key(termina::event::KeyCode::Escape.into(), 5);
+        assert!(app.background_work_pending());
+        finish_search(&mut app);
+        assert_eq!(app.entries().len(), 300);
+        assert!(!app.background_work_pending());
+    }
+
+    #[test]
+    fn no_match_activation_does_not_accept_any_folder() {
+        let (_temp, mut app) = fixture();
+        app.begin_search();
+        for ch in "not-present".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        assert_eq!(app.activate_selected(), NavigationResult::Continue);
+        assert!(!app.is_viewing());
+        app.cancel_search();
+        app.enter_selected();
+        app.begin_search();
+        app.go_parent();
+        app.cancel_search();
+        assert!(app.current_dir().ends_with("Alpha"));
+        assert_eq!(app.selected_entry().unwrap().name, "inside.txt");
+    }
+
+    #[test]
+    fn editing_from_picker_and_rendered_viewer_uses_original_source() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notes.md");
+        fs::write(&path, "# Unicode λ\r\nno final newline").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_editor();
+        assert!(!app.is_viewing());
+        assert_eq!(app.editor().unwrap().lines()[0], "# Unicode λ");
+        app.handle_editor_key(termina::event::KeyCode::Escape.into(), 5);
+        assert!(app.editor().is_none());
+        app.open_viewer();
+        assert!(app.is_rendered_markdown_view());
+        app.open_editor();
+        assert!(app.editor().is_some());
+        app.paste("new ");
+        app.handle_editor_key(termina::event::KeyCode::Escape.into(), 5);
+        assert!(app.editor().unwrap().confirming());
+        app.handle_editor_key(termina::event::KeyCode::Char('c').into(), 5);
+        assert!(!app.editor().unwrap().confirming());
+        app.handle_editor_key(termina::event::KeyCode::Escape.into(), 5);
+        app.handle_editor_key(termina::event::KeyCode::Char('d').into(), 5);
+        assert!(app.editor().is_none());
+        assert!(app.is_rendered_markdown_view());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "# Unicode λ\r\nno final newline"
+        );
+    }
+
+    #[test]
+    fn editor_conflict_keeps_dirty_buffer_and_cancel_returns_to_editing() {
+        use termina::event::{KeyCode, KeyEvent, Modifiers};
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notes.txt");
+        fs::write(&path, "original").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_editor();
+        app.paste("local ");
+        fs::write(&path, "external").unwrap();
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('s'), Modifiers::CONTROL), 5);
+        assert!(app.editor().unwrap().dirty());
+        assert!(app.editor().unwrap().message().unwrap().contains("changed"));
+        app.handle_editor_key(KeyCode::Escape.into(), 5);
+        assert!(app.editor().unwrap().confirming());
+        app.handle_editor_key(KeyCode::Char('s').into(), 5);
+        assert!(app.editor().unwrap().confirming());
+        app.handle_editor_key(KeyCode::Char('c').into(), 5);
+        assert!(!app.editor().unwrap().confirming());
+        assert_eq!(app.editor().unwrap().lines(), &["local original"]);
+        assert_eq!(fs::read_to_string(path).unwrap(), "external");
+        assert!(!app.is_viewing());
+    }
+
+    #[test]
+    fn arriving_search_batches_preserve_selected_path_and_line() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("a")).unwrap();
+        for index in 0..260 {
+            fs::write(temp.path().join(format!("a/needle-{index:03}.txt")), "text").unwrap();
+        }
+        // DFS finds this later, but path ordering puts it before a/needle-*.
+        fs::write(temp.path().join("a.needle"), "text").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.entries().is_empty() {
+            app.poll_search();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        app.move_last();
+        let selected = app.selected_search_hit().unwrap().clone();
+        finish_search(&mut app);
+        assert_eq!(app.entries().len(), 261);
+        assert_eq!(app.selected_search_hit(), Some(&selected));
     }
 
     #[test]
