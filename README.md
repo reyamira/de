@@ -15,7 +15,7 @@ Press `e` to edit a regular UTF-8 file with the built-in editor.
 Press `o` to open a file in its default application.
 `de` has no file delete, rename, or copy commands.
 
-## Unreleased changes
+## What's new in v0.6.0
 
 - Mermaid diagrams and charts fit the rendered content width and reflow on resize.
 - Press `e` for live syntax colors in the preview pane or full-width viewer. The editor supports undo, redo, and explicit save.
@@ -24,7 +24,9 @@ Press `o` to open a file in its default application.
 - In the viewer, `/` finds text, `n`/`N` moves between matches, and `Escape` cancels the find prompt.
 - Mouse wheel and scrollbar scrolling now work in the editor without moving the caret.
 - `/` searches names and text contents below the current folder. `Escape` restores the starting selection.
-- `Enter` accepts the selected folder or views a file. `Ctrl-G` accepts the displayed folder.
+- Navigation change: `Enter` now accepts the selected folder, rather than the displayed folder, or views the selected file. `Ctrl-G` accepts the displayed folder.
+
+See the [v0.6.0 release notes](https://github.com/reyamira/de/releases/tag/v0.6.0).
 
 ## What's new in v0.5.0
 
