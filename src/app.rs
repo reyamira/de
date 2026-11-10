@@ -522,6 +522,14 @@ impl App {
             return false;
         }
         self.markdown_request = None;
+        self.apply_markdown_result(result);
+        true
+    }
+
+    fn apply_markdown_result(
+        &mut self,
+        result: Result<crate::markdown_renderer::RenderedPage, String>,
+    ) {
         match result {
             Ok(page) => {
                 let layout_changed = self
@@ -551,7 +559,6 @@ impl App {
                 self.markdown_error = Some(error);
             }
         }
-        true
     }
 
     fn cancel_markdown(&mut self) {
@@ -1589,14 +1596,32 @@ mod tests {
         (temp, app)
     }
 
+    fn apply_rendered_markdown(app: &mut App, width: u32) {
+        let request = crate::markdown_renderer::RenderRequest {
+            path: app.preview.path.clone().unwrap(),
+            source: app
+                .preview
+                .document
+                .as_ref()
+                .unwrap()
+                .markdown_source
+                .clone()
+                .unwrap(),
+            width,
+            height: 160,
+            scroll_y: app.viewer_scroll as u32,
+            style: app.theme.rendered(),
+            annotations: app.text_annotations(),
+        };
+        let page = crate::markdown_renderer::render_test_page(&request).unwrap();
+        app.apply_markdown_result(Ok(page));
+    }
+
     #[test]
     fn explicit_rendered_mode_survives_a_hidden_browser_hit_after_rerender() {
         let temp = tempdir().unwrap();
-        fs::write(
-            temp.path().join("notes.md"),
-            "[visible label](https://hidden.example/path)\n",
-        )
-        .unwrap();
+        let source = "[visible label](https://hidden.example/path) and hidden.example\n";
+        fs::write(temp.path().join("notes.md"), source).unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         app.begin_search();
         for ch in "hidden.example".chars() {
@@ -1604,26 +1629,59 @@ mod tests {
         }
         finish_search(&mut app);
         app.open_viewer();
-        let finish_render = |app: &mut App| {
-            app.update_markdown_view(320, 160, 16);
-            let deadline = std::time::Instant::now() + Duration::from_secs(15);
-            while app.markdown_pending() {
-                app.poll_markdown();
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "Markdown render timed out"
-                );
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            app.poll_markdown();
-        };
-        finish_render(&mut app);
+        let start = source.find("hidden.example").unwrap();
+        let target = start..start + "hidden.example".len();
+        assert_eq!(app.browser_target, Some(target.clone()));
+        assert!(app.is_rendered_markdown_view());
+        assert!(app.markdown_page.is_none());
+        assert!(app.active_match().is_none());
+
+        // A later visible occurrence must not replace the hidden browser target.
+        apply_rendered_markdown(&mut app, 320);
         assert!(app.is_markdown_source());
+        assert_eq!(app.active_match(), Some(target));
         app.toggle_markdown_source();
         assert!(app.is_rendered_markdown_view());
-        finish_render(&mut app);
+        assert!(app.browser_target.is_none());
+        apply_rendered_markdown(&mut app, 320);
         assert!(app.is_rendered_markdown_view());
         assert!(app.markdown_image().is_some());
+        assert!(app.active_match().is_some());
+        app.resize_viewer_interaction();
+        apply_rendered_markdown(&mut app, 240);
+        assert!(app.is_rendered_markdown_view());
+        assert!(app.markdown_image().is_some());
+    }
+
+    #[test]
+    fn visible_browser_hit_keeps_its_identity_until_markdown_layout_and_after_reflow() {
+        let temp = tempdir().unwrap();
+        let source = "needle elsewhere\n\n[needle](https://hidden.invalid) and needle\n";
+        fs::write(temp.path().join("notes.md"), source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        app.move_down();
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
+        app.open_viewer();
+        let start = source.find("[needle]").unwrap() + 1;
+        let target = start..start + "needle".len();
+        assert_eq!(app.browser_target, Some(target.clone()));
+        assert!(app.is_rendered_markdown_view());
+        assert!(app.markdown_page.is_none());
+        assert!(app.active_match().is_none());
+
+        for width in [320, 240] {
+            apply_rendered_markdown(&mut app, width);
+            assert!(app.is_rendered_markdown_view());
+            assert_eq!(app.browser_target, Some(target.clone()));
+            assert_eq!(app.viewer_matches().len(), 3);
+            assert_eq!(app.active_match(), Some(app.viewer_matches()[1].clone()));
+            app.resize_viewer_interaction();
+        }
     }
 
     #[test]

@@ -285,6 +285,12 @@ fn render(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn render_test_page(request: &RenderRequest) -> Result<RenderedPage, String> {
+    // Exercise native rendering without the worker's terminal-display policy.
+    render(request, &mut None, &mut || false)
+}
+
 fn paint_annotations(
     pixmap: &mut resvg::tiny_skia::Pixmap,
     text: &crate::rendered_text::RenderedText,
