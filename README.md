@@ -15,7 +15,7 @@ Press `e` to edit a regular UTF-8 file with the built-in editor.
 Press `o` to open a file in its default application.
 `de` has no file delete, rename, or copy commands.
 
-## Unreleased
+## What's new in v0.7.0
 
 - Press `f` in the file viewer to use every terminal row, or to restore its normal inline size.
 - Viewer expansion keeps the reading position, subject to the new scroll limit, and resets when the viewer closes.
@@ -24,6 +24,8 @@ Press `o` to open a file in its default application.
 - Search keeps the query at the top and shows only the active mode beside `Shift+Tab` in the footer.
 - A full-row selection now stays distinct from underlined query matches.
 - Search navigation stays within the filtered results. Press `Escape` before browsing folders; `Enter` still chooses or opens a result.
+
+See the [v0.7.0 release notes](https://github.com/reyamira/de/releases/tag/v0.7.0).
 
 ## What's new in v0.6.0
 
