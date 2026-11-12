@@ -34,6 +34,18 @@ The full-width viewer has a thin border around its contents. Text and images
 use the space inside that border, including after a terminal resize. A scrollbar
 uses the rightmost content column when there is enough space.
 
+The viewer normally uses at most 30 terminal rows and leaves one terminal row free.
+Press `f` to use every terminal row without an alternate screen.
+Press `f` again to restore the normal inline size.
+The header shows `inline` or `full`; the footer shows `f size`.
+Expansion keeps the reading position unless the larger viewport requires a lower scroll limit.
+Resizing keeps the selected size mode.
+Text, rendered Markdown, images, and mouse controls use the new content area.
+Expansion can move earlier shell output into scrollback.
+Closing the viewer resets expansion for the next file.
+Viewer-origin editing keeps the selected size; `f` inserts text while editing.
+During the find prompt, `f` remains query text.
+
 In the viewer, use arrows or `j`/`k` to scroll. Use `PageUp`/`PageDown` for pages
 and `Home`/`End` for the beginning or end. For Markdown, press `m` to switch
 between the rendered page and source. The header shows the current mode.

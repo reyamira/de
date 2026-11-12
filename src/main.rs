@@ -37,6 +37,7 @@ const PICKER_HELP: &str = "Picker controls:
   /                  Recursive names + text search
   Shift+S            Ascending / descending
   v                  View file inline   Esc / q           Return to picker
+  f (viewer)         Toggle inline / full terminal size
   e                  Edit original file inline (pane or viewer)
   Ctrl-S             Save in editor; Esc/Ctrl-Q returns with Save/Discard/Cancel
   Shift+arrows        Select; Ctrl-Z / Ctrl-Y undo / redo in editor
@@ -566,6 +567,7 @@ fn run_inline_with_mouse<S, T>(
                     desired_viewport_height(&app, terminal_width, terminal_height, min_height);
                 let mut measure_origin = viewing && !viewer_active;
                 if desired != viewport_height {
+                    set_mouse_capture(&mut raw_mode.mouse_capture, false, &mut io::stderr())?;
                     terminal
                         .backend_mut()
                         .resize_viewport(terminal_width, desired)?;
@@ -1013,6 +1015,10 @@ fn desired_viewport_height(
     terminal_height: u16,
     min_height: u16,
 ) -> u16 {
+    if app.viewer_expanded() {
+        // The relative backend reserves these rows without an alternate screen.
+        return terminal_height.max(1);
+    }
     if app.is_viewing() || app.editor().is_some() {
         return terminal_height.saturating_sub(1).clamp(1, 30);
     }
@@ -1112,6 +1118,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::Char('o') => return app.open_selected(),
             KeyCode::Char('m') => app.toggle_markdown_source(),
             KeyCode::Char('R') => app.toggle_reading(),
+            KeyCode::Char('f') => app.toggle_viewer_expanded(),
             KeyCode::Char('e') => app.open_editor(),
             KeyCode::Char('/') => app.begin_find(),
             KeyCode::Char('n') => app.next_match(false),
@@ -1296,6 +1303,74 @@ mod tests {
     use clap::error::ErrorKind;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn viewer_expansion_follows_terminal_size_and_resets_after_closing() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "line\n".repeat(180)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let normal_picker = desired_viewport_height(&app, 112, 48, 0);
+        handle_key(&mut app, key(KeyCode::Char('f')), 26);
+        assert!(!app.viewer_expanded());
+        assert_eq!(desired_viewport_height(&app, 112, 48, 0), normal_picker);
+        app.open_viewer();
+        app.set_viewer_scroll(50);
+        assert_eq!(desired_viewport_height(&app, 112, 48, 0), 30);
+        handle_key(&mut app, key(KeyCode::Char('f')), 26);
+        assert!(app.viewer_expanded());
+        assert_eq!(app.viewer_scroll(), 50);
+        for (width, height) in [(112, 48), (80, 60), (40, 18), (1, 1)] {
+            assert_eq!(desired_viewport_height(&app, width, height, 0), height);
+        }
+        let area = Rect::new(0, 0, 112, 48);
+        assert_eq!(viewer_body(area), Rect::new(1, 2, 109, 44));
+        app.set_viewer_scroll(usize::MAX);
+        app.set_viewer_scroll(app.viewer_scroll().min(viewer_scroll_max(&app, area)));
+        assert_eq!(app.viewer_scroll(), viewer_scroll_max(&app, area));
+        let scroll = app.viewer_scroll();
+        handle_key(&mut app, key(KeyCode::Char('f')), 44);
+        assert!(!app.viewer_expanded());
+        assert_eq!(desired_viewport_height(&app, 112, 48, 0), 30);
+        assert_eq!(app.viewer_scroll(), scroll);
+        handle_key(&mut app, key(KeyCode::Char('f')), 26);
+        handle_key(&mut app, key(KeyCode::Char('e')), 44);
+        assert!(app.editor().is_some());
+        assert_eq!(desired_viewport_height(&app, 112, 48, 0), 48);
+        handle_key(&mut app, key(KeyCode::Char('f')), 44);
+        assert!(app.viewer_expanded());
+        assert!(app.editor().unwrap().dirty());
+        handle_key(&mut app, key(KeyCode::Escape), 44);
+        handle_key(&mut app, key(KeyCode::Char('d')), 44);
+        assert!(app.editor().is_none());
+        assert!(app.viewer_expanded());
+        handle_key(&mut app, key(KeyCode::Escape), 44);
+        assert!(!app.is_viewing());
+        assert!(!app.viewer_expanded());
+        assert_eq!(desired_viewport_height(&app, 112, 48, 0), normal_picker);
+        app.open_viewer();
+        assert!(!app.viewer_expanded());
+        assert_eq!(desired_viewport_height(&app, 112, 48, 0), 30);
+    }
+
+    #[test]
+    fn viewer_expansion_key_remains_text_in_find_prompt() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "first\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        handle_key(&mut app, key(KeyCode::Char('/')), 26);
+        handle_key(&mut app, key(KeyCode::Char('f')), 26);
+        assert!(app.find_status().unwrap().contains("f"));
+        assert!(!app.viewer_expanded());
+        handle_key(&mut app, key(KeyCode::Escape), 26);
+        handle_key(&mut app, key(KeyCode::Char('f')), 26);
+        assert!(app.viewer_expanded());
+        handle_key(&mut app, key(KeyCode::Char('/')), 44);
+        handle_key(&mut app, key(KeyCode::Char('f')), 44);
+        assert!(app.viewer_expanded());
+    }
 
     #[test]
     fn mouse_capture_follows_valid_origin_and_restores_terminal_modes() {

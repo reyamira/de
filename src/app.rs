@@ -163,6 +163,7 @@ pub struct App {
     theme: Theme,
     display: DisplaySettings,
     viewing: bool,
+    viewer_expanded: bool,
     viewer_scroll: usize,
     markdown_source: bool,
     reading: bool,
@@ -232,6 +233,7 @@ impl App {
             theme: Theme::auto(),
             display: DisplaySettings::default(),
             viewing: false,
+            viewer_expanded: false,
             viewer_scroll: 0,
             markdown_source: false,
             reading: false,
@@ -304,6 +306,17 @@ impl App {
         self.viewing
     }
 
+    pub fn viewer_expanded(&self) -> bool {
+        self.viewing && self.viewer_expanded
+    }
+
+    pub fn toggle_viewer_expanded(&mut self) {
+        if self.viewing && self.editor.is_none() && !self.find.prompt {
+            self.viewer_expanded = !self.viewer_expanded;
+            self.invalidate_markdown_layout();
+        }
+    }
+
     pub fn theme_sample(&self) -> ThemeSample {
         self.theme_sample
     }
@@ -314,6 +327,7 @@ impl App {
         self.cancel_markdown();
         self.viewer_text_cache.get_mut().take();
         self.viewer_scroll = 0;
+        self.viewer_expanded = false;
         self.reading = false;
         self.status = None;
         if sample == ThemeSample::Picker {
@@ -580,6 +594,7 @@ impl App {
         match self.selected_entry() {
             Some(entry) if !entry.is_dir => {
                 self.viewing = true;
+                self.viewer_expanded = false;
                 self.viewer_scroll = 0;
                 self.find = ViewerFind::default();
                 self.viewer_selection = None;
@@ -617,6 +632,7 @@ impl App {
             self.viewer_text_cache.get_mut().take();
         }
         self.viewing = false;
+        self.viewer_expanded = false;
         self.viewer_scroll = 0;
         self.reading = false;
         self.status = None;
@@ -779,6 +795,10 @@ impl App {
 
     pub fn resize_viewer_interaction(&mut self) {
         self.reveal_match = self.active_match().is_some();
+        self.invalidate_markdown_layout();
+    }
+
+    fn invalidate_markdown_layout(&mut self) {
         // No coordinates from an old native layout may survive a resize.
         self.markdown_page = None;
         self.markdown_key = None;
@@ -1615,6 +1635,46 @@ mod tests {
         };
         let page = crate::markdown_renderer::render_test_page(&request).unwrap();
         app.apply_markdown_result(Ok(page));
+    }
+
+    #[test]
+    fn viewer_expansion_invalidates_native_geometry_without_revealing_an_old_match() {
+        let temp = tempdir().unwrap();
+        let source = format!(
+            "# Title\n\nneedle\n\n{}",
+            "A paragraph of text.\n\n".repeat(80)
+        );
+        fs::write(temp.path().join("notes.md"), source).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        apply_rendered_markdown(&mut app, 640);
+        app.begin_find();
+        for ch in "needle".chars() {
+            app.push_find_char(ch);
+        }
+        app.finish_find(false);
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 83, 14));
+        app.set_viewer_scroll(96);
+        apply_rendered_markdown(&mut app, 640);
+        assert_eq!(app.viewer_scroll(), 96);
+        assert!(app.markdown_image().is_some());
+        app.toggle_viewer_expanded();
+        assert!(app.viewer_expanded());
+        assert!(app.markdown_image().is_none());
+        assert!(app.markdown_page.is_none());
+        assert!(app.markdown_key.is_none());
+        assert!(app.markdown_layout.is_none());
+        assert!(app.markdown_request.is_none());
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 83, 48));
+        assert_eq!(app.viewer_scroll(), 96);
+        assert_eq!(app.find.query, "needle");
+        apply_rendered_markdown(&mut app, 640);
+        assert_eq!(app.viewer_scroll(), 96);
+        assert!(app.markdown_image().is_some());
+        app.toggle_viewer_expanded();
+        assert!(!app.viewer_expanded());
+        assert_eq!(app.viewer_scroll(), 96);
+        assert!(app.markdown_page.is_none());
     }
 
     #[test]

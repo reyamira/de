@@ -1906,6 +1906,11 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             Constraint::Length(1),
         ])
         .areas(area);
+        let size = if app.viewer_expanded() {
+            "full"
+        } else {
+            "inline"
+        };
         let heading = if markdown {
             let mode = if app.is_markdown_source() {
                 "source"
@@ -1915,13 +1920,13 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
             if app.theme_sample() != crate::ThemeSample::Picker {
                 format!(" {} · {mode} · theme sample", app.theme().name())
             } else {
-                format!(" {mode} · {}", app.preview().label())
+                format!(" {size} · {mode} · {}", app.preview().label())
             }
         } else if app.supports_reading() {
             let mode = if app.is_reading() { "reading" } else { "raw" };
-            format!(" {mode} · {}", app.preview().label())
+            format!(" {size} · {mode} · {}", app.preview().label())
         } else {
-            format!(" view · {}", app.preview().label())
+            format!(" {size} · view · {}", app.preview().label())
         };
         frame.render_widget(
             Paragraph::new(shorten_right(&heading, header.width as usize)).style(
@@ -1941,22 +1946,24 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
                 " tab sample  m mode  ←→/↑↓ theme  pg↑↓ scroll  enter save  esc cancel"
             } else if app.theme_sample() != crate::ThemeSample::Picker {
                 " tab sample  m mode  arrows theme  ↵ save  esc"
-            } else if markdown && footer.width >= 64 {
-                " / find  n/N next  y copy  e edit  m mode  q/esc back  ↑↓ scroll"
-            } else if markdown && footer.width >= 32 {
-                " e edit  m mode  q/esc back  ↑↓"
+            } else if markdown && footer.width >= 72 {
+                " f size  / find  n/N next  y copy  e edit  m mode  q back  ↑↓ scroll"
+            } else if markdown && footer.width >= 42 {
+                " f size  e edit  m mode  q back  ↑↓"
             } else if markdown {
-                "e edit  m mode  q back"
+                "f size  m mode  q back"
+            } else if app.supports_reading() && footer.width >= 64 {
+                " f size  / find  n/N next  y copy  e edit  R mode  q back  ↑↓"
             } else if app.supports_reading() && footer.width >= 42 {
-                " e edit  R reading/raw  q/esc back  ↑↓ scroll"
+                " f size  e edit  R mode  q back  ↑↓"
             } else if app.supports_reading() {
-                " e edit  R mode  q back"
-            } else if footer.width >= 55 {
-                " / find  n/N next  y copy  e edit  q/esc back  ↑↓ scroll"
+                "f size  R mode  q back"
+            } else if footer.width >= 64 {
+                " f size  / find  n/N next  y copy  e edit  q back  ↑↓ scroll"
             } else if footer.width >= 30 {
-                " e edit  q/esc back  ↑↓"
+                " f size  e edit  q back  ↑↓"
             } else {
-                " e edit  q back"
+                "f size  q back"
             })
             .style(muted_style(palette)),
             footer,
@@ -2536,6 +2543,30 @@ mod tests {
         assert!(rendered.contains('┘'));
         assert!(rendered.contains("│hello"));
         assert_eq!(viewer_page_rows(Rect::new(0, 0, 40, 7)), 3);
+    }
+
+    #[test]
+    fn viewer_expansion_shows_size_and_key_at_narrow_and_wide_widths() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "line\n".repeat(180)).unwrap();
+        for width in [12, 40, 112] {
+            let mut app = App::new(temp.path().to_path_buf()).unwrap();
+            app.open_viewer();
+            for (expanded, height, label) in [(false, 30, "inline"), (true, 48, "full")] {
+                if expanded {
+                    app.toggle_viewer_expanded();
+                }
+                let area = Rect::new(0, 0, width, height);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                let screen = terminal.backend().to_string();
+                assert!(screen.contains(label), "{screen}");
+                assert!(screen.contains("f size"), "{screen}");
+                assert_eq!(viewer_page_rows(area), usize::from(height - 4));
+                let bar = viewer_scrollbar(&app, area).unwrap();
+                assert_eq!(bar.track.height, height - 4);
+            }
+        }
     }
 
     #[test]

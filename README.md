@@ -15,6 +15,11 @@ Press `e` to edit a regular UTF-8 file with the built-in editor.
 Press `o` to open a file in its default application.
 `de` has no file delete, rename, or copy commands.
 
+## Unreleased
+
+- Press `f` in the file viewer to use every terminal row, or to restore its normal inline size.
+- Viewer expansion keeps the reading position, subject to the new scroll limit, and resets when the viewer closes.
+
 ## What's new in v0.6.0
 
 - Mermaid diagrams and charts fit the rendered content width and reflow on resize.
@@ -118,6 +123,7 @@ asks the parent shell to `cd` there.
 | `s` | Toggle sorting by name or modification time |
 | `Shift+S` | Toggle ascending or descending order |
 | `v` | View the highlighted file inline |
+| `f` (viewer) | Toggle normal inline and full terminal size |
 | `e` (picker or viewer) | Edit the original file inline |
 | `Ctrl-S` (editor) | Save the file |
 | `Escape`, `Ctrl-Q` (editor) | Return; choose Save, Discard, or Cancel for changed text |
@@ -150,6 +156,8 @@ The right pane previews Markdown source, JSON, source code, plain text, and
 supported images. Press `v` for the full-width viewer. For Markdown, press `m`
 to switch between the rendered page and the same highlighted source. Use arrows
 or `j`/`k` to scroll. Press `Escape` or `q` to return to the same selection.
+Press `f` to use the full terminal height.
+Press `f` again to restore the normal inline size.
 
 The [viewer guide](docs/viewer.md) covers supported formats, controls, graphics
 requirements, Markdown rendering, and size limits.
