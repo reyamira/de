@@ -466,6 +466,10 @@ pub fn editor_scrollbar(app: &App, area: Rect) -> Option<ViewerScrollBar> {
 }
 
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette, badge: &str) {
+    if app.is_searching() {
+        render_search_header(frame, app, area, palette);
+        return;
+    }
     let badge_width = UnicodeWidthStr::width(badge);
     let path_width = (area.width as usize).saturating_sub(badge_width + 1);
     let path = shorten_left(&app.current_dir().to_string_lossy(), path_width);
@@ -482,6 +486,25 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         ])),
         area,
     );
+}
+
+fn render_search_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
+    let mut spans = Vec::with_capacity(3);
+    spans.push(Span::styled("/ ", muted_style(palette)));
+    let query_width = (area.width as usize).saturating_sub(3);
+    let query = app.search_query();
+    let window = search_window(query, query.len()..query.len(), query_width);
+    let mut text = String::new();
+    if window.before {
+        text.push('…');
+    }
+    text.push_str(&query[window.bytes]);
+    if window.after {
+        text.push('…');
+    }
+    spans.push(Span::styled(text, Style::default().fg(palette.text)));
+    spans.push(Span::styled("▏", Style::default().fg(palette.accent)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_two_panes(
@@ -520,15 +543,19 @@ fn render_current_entries(
         (None, area)
     };
 
-    let modified_width = modified_column_width(app.entries(), app.display_settings(), now);
+    let modified_width = if app.is_searching() {
+        None
+    } else {
+        modified_column_width(app.entries(), app.display_settings(), now)
+    };
     if let Some(title) = title {
+        let heading = if app.is_searching() {
+            format!(" {}", app.current_dir().display())
+        } else {
+            " current".to_owned()
+        };
         frame.render_widget(
-            Paragraph::new(pane_heading(
-                " current",
-                title.width as usize,
-                modified_width,
-            ))
-            .style(
+            Paragraph::new(pane_heading(&heading, title.width as usize, modified_width)).style(
                 Style::default()
                     .fg(palette.title)
                     .add_modifier(Modifier::BOLD),
@@ -573,35 +600,30 @@ fn render_current_entries(
     {
         let selected = index == app.selected();
         let prefix = if selected { "› " } else { "  " };
-        let (text, first_match) = if let Some(hit) = app.search_hit(index) {
-            search_result_row(prefix, &entry.display_name(), hit, list.width as usize)
-        } else {
-            (
-                entry_row(
-                    prefix,
-                    entry,
-                    list.width as usize,
-                    modified_width,
-                    app.display_settings(),
-                    now,
-                ),
-                None,
-            )
-        };
-        let style = if selected {
-            emphasis_style(palette)
-        } else {
-            entry_style(entry, palette)
-        };
-        if app.is_searching() {
-            lines.push(literal_highlight_line(
-                text,
-                style,
+        if let Some(hit) = app.search_hit(index) {
+            lines.push(search_result_line(
+                &entry.display_name(),
+                hit,
+                app.search_file_line_count(index),
+                list.width as usize,
+                selected,
                 palette,
                 &matcher,
-                first_match,
             ));
         } else {
+            let text = entry_row(
+                prefix,
+                entry,
+                list.width as usize,
+                modified_width,
+                app.display_settings(),
+                now,
+            );
+            let style = if selected {
+                emphasis_style(palette)
+            } else {
+                entry_style(entry, palette)
+            };
             lines.push(Line::styled(text, style));
         }
     }
@@ -1326,98 +1348,270 @@ fn highlighted_source_row(
     Line::from(spans)
 }
 
-fn literal_highlight_line(
-    text: String,
-    style: Style,
+fn search_result_line(
+    name: &str,
+    hit: &crate::search::SearchHit,
+    line_count: usize,
+    width: usize,
+    selected: bool,
     palette: &Palette,
     matcher: &crate::matching::LiteralMatcher,
-    extra: Option<std::ops::Range<usize>>,
 ) -> Line<'static> {
-    use unicode_segmentation::UnicodeSegmentation;
-    let mut ranges = matcher.ranges(&text);
-    if let Some(extra) = extra {
-        ranges.push(extra);
-    }
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (byte, grapheme) in text.grapheme_indices(true) {
-        let matched = ranges
-            .iter()
-            .any(|range| range.start < byte + grapheme.len() && byte < range.end);
-        let style = if matched {
-            style
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    use crate::search::SearchHitKind;
+    let prefix = if selected { "› " } else { "  " };
+    let base = if selected {
+        emphasis_style(palette)
+    } else {
+        Style::default().fg(palette.text)
+    };
+    let muted = if selected {
+        base
+    } else {
+        base.patch(muted_style(palette))
+    };
+    let matched = if selected {
+        base.add_modifier(Modifier::UNDERLINED)
+    } else {
+        base.fg(palette.accent)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    };
+    let mut spans = vec![Span::styled(prefix.to_owned(), base)];
+    let available = width.saturating_sub(UnicodeWidthStr::width(prefix));
+    if hit.kind == SearchHitKind::Line {
+        let gutter = format!("  {:>5} ", hit.line.unwrap_or(1));
+        let gutter_width = gutter.len();
+        if available > gutter_width + 2 {
+            spans.push(Span::styled(gutter, muted));
+        }
+        let text_width = if available > gutter_width + 2 {
+            available - gutter_width
         } else {
-            style
+            available
         };
-        if let Some(last) = spans.last_mut().filter(|span| span.style == style) {
+        let first = hit.first_match.start.saturating_sub(hit.excerpt_start)
+            ..hit.first_match.end.saturating_sub(hit.excerpt_start);
+        append_search_window(
+            &mut spans,
+            &hit.excerpt,
+            first,
+            text_width,
+            base,
+            Some(matcher),
+            matched,
+        );
+    } else {
+        let undecorated = if hit.is_symlink {
+            name.strip_suffix('@').unwrap_or(name)
+        } else {
+            name
+        };
+        let trimmed = if hit.is_dir {
+            undecorated.trim_end_matches('/')
+        } else {
+            undecorated
+        };
+        let basename_start = trimmed.rfind('/').map_or(0, |byte| byte + 1);
+        let (directory, basename) = name.split_at(basename_start);
+        let count = if line_count == 1 {
+            "  1 line".to_owned()
+        } else if line_count > 0 {
+            format!("  {line_count} lines")
+        } else {
+            String::new()
+        };
+        let count_width = count.len();
+        let basename_width = UnicodeWidthStr::width(basename);
+        let show_count = line_count > 0 && available >= basename_width + count_width + 4;
+        let path_width = available.saturating_sub(if show_count { count_width } else { 0 });
+        let header_style = if hit.is_dir && !selected {
+            base.fg(palette.accent).add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        let highlight = (hit.kind == SearchHitKind::Name).then_some(matcher);
+        let directory_match =
+            hit.kind == SearchHitKind::Name && hit.first_match.start < basename_start;
+        let directory_reserve = if directory_match {
+            let match_end = hit.first_match.end.min(directory.len());
+            let match_width = UnicodeWidthStr::width(&directory[hit.first_match.start..match_end]);
+            (match_width + 3)
+                .min((path_width / 2).max(4))
+                .min(path_width)
+        } else {
+            0
+        };
+        if basename_width >= path_width && !directory_match {
+            let first = if hit.kind == SearchHitKind::Name {
+                hit.first_match.start.saturating_sub(basename_start)
+                    ..hit.first_match.end.saturating_sub(basename_start)
+            } else {
+                0..0
+            };
+            append_search_window(
+                &mut spans,
+                basename,
+                first,
+                path_width,
+                header_style,
+                highlight,
+                matched,
+            );
+        } else {
+            // Keep a directory match visible even when the basename also needs clipping.
+            let directory_width = path_width
+                .saturating_sub(basename_width)
+                .max(directory_reserve);
+            let basename_budget = path_width.saturating_sub(directory_width);
+            let first = if directory_match {
+                hit.first_match.clone()
+            } else {
+                directory.len()..directory.len()
+            };
+            if !directory.is_empty() {
+                append_search_window(
+                    &mut spans,
+                    directory.trim_end_matches('/'),
+                    first,
+                    directory_width.saturating_sub(1),
+                    muted,
+                    highlight,
+                    matched,
+                );
+                let slash_style = if highlight.is_some()
+                    && hit.first_match.start < basename_start
+                    && hit.first_match.end >= basename_start
+                {
+                    matched
+                } else {
+                    muted
+                };
+                spans.push(Span::styled("/", slash_style));
+            }
+            let first = hit.first_match.start.saturating_sub(basename_start)
+                ..hit.first_match.end.saturating_sub(basename_start);
+            append_search_window(
+                &mut spans,
+                basename,
+                first,
+                basename_budget,
+                header_style,
+                highlight,
+                matched,
+            );
+        }
+        if show_count {
+            let used = spans.iter().map(Span::width).sum::<usize>();
+            let padding = width.saturating_sub(used + count_width);
+            if padding > 0 {
+                spans.push(Span::styled(" ".repeat(padding), muted));
+            }
+            spans.push(Span::styled(count, muted));
+        }
+    }
+    let used = spans.iter().map(Span::width).sum::<usize>();
+    if selected && used < width {
+        spans.push(Span::styled(" ".repeat(width - used), base));
+    }
+    Line::from(spans)
+}
+
+struct SearchWindow {
+    bytes: std::ops::Range<usize>,
+    before: bool,
+    after: bool,
+}
+
+/// Keep complete graphemes and reserve the first match before context or markers.
+fn search_window(source: &str, first: std::ops::Range<usize>, width: usize) -> SearchWindow {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut window = SearchWindow {
+        bytes: 0..0,
+        before: false,
+        after: false,
+    };
+    if width == 0 {
+        return window;
+    }
+    if UnicodeWidthStr::width(source) <= width {
+        window.bytes.end = source.len();
+        return window;
+    }
+    let target = first.start.min(source.len());
+    let (target_start, target_text) = source
+        .grapheme_indices(true)
+        .take_while(|(byte, _)| *byte <= target)
+        .last()
+        .unwrap_or((0, ""));
+    let target_width = UnicodeWidthStr::width(target_text);
+    window.before = target_start > 0 && width > target_width;
+    window.after = target_start + target_text.len() < source.len()
+        && width > target_width + usize::from(window.before);
+    let available = width.saturating_sub(usize::from(window.before) + usize::from(window.after));
+    let context_width = if first.start >= source.len() {
+        available.saturating_sub(target_width)
+    } else {
+        (width / 4).min(available.saturating_sub(target_width))
+    };
+    let mut context = 0;
+    let mut start = target_start;
+    for (byte, grapheme) in source[..start].grapheme_indices(true).rev() {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if context + cells > context_width {
+            break;
+        }
+        context += cells;
+        start = byte;
+    }
+    window.before &= start > 0;
+    let available = width.saturating_sub(usize::from(window.before) + usize::from(window.after));
+    let mut used = 0;
+    let mut end = start;
+    for (byte, grapheme) in source[start..].grapheme_indices(true) {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if used + cells > available {
+            break;
+        }
+        used += cells;
+        end = start + byte + grapheme.len();
+    }
+    window.after &= end < source.len();
+    window.bytes = start..end;
+    window
+}
+
+fn append_search_window(
+    spans: &mut Vec<Span<'static>>,
+    source: &str,
+    first: std::ops::Range<usize>,
+    width: usize,
+    style: Style,
+    matcher: Option<&crate::matching::LiteralMatcher>,
+    matched_style: Style,
+) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let window = search_window(source, first.clone(), width);
+    let start = window.bytes.start;
+    let end = window.bytes.end;
+    if window.before {
+        spans.push(Span::styled("…", style));
+    }
+    let ranges = matcher.map_or_else(Vec::new, |matcher| matcher.ranges(source));
+    for (byte, grapheme) in source[start..end].grapheme_indices(true) {
+        let byte = byte + start;
+        let matched = matcher.is_some()
+            && std::iter::once(&first)
+                .chain(ranges.iter())
+                .any(|range| range.start < byte + grapheme.len() && byte < range.end);
+        let style = if matched { matched_style } else { style };
+        if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
             last.content.to_mut().push_str(grapheme);
         } else {
             spans.push(Span::styled(grapheme.to_owned(), style));
         }
     }
-    Line::from(spans)
-}
-
-fn search_result_row(
-    prefix: &str,
-    name: &str,
-    hit: &crate::search::SearchHit,
-    width: usize,
-) -> (String, Option<std::ops::Range<usize>>) {
-    use unicode_segmentation::UnicodeSegmentation;
-    let available = width.saturating_sub(UnicodeWidthStr::width(prefix));
-    let location = hit
-        .line
-        .map_or_else(String::new, |line| format!(":{line}: "));
-    let label = if hit.line.is_some() {
-        shorten_left(name, available.saturating_sub(location.len()) / 3)
-    } else {
-        String::new()
-    };
-    let excerpt_width =
-        available.saturating_sub(UnicodeWidthStr::width(label.as_str()) + location.len());
-    let source = if hit.line.is_some() {
-        hit.excerpt.as_str()
-    } else {
-        name
-    };
-    let local_first = hit
-        .first_match
-        .start
-        .saturating_sub(hit.excerpt_start)
-        .min(source.len());
-    let mut window_start = source
-        .grapheme_indices(true)
-        .map(|(byte, _)| byte)
-        .take_while(|byte| *byte <= local_first)
-        .last()
-        .unwrap_or(0);
-    let mut context = 0;
-    for (byte, grapheme) in source[..window_start].grapheme_indices(true).rev() {
-        let cells = UnicodeWidthStr::width(grapheme);
-        if context + cells > excerpt_width / 4 {
-            break;
-        }
-        context += cells;
-        window_start = byte;
+    if window.after {
+        spans.push(Span::styled("…", style));
     }
-    let marker = if window_start > 0 { "…" } else { "" };
-    let excerpt = shorten_right(
-        &format!("{marker}{}", &source[window_start..]),
-        excerpt_width,
-    );
-    let base = prefix.len() + label.len() + location.len() + marker.len();
-    let first_start = hit.first_match.start.max(hit.excerpt_start + window_start);
-    let first_end = hit.first_match.end.min(hit.excerpt_start + source.len());
-    let extra = (first_start < first_end).then_some(
-        base + first_start - hit.excerpt_start - window_start
-            ..base + first_end - hit.excerpt_start - window_start,
-    );
-    (
-        fill_row(prefix, &format!("{label}{location}{excerpt}"), width),
-        extra,
-    )
 }
 
 /// Number only the first visual row of each original line.
@@ -2015,24 +2209,11 @@ fn render_scrollbar(frame: &mut Frame<'_>, bar: ViewerScrollBar, palette: &Palet
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
-    let line = if app.is_searching() {
-        format!(
-            " / {}▏  {}  {} hits · {} scanned{}  Esc restore",
-            app.search_query(),
-            if app.search_pending() {
-                "searching…"
-            } else {
-                "complete"
-            },
-            app.entries().len(),
-            app.search_scanned(),
-            if app.search_truncated() {
-                " · result limit"
-            } else {
-                ""
-            }
-        )
-    } else if area.width >= 85 {
+    if app.is_searching() {
+        frame.render_widget(search_footer(app, area.width as usize, palette), area);
+        return;
+    }
+    let line = if area.width >= 85 {
         format!(
             " ↑↓ select  → browse  ← parent  / search  e edit  ↵ choose/view  ^G current  s:{}{}  . hidden:{}",
             app.sort_mode().label(),
@@ -2045,6 +2226,68 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         " / find  e edit  ↵ choose/view  ^G here".to_owned()
     };
     frame.render_widget(Paragraph::new(line).style(muted_style(palette)), area);
+}
+
+fn search_footer(app: &App, width: usize, palette: &Palette) -> Paragraph<'static> {
+    use crate::search::SearchScope;
+    let label = app.search_scope().label();
+    let short_label = match app.search_scope() {
+        SearchScope::Names => "Names",
+        _ => label,
+    };
+    let limit = if app.search_truncated() { " LIMIT" } else { "" };
+    let budget = width.saturating_sub(limit.len());
+    let (label, control) = [
+        (label, " Shift+Tab"),
+        (short_label, " Shift+Tab"),
+        (short_label, " ⇧Tab"),
+        (&short_label[..1], " ⇧Tab"),
+    ]
+    .into_iter()
+    .find(|(label, control)| label.len() + 2 + UnicodeWidthStr::width(*control) <= budget)
+    .unwrap_or((&short_label[..1], " ⇧Tab"));
+    let mut used = label.len() + 2 + UnicodeWidthStr::width(control);
+    let mut spans = vec![
+        Span::styled(format!("[{label}]"), emphasis_style(palette)),
+        key(control, palette),
+    ];
+    let (names, lines, files) = app.search_counts();
+    let mut append = |full: String, compact: String| {
+        let remaining = budget.saturating_sub(used + 3);
+        let (separator, text) = if UnicodeWidthStr::width(full.as_str()) <= remaining {
+            (" · ", full)
+        } else if UnicodeWidthStr::width(compact.as_str()) <= remaining {
+            (" · ", compact)
+        } else if UnicodeWidthStr::width(compact.as_str()) <= budget.saturating_sub(used + 1) {
+            (" ", compact)
+        } else {
+            return;
+        };
+        used += UnicodeWidthStr::width(separator) + UnicodeWidthStr::width(text.as_str());
+        spans.push(hint(format!("{separator}{text}"), palette));
+    };
+    append(
+        format!("{names} names · {lines} lines in {files} files"),
+        format!("N:{names} L:{lines} F:{files}"),
+    );
+    append(
+        if app.search_pending() {
+            "searching…"
+        } else {
+            "complete"
+        }
+        .to_owned(),
+        if app.search_pending() { "…" } else { "done" }.to_owned(),
+    );
+    append(
+        format!("{} paths scanned", app.search_scanned()),
+        format!("S:{}", app.search_scanned()),
+    );
+    append("Esc restore".to_owned(), "Esc".to_owned());
+    if !limit.is_empty() {
+        spans.push(key(limit, palette));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 fn render_theme_footer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
@@ -2753,18 +2996,17 @@ mod tests {
     }
 
     #[test]
-    fn search_footer_distinguishes_pending_and_complete_results() {
+    fn search_groups_lines_and_keeps_controls_visible_at_browser_widths() {
         let temp = tempdir().unwrap();
         fs::create_dir(temp.path().join("Cargo-project")).unwrap();
-        fs::write(temp.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "cargo first\nsecond cargo").unwrap();
         fs::write(temp.path().join("README.md"), "hello").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         app.begin_search();
         for character in "cargo".chars() {
             app.push_search_char(character);
         }
-        let backend = TestBackend::new(78, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let pending = terminal.backend().to_string();
@@ -2777,12 +3019,155 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         app.poll_search();
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        for width in [112, 80, 40] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            assert_eq!(row(0).trim_end(), "/ cargo▏");
+            let footer = row(9);
+            assert!(footer.starts_with("[Both] Shift+Tab"));
+            assert!(!footer.contains("Content") && !footer.contains("Files & folders"));
+            if width >= 80 {
+                assert!(
+                    footer.contains("2 names")
+                        && footer.contains("2 lines")
+                        && footer.contains("1 files")
+                );
+            } else {
+                assert!(footer.contains("N:2 L:2 F:1"));
+            }
+            assert!(footer.contains("complete") || footer.contains("done"));
+            let [_, body, _] = picker_areas(Rect::new(0, 0, width, 10));
+            let list = if width >= TWO_PANE_MIN_WIDTH {
+                picker_panes(body)[0]
+            } else {
+                body
+            };
+            let text = (list.y..list.bottom())
+                .map(|y| {
+                    (list.x..list.right())
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.matches("Cargo.toml").count(), 1);
+            assert!(text.contains("cargo first") && text.contains("second cargo"));
+            assert!(!text.contains("README.md"));
+        }
+    }
 
-        let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("/ cargo"));
-        assert!(rendered.contains("complete") && rendered.contains("2 hits"));
-        assert!(!rendered.contains("README.md"));
+    #[test]
+    fn search_keeps_only_active_mode_control_in_footer_and_query_tail_in_header() {
+        use crate::search::SearchScope;
+        let temp = tempdir().unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        let query = format!("{}e\u{301}-tail", "界".repeat(80));
+        for character in query.chars() {
+            app.push_search_char(character);
+        }
+        for scope in [SearchScope::Both, SearchScope::Names, SearchScope::Content] {
+            assert_eq!(app.search_scope(), scope);
+            for width in [112, 80, 40, 28, 20, 16] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 3)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let palette = app.theme().palette();
+                        render_search_header(frame, &app, Rect::new(0, 0, width, 1), &palette);
+                        render_footer(frame, &app, Rect::new(0, 2, width, 1), &palette);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let row = |y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                };
+                let header = row(0);
+                assert!(header.starts_with("/ …"));
+                assert!(header.trim_end().ends_with("e\u{301}-tail▏"));
+                assert!(!header.contains("Tab") && !header.contains(scope.label()));
+                let footer = row(2);
+                let label = if scope == SearchScope::Names && width < 27 {
+                    "Names"
+                } else {
+                    scope.label()
+                };
+                let control = if width as usize >= label.len() + 12 {
+                    "Shift+Tab"
+                } else {
+                    "⇧Tab"
+                };
+                assert!(footer.starts_with(&format!("[{label}] {control}")));
+                for inactive in [SearchScope::Both, SearchScope::Names, SearchScope::Content] {
+                    if inactive != scope {
+                        assert!(!footer.contains(inactive.label()));
+                    }
+                }
+                // Check visible control cells, not just text assembled before clipping.
+                for x in 0..(label.len() + 2) as u16 {
+                    assert_eq!(buffer[(x, 2)].fg, app.theme().palette().emphasis_foreground);
+                    assert_eq!(buffer[(x, 2)].bg, app.theme().palette().emphasis_background);
+                    assert!(buffer[(x, 2)].modifier.contains(Modifier::BOLD));
+                }
+                let control_end = label.len() + 3 + UnicodeWidthStr::width(control);
+                assert!(control_end <= width as usize);
+                assert_eq!(
+                    buffer[((control_end - 1) as u16, 2)].fg,
+                    app.theme().palette().accent
+                );
+            }
+            app.cycle_search_scope();
+        }
+    }
+
+    #[test]
+    fn search_footer_keeps_result_limit_after_active_mode_at_narrow_widths() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("many.txt"), "needle\n".repeat(10_001)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for character in "needle".chars() {
+            app.push_search_char(character);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.search_pending() {
+            app.poll_search();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        app.poll_search();
+        assert!(app.search_truncated());
+        for width in [112, 80, 40, 28, 20, 16, 14] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_footer(frame, &app, area, &app.theme().palette());
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..width)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>();
+            let control = if width >= 22 {
+                "[Both] Shift+Tab"
+            } else if width >= 17 {
+                "[Both] ⇧Tab"
+            } else {
+                "[B] ⇧Tab"
+            };
+            assert!(text.starts_with(control));
+            assert!(text.trim_end().ends_with(" LIMIT"));
+            let last = UnicodeWidthStr::width(text.trim_end()) as u16 - 1;
+            assert_eq!(buffer[(last, 0)].fg, app.theme().palette().accent);
+        }
     }
 
     #[test]
@@ -3636,18 +4021,267 @@ mod tests {
     }
 
     #[test]
-    fn clipped_long_browser_query_still_marks_the_visible_first_match() {
+    fn clipped_search_matches_keep_graphemes_and_highlight_only_source_text() {
+        use crate::search::{SearchHit, SearchHitKind};
         let palette = crate::Theme::auto().palette();
-        let query = "needle".repeat(80);
-        let matcher = crate::matching::LiteralMatcher::new(&query);
-        let line = literal_highlight_line(
-            "  file:1: needleneedle…".into(),
-            Style::default(),
+        let source = format!("{}a\u{301}界 tail", "x".repeat(60));
+        let hit = SearchHit {
+            path: "42.txt".into(),
+            is_dir: false,
+            is_symlink: false,
+            kind: SearchHitKind::Line,
+            line: Some(42),
+            excerpt: source,
+            first_match: 61..63,
+            excerpt_start: 0,
+        };
+        let line = search_result_line(
+            "42.txt",
+            &hit,
+            1,
+            14,
+            false,
             &palette,
-            &matcher,
-            Some(10..490),
+            &crate::matching::LiteralMatcher::new("\u{301}"),
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("a\u{301}")
+                    && span.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(
+            line.spans
+                .iter()
+                .filter(|span| span.content.contains("42"))
+                .all(|span| !span.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(line.width() <= 14);
+
+        let whitespace = SearchHit {
+            excerpt: "  visible".into(),
+            first_match: 0..2,
+            ..hit.clone()
+        };
+        let line = search_result_line(
+            "42.txt",
+            &whitespace,
+            1,
+            18,
+            false,
+            &palette,
+            &crate::matching::LiteralMatcher::new("  "),
+        );
+        assert!(
+            !line.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(
+            line.spans.iter().any(|span| span.content == "  "
+                && span.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+
+        let query = "needle".repeat(80);
+        let clipped = SearchHit {
+            excerpt: "needle".repeat(40),
+            first_match: 0..query.len(),
+            ..hit.clone()
+        };
+        let line = search_result_line(
+            "42.txt",
+            &clipped,
+            1,
+            40,
+            false,
+            &palette,
+            &crate::matching::LiteralMatcher::new(&query),
         );
         assert!(line.spans.iter().any(|span| span.content.contains("needle")
             && span.style.add_modifier.contains(Modifier::UNDERLINED)));
+
+        let name = SearchHit {
+            kind: SearchHitKind::Name,
+            line: None,
+            first_match: 0..6,
+            ..hit.clone()
+        };
+        let line = search_result_line(
+            "needle-parent/a-very-long-basename-for-clipping.txt",
+            &name,
+            0,
+            30,
+            false,
+            &palette,
+            &crate::matching::LiteralMatcher::new("needle"),
+        );
+        assert!(line.spans.iter().any(|span| span.content.contains("needle")
+            && span.style.add_modifier.contains(Modifier::UNDERLINED)));
+        assert!(line.spans.iter().any(
+            |span| span.content.contains("a-very-long") && span.style.fg == Some(palette.text)
+        ));
+        assert!(line.width() <= 30);
+
+        let header = SearchHit {
+            kind: SearchHitKind::File,
+            excerpt: String::new(),
+            ..hit
+        };
+        let line = search_result_line(
+            "long/directory/42.txt",
+            &header,
+            2,
+            20,
+            false,
+            &palette,
+            &crate::matching::LiteralMatcher::new("42"),
+        );
+        let text = line.to_string();
+        assert!(text.contains("42.txt"));
+        assert!(
+            line.spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::UNDERLINED))
+        );
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| span.content.contains("42.txt") && span.style.fg == Some(palette.text))
+        );
+        for width in [112, 80, 40] {
+            for (count, suffix) in [(1, "1 line"), (2, "2 lines")] {
+                let line = search_result_line(
+                    "long/directory/42.txt",
+                    &header,
+                    count,
+                    width,
+                    false,
+                    &palette,
+                    &crate::matching::LiteralMatcher::new("42"),
+                );
+                assert_eq!(line.width(), width);
+                let text = line.to_string();
+                assert!(text.ends_with(suffix));
+                assert_eq!(text.matches("42.txt").count(), 1);
+                assert!(
+                    line.spans
+                        .iter()
+                        .all(|span| { !span.style.add_modifier.contains(Modifier::UNDERLINED) })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_selection_keeps_effective_contrast_across_matches_gutters_and_padding() {
+        use crate::search::{SearchHit, SearchHitKind};
+        use ratatui::style::Color;
+        let catalog = crate::Config::built_ins();
+        let matcher = crate::matching::LiteralMatcher::new("needle");
+        let hit = SearchHit {
+            path: "needle/needle-file.txt".into(),
+            is_dir: false,
+            is_symlink: false,
+            kind: SearchHitKind::Name,
+            line: None,
+            excerpt: String::new(),
+            first_match: 0..7,
+            excerpt_start: 0,
+        };
+        let fixtures = [
+            ("needle/needle-file.txt", hit.clone()),
+            (
+                "needle/needle-folder/",
+                SearchHit {
+                    is_dir: true,
+                    ..hit.clone()
+                },
+            ),
+            (
+                "needle/needle-file.txt",
+                SearchHit {
+                    kind: SearchHitKind::Line,
+                    line: Some(42),
+                    excerpt: "prefix needle suffix".into(),
+                    first_match: 107..113,
+                    excerpt_start: 100,
+                    ..hit.clone()
+                },
+            ),
+            (
+                "needle/needle-file.txt",
+                SearchHit {
+                    kind: SearchHitKind::File,
+                    ..hit
+                },
+            ),
+        ];
+        for theme in ["auto", "dark", "light", "mono"] {
+            let palette = catalog.find(theme).unwrap().palette();
+            for width in [112, 80, 40, 14] {
+                for (name, hit) in &fixtures {
+                    let selected =
+                        search_result_line(name, hit, 2, width as usize, true, &palette, &matcher);
+                    let unselected =
+                        search_result_line(name, hit, 2, width as usize, false, &palette, &matcher);
+                    assert_eq!(selected.width(), width as usize);
+                    let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            frame.render_widget(
+                                Paragraph::new(vec![selected.clone(), unselected.clone()]),
+                                frame.area(),
+                            );
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    for (foreground, background) in
+                        [(Color::White, Color::Black), (Color::Black, Color::White)]
+                    {
+                        let effective = |cell: &ratatui::buffer::Cell| {
+                            let fg = if cell.fg == Color::Reset {
+                                foreground
+                            } else {
+                                cell.fg
+                            };
+                            let bg = if cell.bg == Color::Reset {
+                                background
+                            } else {
+                                cell.bg
+                            };
+                            if cell.modifier.contains(Modifier::REVERSED) {
+                                (bg, fg)
+                            } else {
+                                (fg, bg)
+                            }
+                        };
+                        let colors = effective(&buffer[(0, 0)]);
+                        assert_ne!(colors.0, colors.1, "{theme}, width {width}");
+                        assert_ne!(colors.1, background, "{theme}, width {width}");
+                        for x in 0..width {
+                            let cell = &buffer[(x, 0)];
+                            assert_eq!(effective(cell), colors, "{theme}, width {width}, x {x}");
+                            assert!(!cell.modifier.contains(Modifier::DIM));
+                        }
+                        assert_ne!(effective(&buffer[(width - 1, 1)]), colors);
+                        let matches = (0..width)
+                            .filter(|x| buffer[(*x, 0)].modifier.contains(Modifier::UNDERLINED))
+                            .collect::<Vec<_>>();
+                        if hit.kind == SearchHitKind::File {
+                            assert!(matches.is_empty());
+                        } else {
+                            assert!(!matches.is_empty(), "{theme}, width {width}, {name}");
+                            for x in matches {
+                                let normal_match = &buffer[(x, 1)];
+                                assert!(normal_match.modifier.contains(Modifier::UNDERLINED));
+                                assert_eq!(normal_match.fg, palette.accent);
+                                assert_ne!(effective(normal_match), colors);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

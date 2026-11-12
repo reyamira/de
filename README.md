@@ -19,6 +19,11 @@ Press `o` to open a file in its default application.
 
 - Press `f` in the file viewer to use every terminal row, or to restore its normal inline size.
 - Viewer expansion keeps the reading position, subject to the new scroll limit, and resets when the viewer closes.
+- Browser search offers `Both`, `Files & folders`, and `Content` scopes. Press `Shift+Tab` to change scope without clearing the query.
+- Search groups matching source lines under one filename. Headers show line counts, and the footer separates name, line, and content-file counts.
+- Search keeps the query at the top and shows only the active mode beside `Shift+Tab` in the footer.
+- A full-row selection now stays distinct from underlined query matches.
+- Search navigation stays within the filtered results. Press `Escape` before browsing folders; `Enter` still chooses or opens a result.
 
 ## What's new in v0.6.0
 
@@ -120,6 +125,9 @@ asks the parent shell to `cd` there.
 | `Right`, `l`, `Tab` | Make the previewed directory current |
 | `Left`, `h`, `Backspace` | Go to the parent directory |
 | `/` | Search names and text recursively under the current folder |
+| `Shift+Tab` (search) | Cycle `Both`, `Files & folders`, and `Content` without clearing the query |
+| `Up` / `Down`, `PageUp` / `PageDown`, `Home` / `End` (search) | Select only filtered results |
+| `Left`, `Right`, `Tab` (search) | Do not browse folders; press `Escape` to leave search first |
 | `s` | Toggle sorting by name or modification time |
 | `Shift+S` | Toggle ascending or descending order |
 | `v` | View the highlighted file inline |
@@ -166,13 +174,27 @@ requirements, Markdown rendering, and size limits.
 
 Press `/` to search names and text under the current folder.
 The search uses literal, case-insensitive text, not a regular expression.
-Results show relative paths and original source lines with excerpts.
-Name matches and matching text lines are separate results.
-Arrow and page keys select results while the search continues in the background.
+Search starts in `Both` mode.
+Press `Shift+Tab` while typing to cycle through `Files & folders`, `Content`, and `Both`.
+The header shows only `/ query▏`.
+The footer shows only the active mode and its `Shift+Tab` control.
+The app remembers the mode until it closes.
+`Files & folders` matches the full relative path, including parent directory names, as before.
+`Content` matches original source text.
+Results group matching source lines under one filename.
+Unselected rows use muted directory names and source numbers.
+File headers show matching line counts when space permits.
+Only matching names and source excerpts receive query highlights.
+The selected result uses a full-row reverse or filled style from the current theme.
+Matches within that row use underlines without changing its selection colors.
+The footer adds counts, progress, and controls when space permits.
+It keeps the result-limit warning when results reach the limit.
+`Up`, `Down`, `PageUp`, `PageDown`, `Home`, and `End` select only filtered results.
+Search continues in the background.
 `Enter` chooses a folder result or opens the exact first match in a file.
 Visible Markdown text opens in rendered mode; hidden Markdown syntax opens in source mode.
-`Right` or `Tab` browses into a folder result.
-The same query then searches the folder in the header.
+`Left`, `Right`, and plain `Tab` do not browse folders during search.
+Press `Escape` before using folder-browsing keys.
 To edit a search result, press `Enter`, then `e`.
 `Escape` restores the exact folder and selection from before the search.
 From a viewer, `Escape` first returns to the search.

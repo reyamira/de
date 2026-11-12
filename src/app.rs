@@ -129,6 +129,23 @@ struct SearchSnapshot {
     selected: usize,
 }
 
+#[derive(Clone, Debug)]
+struct SearchSelection {
+    path: PathBuf,
+    kind: crate::search::SearchHitKind,
+    line: Option<usize>,
+}
+
+impl From<&crate::search::SearchHit> for SearchSelection {
+    fn from(hit: &crate::search::SearchHit) -> Self {
+        Self {
+            path: hit.path.clone(),
+            kind: hit.kind,
+            line: hit.line,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ViewerFind {
     query: String,
@@ -149,10 +166,15 @@ pub struct App {
     status: Option<String>,
     preview: Preview,
     search_query: String,
+    search_scope: crate::search::SearchScope,
     search_snapshot: Option<SearchSnapshot>,
     search_worker: crate::search::SearchWorker,
     search_generation: Option<u64>,
     search_hits: Vec<crate::search::SearchHit>,
+    search_selection: Option<SearchSelection>,
+    search_name_count: usize,
+    search_line_count: usize,
+    search_file_lines: std::collections::HashMap<PathBuf, usize>,
     search_scanned: usize,
     search_truncated: bool,
     viewer_source_line: Option<usize>,
@@ -219,10 +241,15 @@ impl App {
                 image: None,
             },
             search_query: String::new(),
+            search_scope: crate::search::SearchScope::default(),
             search_snapshot: None,
             search_worker: crate::search::SearchWorker::new(),
             search_generation: None,
             search_hits: Vec::new(),
+            search_selection: None,
+            search_name_count: 0,
+            search_line_count: 0,
+            search_file_lines: std::collections::HashMap::new(),
             search_scanned: 0,
             search_truncated: false,
             viewer_source_line: None,
@@ -659,6 +686,32 @@ impl App {
 
     pub fn search_query(&self) -> &str {
         &self.search_query
+    }
+
+    pub fn search_scope(&self) -> crate::search::SearchScope {
+        self.search_scope
+    }
+
+    pub fn cycle_search_scope(&mut self) {
+        self.search_scope = self.search_scope.next();
+        if self.is_searching() {
+            self.request_search();
+        }
+    }
+
+    pub fn search_counts(&self) -> (usize, usize, usize) {
+        (
+            self.search_name_count,
+            self.search_line_count,
+            self.search_file_lines.len(),
+        )
+    }
+
+    pub fn search_file_line_count(&self, index: usize) -> usize {
+        self.search_hit(index)
+            .filter(|hit| hit.kind != crate::search::SearchHitKind::Line)
+            .and_then(|hit| self.search_file_lines.get(&hit.path).copied())
+            .unwrap_or(0)
     }
 
     pub fn search_pending(&self) -> bool {
@@ -1114,12 +1167,14 @@ impl App {
 
     pub fn move_up(&mut self) {
         self.status = None;
+        self.search_selection = None;
         self.selected = self.selected.saturating_sub(1);
         self.refresh_preview();
     }
 
     pub fn move_down(&mut self) {
         self.status = None;
+        self.search_selection = None;
         if !self.entries.is_empty() {
             self.selected = (self.selected + 1).min(self.entries.len() - 1);
         }
@@ -1128,24 +1183,28 @@ impl App {
 
     pub fn move_first(&mut self) {
         self.status = None;
+        self.search_selection = None;
         self.selected = 0;
         self.refresh_preview();
     }
 
     pub fn move_last(&mut self) {
         self.status = None;
+        self.search_selection = None;
         self.selected = self.entries.len().saturating_sub(1);
         self.refresh_preview();
     }
 
     pub fn page_up(&mut self, rows: usize) {
         self.status = None;
+        self.search_selection = None;
         self.selected = self.selected.saturating_sub(rows.max(1));
         self.refresh_preview();
     }
 
     pub fn page_down(&mut self, rows: usize) {
         self.status = None;
+        self.search_selection = None;
         if !self.entries.is_empty() {
             self.selected = self
                 .selected
@@ -1183,6 +1242,10 @@ impl App {
         self.search_worker.cancel();
         self.search_generation = None;
         self.search_hits.clear();
+        self.search_selection = None;
+        self.search_name_count = 0;
+        self.search_line_count = 0;
+        self.search_file_lines.clear();
         self.search_query.clear();
         if let Some(snapshot) = self.search_snapshot.take() {
             self.current_dir = snapshot.current_dir;
@@ -1195,12 +1258,19 @@ impl App {
     }
 
     fn request_search(&mut self) {
+        if self.search_selection.is_none() {
+            self.search_selection = self.selected_search_hit().map(SearchSelection::from);
+        }
         self.search_generation = Some(self.search_worker.request(
             self.current_dir.clone(),
             self.search_query.clone(),
             self.show_hidden,
+            self.search_scope,
         ));
         self.search_hits.clear();
+        self.search_name_count = 0;
+        self.search_line_count = 0;
+        self.search_file_lines.clear();
         self.entries.clear();
         self.selected = 0;
         self.search_scanned = 0;
@@ -1214,9 +1284,8 @@ impl App {
             return false;
         }
         let mut changed = false;
-        let selected = self
-            .selected_search_hit()
-            .map(|hit| (hit.path.clone(), hit.line));
+        let mut done = false;
+        let mut selected = None;
         for _ in 0..4 {
             let Some(batch) = self.search_worker.poll() else {
                 break;
@@ -1224,48 +1293,97 @@ impl App {
             if Some(batch.generation) != self.search_generation || !self.is_searching() {
                 continue;
             }
+            if !changed && self.search_selection.is_none() {
+                selected = self.selected_search_hit().map(SearchSelection::from);
+            }
             self.search_scanned = batch.scanned;
             self.search_truncated |= batch.truncated;
-            for hit in batch.hits {
-                let position = self.search_hits.binary_search_by(|existing| {
-                    existing
-                        .path
-                        .cmp(&hit.path)
-                        .then(existing.line.cmp(&hit.line))
-                });
-                let Err(index) = position else {
-                    continue;
-                };
-                self.entries.insert(
-                    index,
-                    Entry {
-                        name: hit
-                            .path
-                            .strip_prefix(&self.current_dir)
-                            .unwrap_or(&hit.path)
-                            .as_os_str()
-                            .to_owned(),
-                        path: hit.path.clone(),
-                        is_dir: hit.is_dir,
-                        is_symlink: hit.is_symlink,
-                        modified: None,
-                    },
-                );
-                self.search_hits.insert(index, hit);
-            }
+            done |= batch.done;
+            self.merge_search_hits(batch.hits);
             changed = true;
         }
         if changed {
-            self.selected = selected
-                .and_then(|identity| {
-                    self.search_hits.iter().position(|hit| {
-                        (hit.path.as_path(), hit.line) == (identity.0.as_path(), identity.1)
-                    })
-                })
-                .unwrap_or(0);
+            self.restore_search_selection(selected.as_ref(), done);
             self.refresh_preview();
         }
         changed
+    }
+
+    fn merge_search_hits(&mut self, hits: Vec<crate::search::SearchHit>) {
+        use crate::search::SearchHitKind;
+        for hit in hits {
+            let position = self.search_hits.binary_search_by(|existing| {
+                existing
+                    .path
+                    .cmp(&hit.path)
+                    .then(existing.kind.cmp(&hit.kind))
+                    .then(existing.line.cmp(&hit.line))
+            });
+            let Err(index) = position else {
+                continue;
+            };
+            match hit.kind {
+                SearchHitKind::Name => self.search_name_count += 1,
+                SearchHitKind::Line => {
+                    self.search_line_count += 1;
+                    if let Some(count) = self.search_file_lines.get_mut(&hit.path) {
+                        *count += 1;
+                    } else {
+                        self.search_file_lines.insert(hit.path.clone(), 1);
+                    }
+                }
+                SearchHitKind::File => {}
+            }
+            self.entries.insert(
+                index,
+                Entry {
+                    name: hit
+                        .path
+                        .strip_prefix(&self.current_dir)
+                        .unwrap_or(&hit.path)
+                        .as_os_str()
+                        .to_owned(),
+                    path: hit.path.clone(),
+                    is_dir: hit.is_dir,
+                    is_symlink: hit.is_symlink,
+                    modified: None,
+                },
+            );
+            self.search_hits.insert(index, hit);
+        }
+    }
+
+    fn restore_search_selection(&mut self, selected: Option<&SearchSelection>, done: bool) {
+        use crate::search::{SearchHitKind, SearchScope};
+        let Some(anchor) = self.search_selection.as_ref().or(selected) else {
+            self.selected = 0;
+            return;
+        };
+        let start = self
+            .search_hits
+            .partition_point(|hit| hit.path < anchor.path);
+        let end = start + self.search_hits[start..].partition_point(|hit| hit.path == anchor.path);
+        let group = &self.search_hits[start..end];
+        let desired = group.iter().position(|hit| match self.search_scope {
+            SearchScope::Names => hit.kind == SearchHitKind::Name,
+            SearchScope::Content if anchor.kind == SearchHitKind::Name => {
+                hit.kind == SearchHitKind::Line
+            }
+            _ if anchor.kind == SearchHitKind::Line => {
+                hit.kind == SearchHitKind::Line && hit.line == anchor.line
+            }
+            _ => hit.kind != SearchHitKind::Line,
+        });
+        if let Some(index) = desired {
+            self.selected = start + index;
+            self.search_selection = None;
+        } else {
+            // Keep a same-file header visible while the exact line is still in flight.
+            self.selected = if group.is_empty() { 0 } else { start };
+            if done {
+                self.search_selection = None;
+            }
+        }
     }
 
     pub fn cycle_sort(&mut self) {
@@ -1362,6 +1480,10 @@ impl App {
                 self.search_worker.cancel();
                 self.search_generation = None;
                 self.search_hits.clear();
+                self.search_selection = None;
+                self.search_name_count = 0;
+                self.search_line_count = 0;
+                self.search_file_lines.clear();
                 self.all_entries = entries;
                 self.entries = self.all_entries.clone();
                 self.selected = select_name
@@ -1725,6 +1847,7 @@ mod tests {
         }
         finish_search(&mut app);
         app.move_down();
+        app.move_down();
         assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
         app.open_viewer();
         let start = source.find("[needle]").unwrap() + 1;
@@ -1786,7 +1909,12 @@ mod tests {
             app.push_search_char(ch);
         }
         finish_search(&mut app);
-        assert!(app.selected_search_hit().unwrap().excerpt_start > 240);
+        assert_eq!(
+            app.selected_search_hit().unwrap().kind,
+            crate::search::SearchHitKind::File
+        );
+        assert!(app.selected_search_hit().unwrap().first_match.start > 240);
+        assert!(app.search_hit(1).unwrap().excerpt_start > 240);
         let entries = app.entries.clone();
         app.open_viewer();
         assert_eq!(&source[app.active_match().unwrap()], "NEEDLE");
@@ -2164,7 +2292,7 @@ mod tests {
         finish_search(&mut app);
         assert!(app.is_searching());
         assert_eq!(app.search_query(), "NEEDLE");
-        assert_eq!(app.entries().len(), 1);
+        assert_eq!(app.entries().len(), 2);
         assert_eq!(app.selected_search_hit().unwrap().line, Some(2));
         assert_eq!(app.activate_selected(), NavigationResult::Continue);
         assert!(app.is_viewing());
@@ -2172,6 +2300,10 @@ mod tests {
         app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 40, 10));
         assert_eq!(crate::ui::viewer_source_at_scroll(&app), Some(2));
         app.close_viewer();
+        app.open_editor();
+        assert_eq!(app.editor().unwrap().cursor(), (1, 0));
+        assert_eq!(app.editor().unwrap().lines()[1], "Needle here");
+        app.handle_editor_key(termina::event::KeyCode::Escape.into(), 5);
         assert!(app.is_searching());
         app.cancel_search();
         assert_eq!(app.current_dir(), temp.path());
@@ -2190,6 +2322,10 @@ mod tests {
         }
         finish_search(&mut app);
         assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
+        assert_eq!(
+            app.selected_search_hit().unwrap().kind,
+            crate::search::SearchHitKind::File
+        );
         assert_eq!(app.activate_selected(), NavigationResult::Continue);
         app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 40, 10));
         assert_eq!(crate::ui::viewer_source_at_scroll(&app), Some(3));
@@ -2230,7 +2366,7 @@ mod tests {
         app.handle_editor_key(termina::event::KeyCode::Escape.into(), 5);
         assert!(app.background_work_pending());
         finish_search(&mut app);
-        assert_eq!(app.entries().len(), 300);
+        assert_eq!(app.entries().len(), 301);
         assert!(!app.background_work_pending());
     }
 
@@ -2332,6 +2468,112 @@ mod tests {
         finish_search(&mut app);
         assert_eq!(app.entries().len(), 261);
         assert_eq!(app.selected_search_hit(), Some(&selected));
+    }
+
+    #[test]
+    fn search_scope_maps_selection_and_keeps_session_scope() {
+        use crate::search::{SearchHitKind, SearchScope};
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("needle-folder")).unwrap();
+        fs::write(temp.path().join("needle-folder/child.txt"), "plain").unwrap();
+        fs::write(
+            temp.path().join("needle.txt"),
+            "first needle\nskip\nlast needle\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("other.txt"), "needle\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        app.paste("needle");
+        finish_search(&mut app);
+        assert_eq!(app.search_counts(), (3, 3, 2));
+        let name = app
+            .search_hits
+            .iter()
+            .position(|hit| hit.path.ends_with("needle.txt") && hit.kind == SearchHitKind::Name)
+            .unwrap();
+        assert_eq!(app.search_file_line_count(name), 2);
+        assert_eq!(app.search_file_line_count(name + 1), 0);
+
+        // An unmatched directory has no content row: completion falls back to the first group.
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.search_counts(), (3, 0, 0));
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.search_scope(), SearchScope::Content);
+        assert_eq!(app.search_counts(), (0, 3, 2));
+        assert!(app.selected_entry().unwrap().path.ends_with("needle.txt"));
+        assert_eq!(app.selected_search_hit().unwrap().kind, SearchHitKind::File);
+        assert!(app.search_selection.is_none());
+
+        app.page_down(2);
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.selected_search_hit().unwrap().kind, SearchHitKind::Line);
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.selected_search_hit().unwrap().kind, SearchHitKind::Name);
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.selected_search_hit().unwrap().kind, SearchHitKind::Line);
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(1));
+        assert_eq!(app.search_query(), "needle");
+        app.cancel_search();
+        assert_eq!(app.search_scope(), SearchScope::Content);
+        app.enter_selected();
+        assert!(app.current_dir().ends_with("needle-folder"));
+        app.begin_search();
+        assert_eq!(app.search_scope(), SearchScope::Content);
+        app.paste("plain");
+        finish_search(&mut app);
+        assert_eq!(app.search_counts(), (0, 1, 1));
+    }
+
+    #[test]
+    fn pending_search_line_waits_for_its_batch_unless_navigation_cancels_it() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("a.txt"), "needle\n").unwrap();
+        fs::write(temp.path().join("z.txt"), "needle\nskip\nneedle\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        app.paste("needle");
+        finish_search(&mut app);
+        app.move_last();
+        let wanted = app.selected_search_hit().unwrap().clone();
+        let hits = app.search_hits.clone();
+        let split = hits.len() - 1;
+
+        // Replay real worker rows with the selected line in a later batch.
+        app.request_search();
+        app.search_worker.cancel();
+        app.merge_search_hits(hits[..split].to_vec());
+        app.restore_search_selection(None, false);
+        assert_eq!(
+            app.selected_search_hit().unwrap().kind,
+            crate::search::SearchHitKind::File
+        );
+        assert!(app.search_selection.is_some());
+        let selected = app.selected_search_hit().map(SearchSelection::from);
+        app.merge_search_hits(hits[split..].to_vec());
+        app.restore_search_selection(selected.as_ref(), true);
+        assert_eq!(app.selected_search_hit(), Some(&wanted));
+        assert!(app.search_selection.is_none());
+
+        app.request_search();
+        app.search_worker.cancel();
+        app.merge_search_hits(hits[..split].to_vec());
+        app.restore_search_selection(None, false);
+        app.move_first();
+        assert!(app.search_selection.is_none());
+        let manual = app.selected_search_hit().unwrap().clone();
+        let selected = app.selected_search_hit().map(SearchSelection::from);
+        app.merge_search_hits(hits[split..].to_vec());
+        app.restore_search_selection(selected.as_ref(), true);
+        assert_eq!(app.selected_search_hit(), Some(&manual));
+        assert_eq!(app.search_counts(), (0, 3, 2));
     }
 
     #[test]

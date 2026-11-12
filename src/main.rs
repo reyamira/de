@@ -35,6 +35,8 @@ const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
   → or l/Tab         Open folder     ← or h/Backspace  Go to parent
   /                  Recursive names + text search
+  Shift+Tab (search) Cycle Both / Files & folders / Content, keeping the query
+  ↑/↓ (search)       Select results; Esc restores folder browsing
   Shift+S            Ascending / descending
   v                  View file inline   Esc / q           Return to picker
   f (viewer)         Toggle inline / full terminal size
@@ -1136,8 +1138,8 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::PageDown => app.page_down(page_rows),
             KeyCode::Home => app.move_first(),
             KeyCode::End => app.move_last(),
-            KeyCode::Right | KeyCode::Tab => app.enter_selected(),
-            KeyCode::Left => app.go_parent(),
+            KeyCode::BackTab => app.cycle_search_scope(),
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => app.cycle_search_scope(),
             KeyCode::Backspace => app.pop_search_char(),
             KeyCode::Enter => return app.activate_selected(),
             KeyCode::Escape => app.cancel_search(),
@@ -1617,6 +1619,102 @@ mod tests {
         let open = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
         assert_eq!(handle_key(&mut app, open, 5), NavigationResult::Continue);
         assert_eq!(app.search_query(), "o");
+    }
+
+    #[test]
+    fn search_scope_keys_keep_query_and_do_not_browse() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("needle")).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        app.push_search_char('n');
+        let root = app.current_dir().to_path_buf();
+        for (key, scope) in [
+            (
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+                de::search::SearchScope::Names,
+            ),
+            (
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+                de::search::SearchScope::Content,
+            ),
+        ] {
+            assert_eq!(handle_key(&mut app, key, 5), NavigationResult::Continue);
+            assert_eq!(app.search_scope(), scope);
+            assert_eq!(app.search_query(), "n");
+            assert_eq!(app.current_dir(), root.as_path());
+        }
+    }
+
+    #[test]
+    fn search_navigation_stays_in_the_active_results() {
+        use de::search::{SearchHitKind, SearchScope};
+
+        let temp = tempdir().unwrap();
+        let folder = temp.path().join("needle-dir");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("inside.txt"), "needle inside\n").unwrap();
+        fs::write(temp.path().join("notes.txt"), "needle outside\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for scope in [SearchScope::Both, SearchScope::Names, SearchScope::Content] {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while app.search_pending() {
+                app.poll_search();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "search did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(app.search_scope(), scope);
+            assert!(app.entries().len() >= 2);
+            for index in 0..app.entries().len() {
+                let kind = app.search_hit(index).unwrap().kind;
+                match scope {
+                    SearchScope::Both => {}
+                    SearchScope::Names => assert_eq!(kind, SearchHitKind::Name),
+                    SearchScope::Content => assert_ne!(kind, SearchHitKind::Name),
+                }
+            }
+            handle_key(&mut app, key(KeyCode::Home), 1);
+            let selected = app.selected_entry().unwrap().path.clone();
+            for code in [KeyCode::Left, KeyCode::Right, KeyCode::Tab] {
+                assert_eq!(
+                    handle_key(&mut app, key(code), 1),
+                    NavigationResult::Continue
+                );
+                assert_eq!(app.current_dir(), temp.path());
+                assert_eq!(app.selected_entry().unwrap().path, selected);
+                assert_eq!(app.search_query(), "needle");
+                assert_eq!(app.search_scope(), scope);
+                assert!(!app.is_viewing());
+            }
+            handle_key(&mut app, key(KeyCode::Down), 1);
+            assert_eq!(app.selected(), 1);
+            handle_key(&mut app, key(KeyCode::Up), 1);
+            assert_eq!(app.selected(), 0);
+            handle_key(&mut app, key(KeyCode::PageDown), 1);
+            assert_eq!(app.selected(), 1);
+            handle_key(&mut app, key(KeyCode::PageUp), 1);
+            assert_eq!(app.selected(), 0);
+            handle_key(&mut app, key(KeyCode::End), 1);
+            assert_eq!(app.selected(), app.entries().len() - 1);
+            handle_key(&mut app, key(KeyCode::Home), 1);
+            assert_eq!(app.selected(), 0);
+            handle_key(&mut app, KeyCode::BackTab.into(), 1);
+        }
+        handle_key(&mut app, key(KeyCode::Escape), 1);
+        handle_key(&mut app, key(KeyCode::Right), 1);
+        assert_eq!(app.current_dir(), folder);
+        handle_key(&mut app, key(KeyCode::Left), 1);
+        assert_eq!(app.current_dir(), temp.path());
+        handle_key(&mut app, key(KeyCode::Tab), 1);
+        assert_eq!(app.current_dir(), folder);
     }
 
     #[test]

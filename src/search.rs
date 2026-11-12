@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_CONTENT_LINES: usize = 20_000;
+// Synthetic file headers do not consume this limit.
 const MAX_RESULTS: usize = 10_000;
 const BATCH_SIZE: usize = 64;
 const QUEUED_BATCHES: usize = 4;
@@ -21,12 +22,46 @@ const PROGRESS_INTERVAL: usize = 128;
 const PROGRESS_LATENCY: Duration = Duration::from_millis(50);
 const MAX_EXCERPT_CHARS: usize = 240;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchScope {
+    #[default]
+    Both,
+    Names,
+    Content,
+}
+
+impl SearchScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "Both",
+            Self::Names => "Files & folders",
+            Self::Content => "Content",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Both => Self::Names,
+            Self::Names => Self::Content,
+            Self::Content => Self::Both,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum SearchHitKind {
+    Name,
+    File,
+    Line,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchHit {
+    pub kind: SearchHitKind,
     pub path: PathBuf,
     pub is_dir: bool,
     pub is_symlink: bool,
-    /// Original source line number, starting at one. Name hits have no line.
+    /// Original source line number, starting at one. File headers target their first match.
     pub line: Option<usize>,
     pub excerpt: String,
     /// First original UTF-8 match range, relative to the full source line.
@@ -53,6 +88,7 @@ struct Request {
     root: PathBuf,
     query: String,
     show_hidden: bool,
+    scope: SearchScope,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +104,8 @@ struct Shared {
     shutdown: AtomicBool,
     state: Mutex<State>,
     wake: Condvar,
+    #[cfg(test)]
+    source_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// One background scanner with coalesced requests and bounded result storage.
@@ -85,7 +123,13 @@ impl SearchWorker {
     }
 
     /// Replace the current search. Relative path names and contents use lowercase matching.
-    pub fn request(&mut self, root: PathBuf, query: String, show_hidden: bool) -> u64 {
+    pub fn request(
+        &mut self,
+        root: PathBuf,
+        query: String,
+        show_hidden: bool,
+        scope: SearchScope,
+    ) -> u64 {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let generation = self
             .shared
@@ -109,6 +153,7 @@ impl SearchWorker {
                 root,
                 query,
                 show_hidden,
+                scope,
             });
         }
         self.shared.wake.notify_all();
@@ -234,9 +279,16 @@ impl SearchRun<'_> {
             && (self.last_publish.elapsed() < PROGRESS_LATENCY || self.publish(false, false))
     }
 
-    fn push(&mut self, hit: SearchHit) -> bool {
+    /// Add one real match and its optional synthetic file header together.
+    fn push(&mut self, hit: SearchHit, header: Option<SearchHit>) -> bool {
         if self.cancelled() {
             return false;
+        }
+        if header.is_some() && self.hits.len() + 2 > BATCH_SIZE && !self.publish(false, false) {
+            return false;
+        }
+        if let Some(header) = header {
+            self.hits.push(header);
         }
         self.hits.push(hit);
         self.total_hits += 1;
@@ -265,24 +317,30 @@ fn search(shared: &Shared, request: Request) {
         && !std::fs::metadata(&request.root).is_ok_and(|target| target.is_dir())
     {
         run.scanned = 1;
-        let name = request
-            .root
-            .file_name()
-            .unwrap_or(request.root.as_os_str())
-            .to_string_lossy()
-            .into_owned();
-        if let Some(first_match) = matcher.first(&name)
-            && !run.push(SearchHit {
-                path: request.root,
-                is_dir: false,
-                is_symlink: true,
-                line: None,
-                excerpt: name,
-                first_match,
-                excerpt_start: 0,
-            })
-        {
-            return;
+        if request.scope != SearchScope::Content {
+            let name = request
+                .root
+                .file_name()
+                .unwrap_or(request.root.as_os_str())
+                .to_string_lossy()
+                .into_owned();
+            if let Some(first_match) = matcher.first(&name)
+                && !run.push(
+                    SearchHit {
+                        kind: SearchHitKind::Name,
+                        path: request.root,
+                        is_dir: false,
+                        is_symlink: true,
+                        line: None,
+                        excerpt: name,
+                        first_match,
+                        excerpt_start: 0,
+                    },
+                    None,
+                )
+            {
+                return;
+            }
         }
         run.publish(true, false);
         return;
@@ -334,21 +392,30 @@ fn search(shared: &Shared, request: Request) {
                 request.root.join(relative)
             }
         };
-        let name = relative.to_string_lossy();
-        if let Some(first_match) = matcher.first(&name)
-            && !run.push(SearchHit {
-                path: logical_path(),
-                is_dir,
-                is_symlink,
-                line: None,
-                excerpt: name.into_owned(),
-                first_match,
-                excerpt_start: 0,
-            })
-        {
-            return;
+        let mut has_header = false;
+        if request.scope != SearchScope::Content {
+            let name = relative.to_string_lossy();
+            if let Some(first_match) = matcher.first(&name) {
+                if !run.push(
+                    SearchHit {
+                        kind: SearchHitKind::Name,
+                        path: logical_path(),
+                        is_dir,
+                        is_symlink,
+                        line: None,
+                        excerpt: name.into_owned(),
+                        first_match,
+                        excerpt_start: 0,
+                    },
+                    None,
+                ) {
+                    return;
+                }
+                has_header = true;
+            }
         }
-        if file_type.is_file()
+        if request.scope != SearchScope::Names
+            && file_type.is_file()
             && !is_symlink
             && let Some(source) = read_source(entry.path(), &mut run)
         {
@@ -375,16 +442,35 @@ fn search(shared: &Shared, request: Request) {
                         return;
                     }
                     if let Some(first_match) = matcher.first(line) {
+                        let header = if has_header {
+                            None
+                        } else {
+                            has_header = true;
+                            Some(SearchHit {
+                                kind: SearchHitKind::File,
+                                path: logical_path(),
+                                is_dir: false,
+                                is_symlink: false,
+                                line: Some(index + 1),
+                                excerpt: String::new(),
+                                first_match: first_match.clone(),
+                                excerpt_start: 0,
+                            })
+                        };
                         let (excerpt, excerpt_start) = excerpt(line, first_match.start);
-                        if !run.push(SearchHit {
-                            path: logical_path(),
-                            is_dir: false,
-                            is_symlink: false,
-                            line: Some(index + 1),
-                            excerpt,
-                            first_match,
-                            excerpt_start,
-                        }) {
+                        if !run.push(
+                            SearchHit {
+                                kind: SearchHitKind::Line,
+                                path: logical_path(),
+                                is_dir: false,
+                                is_symlink: false,
+                                line: Some(index + 1),
+                                excerpt,
+                                first_match,
+                                excerpt_start,
+                            },
+                            header,
+                        ) {
                             return;
                         }
                     }
@@ -404,6 +490,9 @@ fn search(shared: &Shared, request: Request) {
 
 fn read_source(path: &Path, run: &mut SearchRun<'_>) -> Option<String> {
     use rustix::fs::{Mode, OFlags, open, openat};
+
+    #[cfg(test)]
+    run.shared.source_reads.fetch_add(1, Ordering::Relaxed);
 
     // Open every path component without following symlinks, including parent directories.
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -476,7 +565,9 @@ fn excerpt(line: &str, first_match: usize) -> (String, usize) {
         .take(MAX_EXCERPT_CHARS / 4)
         .map(char::len_utf8)
         .sum();
-    let start = first_match - context_bytes;
+    // Remove only indentation before the match, including for whitespace queries.
+    let indentation = first_match - line[..first_match].trim_start().len();
+    let start = (first_match - context_bytes).max(indentation);
     let window = &line[start..];
     let excerpt = match window.char_indices().nth(MAX_EXCERPT_CHARS) {
         Some((end, _)) => {
@@ -517,11 +608,87 @@ mod tests {
     }
 
     fn hits(worker: &mut SearchWorker, root: &Path, query: &str, hidden: bool) -> Vec<SearchHit> {
-        let generation = worker.request(root.to_path_buf(), query.to_owned(), hidden);
+        scoped_hits(worker, root, query, hidden, SearchScope::Both)
+    }
+
+    fn scoped_hits(
+        worker: &mut SearchWorker,
+        root: &Path,
+        query: &str,
+        hidden: bool,
+        scope: SearchScope,
+    ) -> Vec<SearchHit> {
+        let generation = worker.request(root.to_path_buf(), query.to_owned(), hidden, scope);
         batches(worker, generation)
             .into_iter()
             .flat_map(|batch| batch.hits)
             .collect()
+    }
+
+    #[test]
+    fn filters_scopes_and_never_reads_sources_for_names() {
+        use SearchHitKind::{File, Line, Name};
+
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("needle-folder")).unwrap();
+        fs::write(root.path().join("needle-folder/child.txt"), "plain\n").unwrap();
+        fs::write(root.path().join("needle.txt"), "plain\nneedle\nneedle\n").unwrap();
+        fs::write(root.path().join("text.txt"), "needle\n").unwrap();
+        let mut worker = SearchWorker::new();
+        let names = scoped_hits(
+            &mut worker,
+            root.path(),
+            "needle",
+            false,
+            SearchScope::Names,
+        );
+        assert_eq!(worker.shared.source_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(names.len(), 3);
+        assert!(
+            names
+                .iter()
+                .all(|hit| hit.kind == Name && hit.line.is_none())
+        );
+        assert_eq!(names[1].path, root.path().join("needle-folder/child.txt"));
+
+        let content = scoped_hits(
+            &mut worker,
+            root.path(),
+            "needle",
+            false,
+            SearchScope::Content,
+        );
+        assert_eq!(worker.shared.source_reads.load(Ordering::Relaxed), 3);
+        let expected = [
+            ("needle.txt", File, Some(2)),
+            ("needle.txt", Line, Some(2)),
+            ("needle.txt", Line, Some(3)),
+            ("text.txt", File, Some(1)),
+            ("text.txt", Line, Some(1)),
+        ];
+        assert_eq!(content.len(), expected.len());
+        for (hit, (path, kind, line)) in content.iter().zip(expected) {
+            assert_eq!(hit.path, root.path().join(path));
+            assert_eq!(hit.kind, kind);
+            assert_eq!(hit.line, line);
+        }
+
+        let both = hits(&mut worker, root.path(), "needle", false);
+        let expected = [
+            ("needle-folder", Name, None),
+            ("needle-folder/child.txt", Name, None),
+            ("needle.txt", Name, None),
+            ("needle.txt", Line, Some(2)),
+            ("needle.txt", Line, Some(3)),
+            ("text.txt", File, Some(1)),
+            ("text.txt", Line, Some(1)),
+        ];
+        assert_eq!(both.len(), expected.len());
+        for (hit, (path, kind, line)) in both.iter().zip(expected) {
+            assert_eq!(hit.path, root.path().join(path));
+            assert_eq!(hit.kind, kind);
+            assert_eq!(hit.line, line);
+        }
     }
 
     #[test]
@@ -547,15 +714,22 @@ mod tests {
         for (hit, (path, line, excerpt)) in result.iter().zip(expected) {
             assert_eq!(hit.path, root.path().join(path));
             assert_eq!(hit.line, line);
+            assert_eq!(
+                hit.kind,
+                if line.is_none() {
+                    SearchHitKind::Name
+                } else {
+                    SearchHitKind::Line
+                }
+            );
             assert_eq!(hit.excerpt, excerpt);
             assert_eq!(hit.is_dir, path == "Needle");
             assert!(!hit.is_symlink);
         }
-        assert!(
-            result
-                .windows(2)
-                .all(|pair| { (&pair[0].path, pair[0].line) < (&pair[1].path, pair[1].line) })
-        );
+        assert!(result.windows(2).all(|pair| {
+            (&pair[0].path, pair[0].kind, pair[0].line)
+                < (&pair[1].path, pair[1].kind, pair[1].line)
+        }));
     }
 
     #[test]
@@ -568,16 +742,18 @@ mod tests {
         .unwrap();
         let mut worker = SearchWorker::new();
         let result = hits(&mut worker, root.path(), "[a.*]", false);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].excerpt, "literal [A.*] ÉCLAIR");
-        assert_eq!(hits(&mut worker, root.path(), "éclair", false).len(), 1);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].kind, SearchHitKind::File);
+        assert!(result[0].excerpt.is_empty());
+        assert_eq!(result[1].excerpt, "literal [A.*] ÉCLAIR");
+        assert_eq!(hits(&mut worker, root.path(), "éclair", false).len(), 2);
     }
 
     #[test]
     fn keeps_original_first_match_for_paths_and_lowercase_expansions() {
         let root = tempdir().unwrap();
         let path = root.path().join("İ-İ.txt");
-        fs::write(&path, "β İ i\u{307} İ\r\n").unwrap();
+        fs::write(&path, "\u{3000}\tβ İ i\u{307} İ\r\n").unwrap();
         let result = hits(&mut SearchWorker::new(), root.path(), "i", false);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].path, path);
@@ -587,8 +763,35 @@ mod tests {
         assert_eq!(result[0].first_match, 0..2);
         assert_eq!(result[1].line, Some(1));
         assert_eq!(result[1].excerpt, "β İ i\u{307} İ");
-        assert_eq!(result[1].excerpt_start, 0);
-        assert_eq!(result[1].first_match, 3..5);
+        assert_eq!(result[1].excerpt_start, 4);
+        assert_eq!(result[1].first_match, 7..9);
+        let content = scoped_hits(
+            &mut SearchWorker::new(),
+            root.path(),
+            "i",
+            false,
+            SearchScope::Content,
+        );
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0].kind, SearchHitKind::File);
+        assert_eq!(content[0].path, path);
+        assert_eq!(content[0].line, Some(1));
+        assert_eq!(content[0].first_match, 7..9);
+        assert_eq!(content[0].excerpt_start, 0);
+        assert!(content[0].excerpt.is_empty());
+        assert_eq!(content[1], result[1]);
+        let whitespace = scoped_hits(
+            &mut SearchWorker::new(),
+            root.path(),
+            "\t",
+            false,
+            SearchScope::Content,
+        );
+        assert_eq!(whitespace.len(), 2);
+        assert_eq!(whitespace[0].first_match, 3..4);
+        assert_eq!(whitespace[1].first_match, 3..4);
+        assert_eq!(whitespace[1].excerpt_start, 3);
+        assert_eq!(whitespace[1].excerpt, "\tβ İ i\u{307} İ");
     }
 
     #[test]
@@ -597,8 +800,8 @@ mod tests {
         let line = format!("{}NEEDLE{}needle", "é".repeat(300), "β".repeat(300));
         fs::write(root.path().join("text.txt"), format!("plain\r\n{line}\r\n")).unwrap();
         let result = hits(&mut SearchWorker::new(), root.path(), "needle", false);
-        assert_eq!(result.len(), 1);
-        let hit = &result[0];
+        assert_eq!(result.len(), 2);
+        let hit = &result[1];
         assert_eq!(hit.line, Some(2));
         assert_eq!(hit.excerpt_start, 480);
         assert_eq!(hit.first_match, 600..606);
@@ -627,10 +830,10 @@ mod tests {
         }
         let mut worker = SearchWorker::new();
         let visible = hits(&mut worker, root.path(), "needle", false);
-        assert_eq!(visible.len(), 1);
+        assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].path, root.path().join("visible.txt"));
         let hidden = hits(&mut worker, root.path(), "needle", true);
-        assert_eq!(hidden.len(), 2);
+        assert_eq!(hidden.len(), 4);
         assert!(hidden.iter().any(|hit| hit.path.ends_with(".hidden.txt")));
         assert!(
             hidden
@@ -657,10 +860,27 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("valid.txt"), "needle\n").unwrap();
         let result = hits(&mut SearchWorker::new(), root.path(), "needle", false);
-        assert_eq!(result.len(), 5);
-        assert_eq!(result.iter().filter(|hit| hit.line.is_some()).count(), 1);
+        assert_eq!(result.len(), 6);
         assert_eq!(
-            result.iter().find(|hit| hit.line.is_some()).unwrap().path,
+            result
+                .iter()
+                .filter(|hit| hit.kind == SearchHitKind::Name)
+                .count(),
+            4
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|hit| hit.kind == SearchHitKind::Line)
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .iter()
+                .find(|hit| hit.kind == SearchHitKind::Line)
+                .unwrap()
+                .path,
             root.path().join("valid.txt")
         );
     }
@@ -729,14 +949,14 @@ mod tests {
         symlink(outside.path(), root.path().join("alias")).unwrap();
         let logical_root = root.path().join("alias/folder");
         let result = hits(&mut SearchWorker::new(), &logical_root, "needle", false);
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].path, logical_root.join("text.txt"));
         assert_eq!(result[0].line, Some(1));
         assert!(!result[0].is_symlink);
     }
 
     #[test]
-    fn replaces_backpressured_generations_and_cancel_clears_pending_results() {
+    fn replaces_backpressured_scope_generations_and_cancel_clears_pending_results() {
         let root = tempdir().unwrap();
         fs::write(
             root.path().join("old.txt"),
@@ -745,7 +965,12 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("new.txt"), "new result\n").unwrap();
         let mut worker = SearchWorker::new();
-        let stale = worker.request(root.path().to_path_buf(), "old".to_owned(), false);
+        let stale = worker.request(
+            root.path().to_path_buf(),
+            "old".to_owned(),
+            false,
+            SearchScope::Content,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while worker.shared.state.lock().unwrap().ready.len() < QUEUED_BATCHES {
             assert!(
@@ -754,19 +979,35 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
-        let current = worker.request(root.path().to_path_buf(), "new".to_owned(), false);
+        let current = worker.request(
+            root.path().to_path_buf(),
+            "old".to_owned(),
+            false,
+            SearchScope::Names,
+        );
         assert_ne!(stale, current);
         let result: Vec<_> = batches(&mut worker, current)
             .into_iter()
             .flat_map(|batch| batch.hits)
             .collect();
-        assert_eq!(result.len(), 2);
-        assert!(result.iter().all(|hit| hit.path.ends_with("new.txt")));
-        worker.request(root.path().to_path_buf(), "old".to_owned(), false);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].path.ends_with("old.txt"));
+        assert_eq!(result[0].kind, SearchHitKind::Name);
+        worker.request(
+            root.path().to_path_buf(),
+            "old".to_owned(),
+            false,
+            SearchScope::Content,
+        );
         worker.cancel();
         assert!(!worker.is_pending());
         assert!(worker.poll().is_none());
-        let current = worker.request(root.path().to_path_buf(), "new".to_owned(), false);
+        let current = worker.request(
+            root.path().to_path_buf(),
+            "new".to_owned(),
+            false,
+            SearchScope::Content,
+        );
         assert!(batches(&mut worker, current).last().unwrap().done);
     }
 
@@ -777,6 +1018,7 @@ mod tests {
             PathBuf::from("/nonexistent/search/root"),
             String::new(),
             false,
+            SearchScope::Both,
         );
         assert!(!worker.is_pending());
         let batch = worker.poll().unwrap();
@@ -787,27 +1029,57 @@ mod tests {
     }
 
     #[test]
-    fn bounds_batches_and_results_and_reports_truncation() {
+    fn bounds_real_matches_without_orphaning_file_headers() {
         let root = tempdir().unwrap();
         fs::write(
-            root.path().join("text.txt"),
-            "needle\n".repeat(MAX_RESULTS + 1),
+            root.path().join("needle-a.txt"),
+            "needle\n".repeat(MAX_RESULTS - 1),
         )
         .unwrap();
+        fs::write(root.path().join("needle-b.txt"), "needle\nneedle\n").unwrap();
         let mut worker = SearchWorker::new();
-        let generation = worker.request(root.path().to_path_buf(), "needle".to_owned(), false);
-        let result = batches(&mut worker, generation);
-        assert_eq!(
-            result.iter().map(|batch| batch.hits.len()).sum::<usize>(),
-            MAX_RESULTS
-        );
-        assert!(result.last().unwrap().truncated);
-        assert!(
-            result
-                .windows(2)
-                .all(|pair| pair[0].scanned <= pair[1].scanned)
-        );
-        assert_eq!(result.last().unwrap().scanned, 1);
+        for scope in [SearchScope::Both, SearchScope::Content] {
+            let generation =
+                worker.request(root.path().to_path_buf(), "needle".to_owned(), false, scope);
+            let result = batches(&mut worker, generation);
+            let all: Vec<_> = result.iter().flat_map(|batch| &batch.hits).collect();
+            assert_eq!(
+                all.iter()
+                    .filter(|hit| hit.kind != SearchHitKind::File)
+                    .count(),
+                MAX_RESULTS
+            );
+            assert!(result.last().unwrap().truncated);
+            assert!(
+                result
+                    .windows(2)
+                    .all(|pair| pair[0].scanned <= pair[1].scanned)
+            );
+            if scope == SearchScope::Content {
+                assert_eq!(all.len(), MAX_RESULTS + 2);
+                assert!(all.iter().all(|hit| hit.kind != SearchHitKind::Name));
+                assert_eq!(result.last().unwrap().scanned, 2);
+                assert_eq!(all[all.len() - 2].kind, SearchHitKind::File);
+                assert_eq!(all.last().unwrap().kind, SearchHitKind::Line);
+                assert_eq!(all.last().unwrap().line, Some(1));
+                assert!(all.last().unwrap().path.ends_with("needle-b.txt"));
+                for batch in &result {
+                    for (index, hit) in batch.hits.iter().enumerate() {
+                        if hit.kind == SearchHitKind::File {
+                            let line = &batch.hits[index + 1];
+                            assert_eq!(line.kind, SearchHitKind::Line);
+                            assert_eq!(line.path, hit.path);
+                            assert_eq!(line.line, hit.line);
+                            assert_eq!(line.first_match, hit.first_match);
+                        }
+                    }
+                }
+            } else {
+                assert_eq!(all.len(), MAX_RESULTS);
+                assert_eq!(all[0].kind, SearchHitKind::Name);
+                assert_eq!(result.last().unwrap().scanned, 1);
+            }
+        }
     }
 
     #[test]
@@ -823,9 +1095,11 @@ mod tests {
         exact_lines.push_str("needle");
         fs::write(root.path().join("lines.txt"), exact_lines).unwrap();
         let result = hits(&mut SearchWorker::new(), root.path(), "needle", false);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].line, Some(1));
-        assert_eq!(result[1].line, Some(MAX_CONTENT_LINES));
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[1].kind, SearchHitKind::Line);
+        assert_eq!(result[1].line, Some(1));
+        assert_eq!(result[3].kind, SearchHitKind::Line);
+        assert_eq!(result[3].line, Some(MAX_CONTENT_LINES));
     }
 
     #[test]
@@ -837,6 +1111,7 @@ mod tests {
         assert_eq!(
             result
                 .iter()
+                .filter(|hit| hit.kind == SearchHitKind::Line)
                 .map(|hit| hit.line.unwrap())
                 .collect::<Vec<_>>(),
             [3, 4]
@@ -844,7 +1119,7 @@ mod tests {
         let document =
             crate::document::load_source(&path, &crate::Theme::auto().palette()).unwrap();
         assert_eq!(document.lines.len(), 5);
-        for hit in result {
+        for hit in result.iter().filter(|hit| hit.kind == SearchHitKind::Line) {
             assert_eq!(
                 document.lines[hit.line.unwrap() - 1].to_string(),
                 hit.excerpt
@@ -866,7 +1141,12 @@ mod tests {
     fn nonempty_search_stays_pending_until_its_final_batch_is_consumed() {
         let root = tempdir().unwrap();
         let mut worker = SearchWorker::new();
-        let generation = worker.request(root.path().to_path_buf(), "absent".to_owned(), false);
+        let generation = worker.request(
+            root.path().to_path_buf(),
+            "absent".to_owned(),
+            false,
+            SearchScope::Both,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while !worker
             .shared
@@ -924,5 +1204,8 @@ mod tests {
             &window[..visible_bytes]
         );
         assert!(window.ends_with('…'));
+        assert_eq!(excerpt("\u{3000}\tβ İ", 7), ("β İ".to_owned(), 4));
+        assert_eq!(excerpt("    needle", 2), ("  needle".to_owned(), 2));
+        assert_eq!(excerpt("    needle", 0), ("    needle".to_owned(), 0));
     }
 }
