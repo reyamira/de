@@ -81,8 +81,9 @@ fn load_mode(path: &Path, palette: &Palette, raw: bool) -> Result<Document, Stri
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| "File is not valid UTF-8 text and cannot be previewed.".to_string())?;
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let is_markdown =
-        extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown");
+    let is_markdown = ["md", "markdown", "mdown", "markdn"]
+        .iter()
+        .any(|ext| extension.eq_ignore_ascii_case(ext));
     if text.is_empty() {
         return Ok(Document {
             lines: vec![Line::default()],
@@ -549,6 +550,11 @@ impl SourceSyntax {
         }))
     }
 
+    pub(crate) fn name(self) -> Option<&'static str> {
+        self.0
+            .map(|index| SYNTAX_ASSETS.syntaxes.syntaxes()[index].name.as_str())
+    }
+
     pub(crate) fn state(self) -> SourceState {
         SourceState {
             parser: self
@@ -1001,6 +1007,8 @@ mod tests {
             ("yaml", "message: \"hello\""),
             ("shell", "echo \"hello\""),
             ("js", "const message = \"hello\";"),
+            ("mjs", "export const message = \"hello\";"),
+            ("cjs", "module.exports = \"hello\";"),
             ("c++", "const char* message = \"hello\";"),
             ("ts", "const message: string = \"hello\";"),
             ("jsx", "const element = <div title=\"hello\" />;"),
@@ -1179,6 +1187,18 @@ mod tests {
                 "component.jsx",
                 "const view = <div>hello</div>;\n/* first\nsecond */\n",
                 "div",
+                "second",
+            ),
+            (
+                "module.mjs",
+                "export const message = \"demo\";\n/* first\nsecond */\n",
+                "demo",
+                "second",
+            ),
+            (
+                "module.cjs",
+                "module.exports = \"demo\";\n/* first\nsecond */\n",
+                "demo",
                 "second",
             ),
             ("Dockerfile", "FROM alpine:3\n# note\n", "FROM", "note"),
@@ -1391,14 +1411,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_markdown_retains_source_mode() {
-        let path =
-            std::env::temp_dir().join(format!("de-empty-document-test-{}.MD", std::process::id()));
-        std::fs::write(&path, []).unwrap();
-        let doc = load(&path, &palette()).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(text(&doc), "");
-        assert_eq!(doc.notice.as_deref(), Some("Empty file."));
+    fn markdown_aliases_retain_rendered_and_source_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        for extension in ["md", "MD", "markdown", "mdown", "markdn", "MARKDN"] {
+            let path = directory.path().join(format!("document.{extension}"));
+            for input in ["", "# Heading\n\n**bold**\n"] {
+                std::fs::write(&path, input).unwrap();
+                let doc = load(&path, &palette()).unwrap();
+                assert_eq!(doc.markdown_source.as_deref(), Some(input), "{extension}");
+                assert!(!doc.supports_reading, "{extension}");
+                assert_eq!(text(&doc), input, "{extension}");
+                if input.is_empty() {
+                    assert_eq!(doc.notice.as_deref(), Some("Empty file."));
+                } else {
+                    assert!(doc.lines[0].spans.iter().any(|span| {
+                        span.content.contains("Heading")
+                            && span.style.add_modifier.contains(Modifier::BOLD)
+                    }));
+                }
+            }
+        }
     }
 
     #[test]

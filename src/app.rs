@@ -22,6 +22,22 @@ pub struct Entry {
     pub is_dir: bool,
     pub is_symlink: bool,
     pub modified: Option<SystemTime>,
+    /// Byte length read during directory enumeration, for regular files only.
+    /// Directories, symlinks, search results, and unreadable metadata have none.
+    pub size: Option<u64>,
+}
+
+/// Facts about the previewed item, captured once when its preview loads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreviewDetails {
+    /// The loaded snapshot's original source, before sanitizing or formatting.
+    Source {
+        language: Option<&'static str>,
+        bytes: usize,
+        lines: usize,
+    },
+    /// Immediate children in the loaded listing, which honors the hidden setting.
+    Directory { folders: usize, files: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +48,7 @@ pub struct Preview {
     message: Option<String>,
     document: Option<crate::document::Document>,
     image: Option<crate::media::ImagePreview>,
+    details: Option<PreviewDetails>,
 }
 
 impl Preview {
@@ -53,6 +70,11 @@ impl Preview {
 
     pub fn image(&self) -> Option<&crate::media::ImagePreview> {
         self.image.as_ref()
+    }
+
+    /// Loaded details, only while this preview still belongs to `path`.
+    pub(crate) fn details_for(&self, path: &Path) -> Option<PreviewDetails> {
+        self.details.filter(|_| self.path.as_deref() == Some(path))
     }
 }
 
@@ -239,6 +261,7 @@ impl App {
                 message: None,
                 document: None,
                 image: None,
+                details: None,
             },
             search_query: String::new(),
             search_scope: crate::search::SearchScope::default(),
@@ -371,6 +394,7 @@ impl App {
                 message: None,
                 document: Some(crate::document::markdown_sample(&self.theme.palette())),
                 image: None,
+                details: None,
             };
         }
     }
@@ -1347,6 +1371,7 @@ impl App {
                     is_dir: hit.is_dir,
                     is_symlink: hit.is_symlink,
                     modified: None,
+                    size: None,
                 },
             );
             self.search_hits.insert(index, hit);
@@ -1547,6 +1572,7 @@ impl App {
                 message: Some("nothing selected".into()),
                 document: None,
                 image: None,
+                details: None,
             };
             return;
         };
@@ -1579,11 +1605,17 @@ impl App {
             message: None,
             document: None,
             image: None,
+            details: None,
         };
         if is_dir {
             match read_entries(&path, self.show_hidden, self.sort_mode, self.sort_direction) {
                 Ok(entries) => {
                     preview.message = entries.is_empty().then(|| "empty directory".into());
+                    let folders = entries.iter().filter(|entry| entry.is_dir).count();
+                    preview.details = Some(PreviewDetails::Directory {
+                        folders,
+                        files: entries.len() - folders,
+                    });
                     preview.entries = entries;
                 }
                 Err(error) => preview.message = Some(format!("cannot preview: {error}")),
@@ -1609,7 +1641,10 @@ impl App {
                 crate::document::load(&path, &self.theme.palette())
             };
             match loaded {
-                Ok(document) => preview.document = Some(document),
+                Ok(document) => {
+                    preview.details = Some(source_details(&path, &document.source));
+                    preview.document = Some(document);
+                }
                 Err(error) => {
                     preview.message = Some(format!("{error} · press o to open externally"))
                 }
@@ -1630,6 +1665,17 @@ fn source_line_start(source: &str, line: usize) -> Option<usize> {
     crate::document::logical_lines(source)
         .nth(line.checked_sub(1)?)
         .map(|text| text.as_ptr() as usize - source.as_ptr() as usize)
+}
+
+/// Count the original snapshot once, with the viewer's logical-line policy.
+fn source_details(path: &Path, source: &str) -> PreviewDetails {
+    let mut lines = crate::document::logical_lines(source);
+    let first = lines.next().unwrap_or("");
+    PreviewDetails::Source {
+        language: crate::document::SourceSyntax::for_path(path, first).name(),
+        bytes: source.len(),
+        lines: 1 + lines.count(),
+    }
 }
 
 fn read_entries(
@@ -1657,6 +1703,10 @@ fn read_entries(
         let is_symlink = file_type.is_symlink();
         let is_dir = file_type.is_dir()
             || (is_symlink && metadata.as_ref().is_some_and(|metadata| metadata.is_dir()));
+        let size = metadata
+            .as_ref()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len());
         let modified = metadata.and_then(|metadata| metadata.modified().ok());
 
         entries.push(Entry {
@@ -1665,6 +1715,7 @@ fn read_entries(
             is_dir,
             is_symlink,
             modified,
+            size,
         });
     }
 
@@ -2638,6 +2689,7 @@ mod tests {
                 is_dir: false,
                 is_symlink: false,
                 modified: None,
+                size: None,
             },
             Entry {
                 name: "known".into(),
@@ -2645,6 +2697,7 @@ mod tests {
                 is_dir: false,
                 is_symlink: false,
                 modified: Some(SystemTime::UNIX_EPOCH),
+                size: None,
             },
         ];
         sort_entries(

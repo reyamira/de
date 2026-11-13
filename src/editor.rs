@@ -201,6 +201,10 @@ impl Editor {
     pub fn has_bom(&self) -> bool {
         self.bom
     }
+    /// Bytes the current buffer would occupy on disk, including BOM and CRLF.
+    pub fn byte_len(&self) -> usize {
+        self.encoded_len(self.normalized_bytes, self.lines.len())
+    }
 
     pub fn selection(&self) -> Option<(Position, Position)> {
         self.caret

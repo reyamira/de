@@ -4,8 +4,9 @@ Return to the [README](../README.md) for installation and navigation controls.
 
 The right pane and inline viewer support these file types:
 
-- **Markdown:** The right pane shows highlighted literal source. The full-width
-  viewer uses native FMD rendering, including tables and supported local images.
+- **Markdown:** `.md`, `.markdown`, `.mdown`, and `.markdn` share Markdown behavior.
+  The right pane shows highlighted literal source. The full-width viewer uses
+  native FMD rendering, including tables and supported local images.
   Press `m` in the viewer to show the same highlighted source as the right pane.
   Fenced code uses loaded grammar names, file extensions, and common aliases
   such as `shell`, `js`, and `c++`. Exact extension case takes priority when
@@ -15,10 +16,11 @@ The right pane and inline viewer support these file types:
 - **Source and plain text:** UTF-8 text with terminal control characters
   replaced. Syntect highlights known syntaxes. These include TOML (`.toml` and
   `Cargo.lock`), JSONC (`.jsonc` and TypeScript and JavaScript config JSON),
-  JSON5, JSX, Dockerfiles, Vue, Svelte, GraphQL, Prisma, Terraform/HCL,
-  TypeScript (`.ts`, `.mts`, `.cts`), and TSX. Ordinary `.json` files retain
-  strict JSON validation and formatting. The viewer selects a grammar by
-  filename, extension, or first line. Unknown types stay plain.
+  JSON5, JavaScript (`.js`, `.mjs`, `.cjs`), JSX, Dockerfiles, Vue, Svelte,
+  GraphQL, Prisma, Terraform/HCL, TypeScript (`.ts`, `.mts`, `.cts`), and TSX.
+  Ordinary `.json` files retain strict JSON validation and formatting.
+  The viewer selects a grammar by filename, extension, or first line.
+  Unknown types stay plain.
 - **Images:** PNG, JPEG, GIF, WebP, and BMP in Kitty or Ghostty.
   Animated images show their first frame.
 
@@ -29,6 +31,19 @@ Additional grammar sources, pinned revisions, local changes, and licenses are
 recorded in [`assets/syntaxes`](https://github.com/reyamira/de/tree/main/assets/syntaxes).
 TypeScript and TSX use grammars converted by
 [bat](https://github.com/sharkdp/bat/tree/73dc3258bec83bd7c66334f05b13c2d8221859f9/assets/syntaxes/02_Extra).
+
+The browser header keeps the current directory and adds details for the selected item when space permits.
+File details include the detected language, byte size, and original source line count when available.
+Line counts use the loaded source, not wrapped rows or formatted JSON.
+CRLF, LF, and CR each end a logical line.
+An empty file has one logical line, and a final newline adds an empty final line.
+Folder counts describe immediate files and folders under the current hidden-file setting, not recursive totals.
+Details use the loaded snapshot and require no file reads during drawing.
+The app does not scan other files for line counts or calculate recursive folder sizes.
+Search keeps its query-only header.
+Viewer headers also show the first visible source line and the total source lines when source layout applies.
+In reading layout, this position identifies the first source line of the visible paragraph.
+Formatted JSON and rendered Markdown show total source lines and a scroll percentage when scrolling is possible.
 
 The full-width viewer has a thin border around its contents. Text and images
 use the space inside that border, including after a terminal resize. A scrollbar
@@ -159,6 +174,10 @@ Small areas omit the frame when it cannot fit.
 Below 58 columns, the preview editor uses full width.
 It loads the original file, not highlighted, formatted, or truncated preview rows.
 Leaving the editor returns to the same picker or viewer.
+
+The editor header keeps the unsaved marker and shows live buffer size, line position, and column when space permits.
+Buffer size includes the byte-order mark and the newline style that saving preserves.
+Narrow headers remove details before the filename or unsaved marker.
 
 The editor highlights unsaved source with the same grammars and theme colors as source previews.
 This includes Markdown fences and filename, extension, and first-line grammar selection.

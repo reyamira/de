@@ -17,8 +17,8 @@ JavaScript-Babel.sublime-syntax
   Bat's converted grammar derives from https://github.com/babel/babel-sublime
   at f4579f9107996c16208466248a85dc2296083a5f.
   License: MIT; see LICENSE-Babel.txt.
-  Local changes: register only the jsx extension, remove the JavaScript shebang
-  matcher, and use source.js.jsx to avoid replacing the bundled JavaScript scope.
+  Local changes: register jsx, mjs, and cjs extensions, remove the JavaScript
+  shebang matcher, and use source.js.jsx to preserve the bundled JavaScript scope.
   Replace the unavailable source.js.css include with the bundled CSS scope and
   a local JavaScript interpolation context for styled templates.
 

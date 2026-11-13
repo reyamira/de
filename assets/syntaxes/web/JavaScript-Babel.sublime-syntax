@@ -4,6 +4,8 @@
 name: JavaScript (Babel)
 file_extensions:
   - jsx
+  - mjs
+  - cjs
 scope: source.js.jsx
 contexts:
   main:

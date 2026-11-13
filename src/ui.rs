@@ -146,6 +146,7 @@ fn render_editor_browser(
             is_dir,
             is_symlink,
             modified: None,
+            size: None,
         })
         .collect();
     let now = SystemTime::now();
@@ -210,7 +211,7 @@ pub fn render_config_picker(frame: &mut Frame<'_>, app: &App, picker: &SettingsP
     ])
     .areas(area);
 
-    render_header(frame, app, header, &palette, " de config ");
+    render_header(frame, app, header, &palette, " de config ", None);
     if area.width >= SETTINGS_PANE_WIDTH + 1 + CONFIG_PREVIEW_MIN_WIDTH {
         let [left, divider, right] = Layout::horizontal([
             Constraint::Length(SETTINGS_PANE_WIDTH),
@@ -298,7 +299,7 @@ fn render_picker_in(frame: &mut Frame<'_>, app: &App, theme_preview: bool, area:
         if editor_area != area {
             frame.render_widget(Clear, area);
             let [header, body, footer] = picker_areas(area);
-            render_header(frame, app, header, &palette, " de ");
+            render_header(frame, app, header, &palette, " de ", None);
             let [left, divider, _] = picker_panes(body);
             render_current_entries(frame, app, left, true, &palette, now);
             frame.render_widget(
@@ -351,7 +352,14 @@ fn render_picker_in(frame: &mut Frame<'_>, app: &App, theme_preview: bool, area:
     let [header, body, footer] = picker_areas(area);
 
     let badge = if theme_preview { " de theme " } else { " de " };
-    render_header(frame, app, header, &palette, badge);
+    render_header(
+        frame,
+        app,
+        header,
+        &palette,
+        badge,
+        Some(&browse_details(app)),
+    );
     if area.width >= TWO_PANE_MIN_WIDTH {
         render_two_panes(frame, app, body, &palette, now);
     } else {
@@ -465,27 +473,266 @@ pub fn editor_scrollbar(app: &App, area: Rect) -> Option<ViewerScrollBar> {
     ))
 }
 
-fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette, badge: &str) {
+fn render_header(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: &Palette,
+    badge: &str,
+    details: Option<&[HeaderDetail]>,
+) {
     if app.is_searching() {
         render_search_header(frame, app, area, palette);
         return;
     }
+    let width = area.width as usize;
     let badge_width = UnicodeWidthStr::width(badge);
-    let path_width = (area.width as usize).saturating_sub(badge_width + 1);
-    let path = shorten_left(&app.current_dir().to_string_lossy(), path_width);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(badge, emphasis_style(palette)),
-            Span::raw(" "),
-            Span::styled(
-                path,
-                Style::default()
-                    .fg(palette.text)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])),
-        area,
-    );
+    let available = width.saturating_sub(badge_width + 1);
+    let path = app.current_dir().to_string_lossy();
+    let budget = if details.is_some() {
+        header_path_budget(UnicodeWidthStr::width(&*path), available)
+    } else {
+        available
+    };
+    let path = shorten_left(&path, budget);
+    let used = badge_width + 1 + UnicodeWidthStr::width(path.as_str());
+    let mut spans = vec![
+        Span::styled(badge.to_owned(), emphasis_style(palette)),
+        Span::raw(" "),
+        Span::styled(
+            path,
+            Style::default()
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(details) = details {
+        push_details(&mut spans, used, width, details, palette);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// One optional header fact. Lower priorities disappear first when space is short.
+struct HeaderDetail {
+    text: String,
+    priority: u8,
+}
+
+impl HeaderDetail {
+    fn new(text: impl Into<String>, priority: u8) -> Self {
+        Self {
+            text: text.into(),
+            priority,
+        }
+    }
+}
+
+const HEADER_DETAIL_GAP: usize = 2;
+const HEADER_DETAIL_RESERVE: usize = 24;
+const HEADER_PATH_MIN: usize = 40;
+
+/// The width a header path may use. It depends only on the path and the header,
+/// never on the selection, so the path does not move while details change.
+/// A long path yields a fixed reserve to details only on wide headers.
+fn header_path_budget(path_width: usize, available: usize) -> usize {
+    if path_width <= available {
+        path_width
+    } else if available >= HEADER_PATH_MIN + HEADER_DETAIL_GAP + 1 + HEADER_DETAIL_RESERVE {
+        available - HEADER_DETAIL_GAP - 1 - HEADER_DETAIL_RESERVE
+    } else {
+        available
+    }
+}
+
+/// Join the details that fit in `budget`, dropping the lowest priority first.
+fn fit_details(details: &[HeaderDetail], budget: usize) -> String {
+    const SEPARATOR: &str = " · ";
+    let separator_width = UnicodeWidthStr::width(SEPARATOR);
+    let mut kept: Vec<&HeaderDetail> = details.iter().collect();
+    let mut width = kept
+        .iter()
+        .map(|detail| UnicodeWidthStr::width(detail.text.as_str()))
+        .sum::<usize>()
+        + separator_width * kept.len().saturating_sub(1);
+    while width > budget {
+        let lowest = (0..kept.len())
+            .min_by_key(|&index| kept[index].priority)
+            .expect("an empty list has zero width, which fits any budget");
+        let removed = kept.remove(lowest);
+        width -= UnicodeWidthStr::width(removed.text.as_str());
+        if !kept.is_empty() {
+            width -= separator_width;
+        }
+    }
+    let bytes = kept.iter().map(|detail| detail.text.len()).sum::<usize>()
+        + SEPARATOR.len() * kept.len().saturating_sub(1);
+    let mut text = String::with_capacity(bytes);
+    for (index, detail) in kept.iter().enumerate() {
+        if index > 0 {
+            text.push_str(SEPARATOR);
+        }
+        text.push_str(&detail.text);
+    }
+    text
+}
+
+/// Right-align muted details after `used` columns, with a one-column margin.
+fn push_details(
+    spans: &mut Vec<Span<'static>>,
+    used: usize,
+    width: usize,
+    details: &[HeaderDetail],
+    palette: &Palette,
+) {
+    let text = fit_details(details, width.saturating_sub(used + HEADER_DETAIL_GAP + 1));
+    if text.is_empty() {
+        return;
+    }
+    let padding = width - used - 1 - UnicodeWidthStr::width(text.as_str());
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled(text, muted_style(palette)));
+}
+
+/// Details for the selected browser item, from its loaded preview when it has one.
+fn browse_details(app: &App) -> Vec<HeaderDetail> {
+    use crate::app::PreviewDetails;
+    let Some(entry) = app.selected_entry() else {
+        return Vec::new();
+    };
+    match app.preview().details_for(&entry.path) {
+        Some(PreviewDetails::Directory { folders, files }) if folders + files == 0 => {
+            vec![HeaderDetail::new("empty", 0)]
+        }
+        Some(PreviewDetails::Directory { folders, files }) => [
+            (folders, "folder", "folders", 1),
+            (files, "file", "files", 0),
+        ]
+        .into_iter()
+        .filter(|(count, ..)| *count > 0)
+        .map(|(count, one, many, priority)| {
+            HeaderDetail::new(count_label(count, one, many), priority)
+        })
+        .collect(),
+        Some(PreviewDetails::Source {
+            language,
+            bytes,
+            lines,
+        }) => language
+            .map(|language| HeaderDetail::new(language_label(language), 0))
+            .into_iter()
+            .chain([
+                HeaderDetail::new(format_bytes(bytes as u64), 2),
+                HeaderDetail::new(count_label(lines, "line", "lines"), 1),
+            ])
+            .collect(),
+        None => entry
+            .size
+            .map(|size| HeaderDetail::new(format_bytes(size), 2))
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// Viewer details: the loaded snapshot's facts and the current reading position.
+fn viewer_details(app: &App, body: Rect, palette: &Palette) -> Vec<HeaderDetail> {
+    use crate::app::PreviewDetails;
+    let entry = app.selected_entry();
+    let mut details = Vec::new();
+    let mut total = None;
+    match entry.and_then(|entry| app.preview().details_for(&entry.path)) {
+        Some(PreviewDetails::Source {
+            language,
+            bytes,
+            lines,
+        }) => {
+            if let Some(language) = language {
+                details.push(HeaderDetail::new(language_label(language), 0));
+            }
+            details.push(HeaderDetail::new(format_bytes(bytes as u64), 1));
+            total = Some(lines);
+        }
+        _ => {
+            if let Some(size) = entry.and_then(|entry| entry.size) {
+                details.push(HeaderDetail::new(format_bytes(size), 1));
+            }
+        }
+    }
+    let Some(total) = total else {
+        return details;
+    };
+    let scroll = app.viewer_scroll();
+    if app.is_rendered_markdown_view() {
+        details.push(HeaderDetail::new(count_label(total, "line", "lines"), 2));
+        if let Some(percent) = scroll_percent(scroll, app.markdown_scroll_max()) {
+            details.push(HeaderDetail::new(percent, 3));
+        }
+        return details;
+    }
+    let cached = viewer_text(app, body.width, palette);
+    // Original line numbers exist only for rows that keep source line boundaries.
+    let top = cached
+        .source_rows
+        .get(scroll..)
+        .and_then(|rows| rows.iter().copied().find(|line| *line > 0));
+    if let Some(top) = top {
+        details.push(HeaderDetail::new(format!("Ln {top}/{total}"), 3));
+    } else {
+        details.push(HeaderDetail::new(count_label(total, "line", "lines"), 2));
+        let maximum = cached.rows.len().saturating_sub(body.height as usize);
+        if let Some(percent) = scroll_percent(scroll, maximum) {
+            details.push(HeaderDetail::new(percent, 3));
+        }
+    }
+    details
+}
+
+fn scroll_percent(scroll: usize, maximum: usize) -> Option<String> {
+    (maximum > 0 && maximum != usize::MAX)
+        .then(|| format!("{}%", scroll.min(maximum) as u128 * 100 / maximum as u128))
+}
+
+fn count_label(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// Binary units, with one decimal below ten so small files stay precise.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    // Promote values that would round up to 1024 of the smaller unit.
+    while value >= 1023.5 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 9.95 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// A compact display name for a grammar. Detection stays in the shared syntax set.
+fn language_label(name: &'static str) -> &'static str {
+    match name {
+        "Bourne Again Shell (bash)" => "Bash",
+        "TypeScriptReact" => "TSX",
+        _ => name.split_once(" (").map_or(name, |(base, _)| base),
+    }
+}
+
+/// Keep a fixed prefix (mode or dirty state) and the label's meaningful tail.
+fn titled_label(prefix: &str, label: &str, label_budget: usize, width: usize) -> String {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let room = width.saturating_sub(prefix_width).min(label_budget);
+    if UnicodeWidthStr::width(label) <= room || room >= 8 {
+        format!("{prefix}{}", shorten_left(label, room))
+    } else {
+        shorten_right(&format!("{prefix}{label}"), width)
+    }
 }
 
 fn render_search_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
@@ -1874,6 +2121,57 @@ fn editor_line_rows(source: &str, width: usize) -> Vec<EditorRow> {
     rows
 }
 
+/// The editor title keeps its dirty marker first, then the path's tail.
+/// Details are live: they come from the buffer and the cached grammar.
+fn render_editor_header(
+    frame: &mut Frame<'_>,
+    editor: &crate::editor::Editor,
+    syntax: Option<crate::document::SourceSyntax>,
+    area: Rect,
+    palette: &Palette,
+) {
+    let width = area.width as usize;
+    let marker = if editor.dirty() { "edit*" } else { "edit" };
+    let prefix = format!(" {marker} · ");
+    let path = editor.path().to_string_lossy();
+    let room = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+    let title = if room >= 4 {
+        titled_label(
+            &prefix,
+            &path,
+            header_path_budget(UnicodeWidthStr::width(&*path), room),
+            width,
+        )
+    } else {
+        // Too narrow for a path: the dirty marker matters more than the word.
+        let short = [format!(" {marker}"), marker.to_owned()];
+        short
+            .into_iter()
+            .find(|candidate| UnicodeWidthStr::width(candidate.as_str()) <= width)
+            .unwrap_or_else(|| marker[4..].to_owned())
+    };
+    let used = UnicodeWidthStr::width(title.as_str());
+    let mut spans = vec![Span::styled(
+        title,
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    )];
+    let (line, _) = editor.cursor();
+    let details: Vec<_> = syntax
+        .and_then(crate::document::SourceSyntax::name)
+        .map(|language| HeaderDetail::new(language_label(language), 0))
+        .into_iter()
+        .chain([
+            HeaderDetail::new(format_bytes(editor.byte_len() as u64), 1),
+            HeaderDetail::new(format!("Ln {}/{}", line + 1, editor.lines().len()), 3),
+            HeaderDetail::new(format!("Col {}", editor.cursor_column() + 1), 2),
+        ])
+        .collect();
+    push_details(&mut spans, used, width, &details, palette);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_file_editor(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette) {
     let editor = app.editor().unwrap();
     frame.render_widget(Clear, area);
@@ -1892,27 +2190,12 @@ fn render_file_editor(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Pa
             );
         }
     }
-    frame.render_widget(
-        Paragraph::new(shorten_left(
-            &format!(
-                " edit{} · {}",
-                if editor.dirty() { "*" } else { "" },
-                editor.path().display()
-            ),
-            header.width as usize,
-        ))
-        .style(
-            Style::default()
-                .fg(palette.title)
-                .add_modifier(Modifier::BOLD),
-        ),
-        header,
-    );
     let gutter = source_gutter_width(editor.lines().len(), body.width);
     let width = body.width.saturating_sub(gutter).max(1);
     let mut cache = app.editor_cache().borrow_mut();
     let text = cache.get_or_insert_with(EditorText::new);
     text.update(editor, width, palette);
+    render_editor_header(frame, editor, text.syntax, header, palette);
     let (cursor_line, cursor_byte) = editor.cursor();
     let mut cursor_row = 0;
     let mut cursor_column = 0;
@@ -2105,31 +2388,54 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         } else {
             "inline"
         };
-        let heading = if markdown {
-            let mode = if app.is_markdown_source() {
+        let sample = app.theme_sample() != crate::ThemeSample::Picker;
+        let mode = if markdown {
+            if app.is_markdown_source() {
                 "source"
             } else {
                 "FMD rendered"
-            };
-            if app.theme_sample() != crate::ThemeSample::Picker {
-                format!(" {} · {mode} · theme sample", app.theme().name())
-            } else {
-                format!(" {size} · {mode} · {}", app.preview().label())
             }
         } else if app.supports_reading() {
-            let mode = if app.is_reading() { "reading" } else { "raw" };
-            format!(" {size} · {mode} · {}", app.preview().label())
+            if app.is_reading() { "reading" } else { "raw" }
         } else {
-            format!(" {size} · view · {}", app.preview().label())
+            "view"
         };
-        frame.render_widget(
-            Paragraph::new(shorten_right(&heading, header.width as usize)).style(
-                Style::default()
-                    .fg(palette.title)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            header,
-        );
+        let width = header.width as usize;
+        let title = if sample {
+            shorten_right(
+                &format!(" {} · {mode} · theme sample", app.theme().name()),
+                width,
+            )
+        } else {
+            let prefix = format!(" {size} · {mode} · ");
+            let label = app.preview().label();
+            titled_label(
+                &prefix,
+                label,
+                header_path_budget(
+                    UnicodeWidthStr::width(label),
+                    width.saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
+                ),
+                width,
+            )
+        };
+        let used = UnicodeWidthStr::width(title.as_str());
+        let mut spans = vec![Span::styled(
+            title,
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )];
+        if !sample {
+            push_details(
+                &mut spans,
+                used,
+                width,
+                &viewer_details(app, body, palette),
+                palette,
+            );
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), header);
         let find_status = app.find_status();
         frame.render_widget(
             Paragraph::new(if let Some(status) = app.status() {
@@ -4283,5 +4589,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn header_row(app: &App, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        terminal.draw(|frame| render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn header_details_use_original_source_counts_and_visible_children() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("folder/nested")).unwrap();
+        fs::write(temp.path().join("folder/visible.txt"), "x").unwrap();
+        fs::write(temp.path().join("folder/.hidden"), "x").unwrap();
+        // One physical line plus the empty final logical line; the viewer formats it.
+        fs::write(temp.path().join("data.json"), "{\"a\":1,\"b\":[1,2]}\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let texts = |app: &App| {
+            browse_details(app)
+                .into_iter()
+                .map(|detail| detail.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&app), ["1 folder", "1 file"]);
+        app.toggle_hidden();
+        assert_eq!(texts(&app), ["1 folder", "2 files"]);
+        app.move_last();
+        let details = texts(&app);
+        assert_eq!(details[details.len() - 2..], ["18 B", "2 lines"]);
+
+        app.open_viewer();
+        let formatted = header_row(&app, 100);
+        assert!(formatted.contains("data.json"), "{formatted}");
+        assert!(formatted.contains("18 B · 2 lines"), "{formatted}");
+        assert!(!formatted.contains("Ln "), "{formatted}");
+        app.begin_find();
+        let source = header_row(&app, 100);
+        assert!(source.contains("18 B · Ln 1/2"), "{source}");
+    }
+
+    #[test]
+    fn headers_keep_identity_at_narrow_widths_and_editor_counts_live() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("notes.txt"), "one\ntwo").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let name = temp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let wide = header_row(&app, 120);
+        assert!(
+            wide.contains(&name) && wide.contains("7 B · 2 lines"),
+            "{wide}"
+        );
+        let narrow = header_row(&app, 24);
+        assert!(
+            narrow.contains(&name) && !narrow.contains("lines"),
+            "{narrow}"
+        );
+
+        app.open_viewer();
+        assert!(header_row(&app, 30).contains("raw · notes.txt"));
+        assert!(header_row(&app, 20).starts_with(" inline · raw · "));
+
+        app.open_editor();
+        app.handle_editor_key(termina::event::KeyCode::Char('x').into(), 4);
+        app.handle_editor_key(termina::event::KeyCode::Enter.into(), 4);
+        let editing = header_row(&app, 80);
+        assert!(editing.starts_with(" edit* · "), "{editing}");
+        assert!(editing.contains("9 B · Ln 2/3 · Col 1"), "{editing}");
+        assert!(header_row(&app, 6).starts_with(" edit*"));
+        assert!(header_row(&app, 4).contains('*'));
+    }
+
+    #[test]
+    fn byte_sizes_use_iec_units_without_rounding_to_the_next_unit_boundary() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(20 * 1024), "20 KiB");
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1.0 MiB");
+        assert_eq!(language_label("JavaScript (Babel)"), "JavaScript");
+        assert_eq!(language_label("TypeScriptReact"), "TSX");
     }
 }
