@@ -21,8 +21,11 @@ The right pane and inline viewer support these file types:
   Ordinary `.json` files retain strict JSON validation and formatting.
   The viewer selects a grammar by filename, extension, or first line.
   Unknown types stay plain.
-- **Images:** PNG, JPEG, GIF, WebP, and BMP in Kitty or Ghostty.
+- **Images:** PNG, JPEG, GIF, WebP, and BMP when the terminal confirms PNG graphics support.
   Animated images show their first frame.
+- **SVG:** Static vectors and text use the existing SVG-to-PNG renderer.
+  Press `m` in the viewer to switch between the image and highlighted XML source.
+  Local SVG images in Markdown use the same renderer.
 
 Run `de languages` to list the grammars and file associations loaded by this
 installation. The built-in Syntect grammars come from the
@@ -62,10 +65,10 @@ Viewer-origin editing keeps the selected size; `f` inserts text while editing.
 During the find prompt, `f` remains query text.
 
 In the viewer, use arrows or `j`/`k` to scroll. Use `PageUp`/`PageDown` for pages
-and `Home`/`End` for the beginning or end. For Markdown, press `m` to switch
-between the rendered page and source. The header shows the current mode.
+and `Home`/`End` for the beginning or end. For Markdown or SVG, press `m` to switch
+between the rendered view and source. The header shows the current mode.
 Press `Escape` or `q` to return to the same selection or search result.
-Press `e` to edit the original source, including from rendered Markdown.
+Press `e` to edit the original source, including from rendered Markdown or SVG.
 Press `o` to open the file externally.
 During search input, letters such as `v`, `e`, and `m` remain query text.
 
@@ -117,13 +120,22 @@ Closing the viewer restores the formatted JSON snapshot, including after an acce
 It does not read a changed file again for this restoration.
 In-file find does not change the browser query, results, or selected result.
 
-Image previews require the Kitty graphics protocol. They are unavailable in
-other terminals and inside tmux, GNU Screen, or Zellij. When `de` cannot show a
-file, it explains the reason and shows the external-open option. Video playback
-remains external.
+Images and native FMD Markdown use direct PNG transfer through the
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/).
+At startup, `de` sends a small, non-displaying PNG query and waits at most 250 ms for confirmation.
+It uses the reply, not terminal names or environment variables, to enable graphics for the session.
+The probe confirms protocol support, not the absence of visual bugs in a terminal implementation.
 
-The native FMD Markdown view requires Kitty or Ghostty without a terminal
-multiplexer. It does not require a browser.
+The probe tests the current input/output path, including any terminal multiplexer.
+A multiplexer that filters graphics will fail the probe, even when its outer terminal supports graphics.
+`de` does not send multiplexer passthrough sequences.
+Sixel and the iTerm2 inline-image protocol are not implemented.
+If the probe fails or receives no reply, images show an explanation and retain the external-open option.
+Markdown source remains available with `m`.
+Video playback remains external.
+
+The native FMD Markdown view uses the same measured graphics support.
+It does not require a browser.
 Native text supports selection, copying, and find through the renderer's text geometry.
 Mouse events identify terminal cells.
 Rendered hit testing uses each cell's center, not exact pointer pixels within that cell.
@@ -136,12 +148,31 @@ Markdown. Rendered Markdown also supports separate body, heading, and code fonts
 sizes, and spacing. Source text always uses the terminal font. See
 [theme configuration](configuration.md#themes) for settings and limits.
 
-Markdown images must be local PNG, JPEG, GIF, WebP, or BMP files inside the
+Markdown images must be local PNG, JPEG, GIF, WebP, BMP, or SVG files inside the
 document folder or its subfolders. Remote assets are not loaded. Raw HTML is
 inert. Animated GIFs show their first frame. Images are resized to at most 2,048
-pixels per side. Each file is limited to 16 MiB and 16,777,216 pixels. Each
-document is limited to 128 image occurrences, 32 MiB of image source data, and
-33,554,432 decoded or rendered pixels in total.
+pixels per side. Raster files are limited to 16 MiB and 16,777,216 pixels.
+SVG has the separate limits below.
+Each document is limited to 128 image occurrences, 32 MiB of image source data,
+and 33,554,432 decoded or rendered pixels in total.
+
+SVG input must be UTF-8 and at most 1 MiB.
+Parsing permits at most 4,096 XML nodes and 64 levels.
+Element IDs must be unique.
+Expanded symbol references permit at most 16,384 nodes and 4 MiB of text and attributes.
+Stylesheets have a 16 KiB limit.
+SVG canvases retain the image dimension and pixel limits below.
+Transparent SVG pixels use the terminal background, or the page background when embedded in Markdown.
+
+SVG text uses bundled fonts.
+External files, network resources, embedded images, and external fonts are not loaded.
+Scripts, animation, and HTML `foreignObject` content are not supported.
+Supported static filters include blur, drop shadow, offset, flood, blend, composite, merge, color matrix, and component transfer.
+Filter count, projected regions, and estimated raster work have additional limits.
+Rejected SVGs show an explanation.
+XML source remains available when the file meets the text preview limits.
+
+Changing selection discards old results but cannot interrupt an individual synchronous SVG parse or raster call.
 
 FMD supports some Mermaid diagrams. Unsupported diagrams remain as source.
 Rendering runs in the background. The viewer keeps the last viewport while it
@@ -152,7 +183,7 @@ Ordinary images keep their intrinsic sizing.
 The renderer reflows narrow pages without scaling the body text.
 
 Text previews accept regular UTF-8 files up to 1 MiB. Styled text and source
-previews show at most 20,000 lines. Image previews accept files up to 16 MiB
+previews show at most 20,000 lines. Raster image previews accept files up to 16 MiB
 and 16,777,216 pixels, with each dimension at most 16,384 pixels.
 Images use EXIF orientation and scale to at
 most 2,048 pixels per side before terminal transfer. Press `r` in the picker to

@@ -17,6 +17,7 @@ pub mod render_theme;
 mod rendered_text;
 pub mod search;
 mod settings;
+mod svg;
 #[path = "../vendor/franken-markdown/src/table_format.rs"]
 mod table_format;
 mod theme;

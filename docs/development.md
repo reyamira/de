@@ -7,7 +7,7 @@ Return to the [README](../README.md) for installation and usage. See the [releas
 - [Ratatui](https://ratatui.rs/) renders the interactive panes and layout.
 - [Crossterm](https://github.com/crossterm-rs/crossterm) handles raw mode,
   cursor movement, and colors.
-- [Termina](https://docs.rs/termina/) reads keyboard, mouse, resize, and
+- [Termina](https://docs.rs/termina/) parses keyboard, mouse, paste, and
   cursor-position events.
 - [Syntect](https://docs.rs/syntect/) highlights source files.
 - [franken_markdown](https://crates.io/crates/franken_markdown) renders Markdown
@@ -25,6 +25,10 @@ Mouse controls use an optional query to locate the viewer within the terminal.
 The editor uses the same input reader and inline surface.
 Text entry enables bracketed paste; exit disables it.
 Search and editor code never write selected-path data to stdout.
+`src/terminal_input.rs` owns terminal input and resize notifications.
+It separates graphics replies from normal input before passing normal input to Termina.
+Images and native Markdown share one bounded PNG capability probe.
+Probe output uses stderr, and late replies cannot become keyboard commands.
 
 The rendered viewer uses the FMD SVG backend in `vendor/franken-markdown`.
 Local changes support independent heading and code fonts, sizes, and theme colors.

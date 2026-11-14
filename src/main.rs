@@ -29,7 +29,9 @@ use termina::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, Modifiers as KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use termina::{EventReader, PlatformTerminal, Terminal as _};
+use terminal_input::InputReader;
+
+mod terminal_input;
 
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
@@ -520,13 +522,14 @@ fn run_inline_with_mouse<S, T>(
         images,
         editor_mouse,
     } = options;
-    let input_terminal = PlatformTerminal::new()?;
-    let reader = input_terminal.event_reader();
+    let mut reader = InputReader::new()?;
     enable_raw_mode()?;
     let mut raw_mode = RawModeGuard {
         viewport_active: false,
         mouse_capture: false,
     };
+    let graphics_supported = images && reader.probe_graphics(&mut io::stderr())?;
+    app.set_graphics_supported(graphics_supported);
     execute!(io::stderr(), cursor::Hide)?;
 
     let (mut terminal_width, mut terminal_height) = terminal::size()?;
@@ -581,8 +584,12 @@ fn run_inline_with_mouse<S, T>(
                 if measure_origin {
                     origin = if origin_supported {
                         terminal.backend_mut().request_origin()?;
-                        let result =
-                            read_origin(&reader, terminal_width, terminal_height, viewport_height)?;
+                        let result = read_origin(
+                            &mut reader,
+                            terminal_width,
+                            terminal_height,
+                            viewport_height,
+                        )?;
                         resolve_origin(result, &mut origin_supported)
                     } else {
                         None
@@ -623,6 +630,7 @@ fn run_inline_with_mouse<S, T>(
             }
             let area = Rect::new(0, 0, terminal_width, viewport_height);
             let image = if images
+                && graphics_supported
                 && app.editor().is_none()
                 && (!editor_mouse || app.is_rendered_markdown_view())
             {
@@ -630,7 +638,7 @@ fn run_inline_with_mouse<S, T>(
                     app.markdown_image()
                         .or_else(|| {
                             (!app.is_rendered_markdown_view())
-                                .then(|| app.preview().image())
+                                .then(|| app.preview_image())
                                 .flatten()
                         })
                         .zip(preview_image_area(&app, preview))
@@ -711,7 +719,7 @@ fn run_inline_with_mouse<S, T>(
                         && origin_supported
                     {
                         terminal.backend_mut().request_origin()?;
-                        let result = read_origin(&reader, width, height, viewport_height)?;
+                        let result = read_origin(&mut reader, width, height, viewport_height)?;
                         origin = resolve_origin(result, &mut origin_supported);
                     }
                     set_mouse_capture(
@@ -735,7 +743,7 @@ fn run_inline_with_mouse<S, T>(
 
 /// Wait briefly for a cursor report without consuming unrelated input.
 fn read_origin(
-    reader: &EventReader,
+    reader: &mut InputReader,
     width: u16,
     height: u16,
     viewport_height: u16,
@@ -979,7 +987,7 @@ fn handle_theme_key(
             };
             app.set_viewer_scroll(next);
         }
-        KeyCode::Char('m') if app.is_viewing() => app.toggle_markdown_source(),
+        KeyCode::Char('m') if app.is_viewing() => app.toggle_source_view(),
         KeyCode::PageUp if app.is_viewing() => {
             let step = if app.is_rendered_markdown_view() {
                 app.markdown_scroll_step()
@@ -1027,13 +1035,13 @@ fn desired_viewport_height(
     let status_row = usize::from(app.status().is_some());
     let current_rows = app.entries().len().saturating_add(status_row);
     let body_rows = if terminal_width >= TWO_PANE_MIN_WIDTH {
-        let preview_rows = if let Some(document) = app.preview().document() {
+        let preview_rows = if app.preview_image().is_some() {
+            8
+        } else if let Some(document) = app.preview().document() {
             document
                 .lines
                 .len()
                 .saturating_add(usize::from(document.notice.is_some()))
-        } else if app.preview().image().is_some() {
-            8
         } else if app.preview().message().is_some() {
             3
         } else {
@@ -1118,7 +1126,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::Home => app.set_viewer_scroll(0),
             KeyCode::End => app.set_viewer_scroll(usize::MAX),
             KeyCode::Char('o') => return app.open_selected(),
-            KeyCode::Char('m') => app.toggle_markdown_source(),
+            KeyCode::Char('m') => app.toggle_source_view(),
             KeyCode::Char('R') => app.toggle_reading(),
             KeyCode::Char('f') => app.toggle_viewer_expanded(),
             KeyCode::Char('e') => app.open_editor(),
@@ -2020,14 +2028,14 @@ mod tests {
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         let key = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
         handle_key(&mut app, key('m'), 2);
-        assert!(!app.is_markdown_source());
+        assert!(!app.is_source_view());
         handle_key(&mut app, key('v'), 2);
         app.set_viewer_scroll(5);
         handle_key(&mut app, key('m'), 2);
-        assert!(app.is_markdown_source());
+        assert!(app.is_source_view());
         assert_eq!(app.viewer_scroll(), 0);
         handle_key(&mut app, key('m'), 2);
-        assert!(!app.is_markdown_source());
+        assert!(!app.is_source_view());
         handle_key(&mut app, key('q'), 2);
         app.begin_search();
         handle_key(&mut app, key('m'), 2);

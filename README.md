@@ -137,7 +137,7 @@ asks the parent shell to `cd` there.
 | `e` (picker or viewer) | Edit the original file inline |
 | `Ctrl-S` (editor) | Save the file |
 | `Escape`, `Ctrl-Q` (editor) | Return; choose Save, Discard, or Cancel for changed text |
-| `m` (Markdown viewer) | Toggle source and rendered Markdown |
+| `m` (Markdown/SVG viewer) | Toggle original source and rendered view |
 | `R` (plain text viewer) | Toggle raw and reading layouts |
 | `/` (viewer) | Find literal text in the current file |
 | `n`, `N` (viewer) | Move to the next or previous match |
@@ -163,9 +163,9 @@ to use the navigation controls above.
 ### File previews
 
 The right pane previews Markdown source, JSON, source code, plain text, and
-supported images. Press `v` for the full-width viewer. For Markdown, press `m`
-to switch between the rendered page and the same highlighted source. Use arrows
-or `j`/`k` to scroll. Press `Escape` or `q` to return to the same selection.
+supported images, including static SVG. Press `v` for the full-width viewer.
+For Markdown or SVG, press `m` to switch between the rendered view and highlighted source.
+Use arrows or `j`/`k` to scroll. Press `Escape` or `q` to return to the same selection.
 Press `f` to use the full terminal height.
 Press `f` again to restore the normal inline size.
 
@@ -195,6 +195,7 @@ It keeps the result-limit warning when results reach the limit.
 Search continues in the background.
 `Enter` chooses a folder result or opens the exact first match in a file.
 Visible Markdown text opens in rendered mode; hidden Markdown syntax opens in source mode.
+SVG content matches open highlighted XML source.
 `Left`, `Right`, and plain `Tab` do not browse folders during search.
 Press `Escape` before using folder-browsing keys.
 To edit a search result, press `Enter`, then `e`.

@@ -6,7 +6,7 @@ use std::thread;
 #[derive(Debug, Default)]
 struct State {
     generation: u64,
-    job: Option<(u64, PathBuf)>,
+    job: Option<(u64, PathBuf, Option<Arc<str>>)>,
     result: Option<(u64, Result<ImagePreview, String>)>,
     pending: bool,
     stopped: bool,
@@ -38,9 +38,12 @@ impl ImageLoader {
                 if state.stopped {
                     return;
                 }
-                let (generation, path) = state.job.take().unwrap();
+                let (generation, path, source) = state.job.take().unwrap();
                 drop(state);
-                let result = decoder(&path);
+                let result = match source {
+                    Some(source) => media::load_svg(&source),
+                    None => decoder(&path),
+                };
                 let mut state = lock.lock().unwrap();
                 if !state.stopped && state.generation == generation {
                     state.result = Some((generation, result));
@@ -53,11 +56,19 @@ impl ImageLoader {
     }
 
     pub fn request(&mut self, path: PathBuf) -> u64 {
+        self.request_image(path, None)
+    }
+
+    pub(crate) fn request_svg(&mut self, path: PathBuf, source: Arc<str>) -> u64 {
+        self.request_image(path, Some(source))
+    }
+
+    fn request_image(&mut self, path: PathBuf, source: Option<Arc<str>>) -> u64 {
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
         let generation = state.generation;
-        state.job = Some((generation, path));
+        state.job = Some((generation, path, source));
         state.result = None;
         state.pending = true;
         wake.notify_one();

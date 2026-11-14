@@ -4,33 +4,13 @@
 //! and normalized to PNG before FMD sees them. No file or network access is
 //! allowed by either the outer or nested image resolver.
 
-use resvg::usvg::{self, ImageHrefResolver, ImageKind, Options, Tree};
-use std::sync::{Arc, LazyLock};
-
-fn fonts() -> Arc<usvg::fontdb::Database> {
-    static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
-        let mut db = usvg::fontdb::Database::new();
-        for bytes in [
-            fmd_font::bundled::PLEX_REGULAR,
-            fmd_font::bundled::PLEX_BOLD,
-            fmd_font::bundled::CM_TYPEWRITER,
-            fmd_font::bundled::noto_sans_cjk_sc(),
-            fmd_font::bundled::NOTO_EMOJI_CURATED,
-        ] {
-            db.load_font_data(bytes.to_vec());
-        }
-        db.set_serif_family("IBM Plex Sans");
-        db.set_sans_serif_family("IBM Plex Sans");
-        db.set_monospace_family("CMU Typewriter Text");
-        Arc::new(db)
-    });
-    Arc::clone(&FONTS)
-}
+use resvg::usvg::{ImageHrefResolver, ImageKind, Options, Tree};
+use std::sync::Arc;
 
 pub(crate) fn options(style: Arc<crate::render_theme::RenderedTheme>) -> Options<'static> {
     let default_data = ImageHrefResolver::default_data_resolver();
     Options {
-        fontdb: fonts(),
+        fontdb: crate::svg::fonts(),
         image_href_resolver: ImageHrefResolver {
             resolve_data: Box::new(move |mime, data, opt| {
                 if mime != "image/svg+xml" {

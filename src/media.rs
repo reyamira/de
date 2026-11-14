@@ -1,4 +1,4 @@
-//! Bounded image decoding for terminals that support the Kitty graphics protocol.
+//! Bounded image decoding and PNG preparation for the graphics transport.
 
 use base64::Engine;
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
@@ -24,42 +24,20 @@ pub fn is_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
-            ["png", "jpg", "jpeg", "gif", "webp", "bmp"]
+            ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]
                 .iter()
                 .any(|known| ext.eq_ignore_ascii_case(known))
         })
 }
 
-fn terminal_support(
-    term: &str,
-    program: &str,
-    tmux: bool,
-    screen: bool,
-    zellij: bool,
-) -> Result<(), String> {
-    if tmux || screen || zellij || term.starts_with("screen") || term.starts_with("tmux") {
-        return Err("Image previews are unavailable inside terminal multiplexers. Press o to open externally.".into());
-    }
-    if term == "xterm-kitty" || term == "xterm-ghostty" || program.eq_ignore_ascii_case("ghostty") {
-        Ok(())
-    } else {
-        Err("Image previews require Kitty or Ghostty without a terminal multiplexer. Press o to open externally.".into())
-    }
+pub(crate) fn is_svg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
-pub(crate) fn ensure_terminal_support() -> Result<(), String> {
-    terminal_support(
-        &std::env::var("TERM").unwrap_or_default(),
-        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
-        std::env::var_os("TMUX").is_some(),
-        std::env::var_os("STY").is_some(),
-        std::env::var_os("ZELLIJ").is_some(),
-    )
-}
-
-pub fn load_image(path: &Path) -> Result<ImagePreview, String> {
-    ensure_terminal_support()?;
-    decode_image(path)
+pub(crate) fn load_svg(source: &str) -> Result<ImagePreview, String> {
+    image_from_png(crate::svg::Svg::parse(source)?.render()?)
 }
 
 pub(crate) fn image_from_png(bytes: Vec<u8>) -> Result<ImagePreview, String> {
@@ -82,7 +60,26 @@ pub(crate) fn image_from_png(bytes: Vec<u8>) -> Result<ImagePreview, String> {
     })
 }
 
-fn decode_image(path: &Path) -> Result<ImagePreview, String> {
+pub fn load_image(path: &Path) -> Result<ImagePreview, String> {
+    if is_svg_path(path) {
+        let metadata =
+            std::fs::metadata(path).map_err(|error| format!("Cannot inspect SVG: {error}"))?;
+        if !metadata.is_file() {
+            return Err("SVG is not a regular file.".into());
+        }
+        let file = File::open(path).map_err(|error| format!("Cannot open SVG: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("Cannot inspect SVG: {error}"))?;
+        if !metadata.is_file() || metadata.len() > crate::svg::MAX_SOURCE_BYTES {
+            return Err("SVG must be a regular file within the 1 MiB source limit.".into());
+        }
+        let mut source = String::new();
+        file.take(crate::svg::MAX_SOURCE_BYTES + 1)
+            .read_to_string(&mut source)
+            .map_err(|error| format!("Cannot read SVG UTF-8 source: {error}"))?;
+        return load_svg(&source);
+    }
     // Inspect before opening: opening a FIFO for reading can wait indefinitely.
     let metadata = std::fs::metadata(path)
         .map_err(|e| format!("Cannot inspect image: {e}. Press o to open externally."))?;
@@ -168,23 +165,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_multiplexers_even_with_kitty_term() {
-        assert!(terminal_support("xterm-kitty", "", true, false, false).is_err());
-        assert!(terminal_support("screen-256color", "ghostty", false, false, false).is_err());
-        assert!(terminal_support("xterm-kitty", "", false, false, true).is_err());
-        assert!(terminal_support("xterm-kitty", "", false, false, false).is_ok());
-        assert!(terminal_support("xterm-256color", "ghostty", false, false, false).is_ok());
-        assert!(terminal_support("xterm-256color", "", false, false, false).is_err());
-    }
-
-    #[test]
-    fn decodes_pixels_and_recognizes_case_insensitive_extensions() {
+    fn public_decoder_preserves_pixels_without_terminal_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pixel.PNG");
         image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
-        let image = decode_image(&path).unwrap();
+        let image = load_image(&path).unwrap();
+        assert_eq!(image, load_image(&path).unwrap());
         assert_eq!((image.width, image.height), (1, 1));
         let png = base64::engine::general_purpose::STANDARD
             .decode(&*image.encoded)
@@ -202,7 +190,7 @@ mod tests {
         image::RgbaImage::from_pixel(4096, 1024, image::Rgba([1, 2, 3, 255]))
             .save(&path)
             .unwrap();
-        let image = decode_image(&path).unwrap();
+        let image = load_image(&path).unwrap();
         assert_eq!((image.width, image.height), (2048, 512));
     }
 
@@ -223,7 +211,7 @@ mod tests {
         tagged.extend_from_slice(&exif);
         tagged.extend_from_slice(&jpeg[2..]);
         std::fs::write(&path, tagged).unwrap();
-        let image = decode_image(&path).unwrap();
+        let image = load_image(&path).unwrap();
         assert_eq!((image.width, image.height), (2, 3));
     }
 
@@ -231,14 +219,38 @@ mod tests {
     fn rejects_oversized_file_and_invalid_image() {
         let directory = tempfile::tempdir().unwrap();
         assert!(
-            decode_image(directory.path())
+            load_image(directory.path())
                 .unwrap_err()
                 .contains("not a regular file")
         );
         let file = tempfile::NamedTempFile::new().unwrap();
         file.as_file().set_len(MAX_FILE_BYTES + 1).unwrap();
-        assert!(decode_image(file.path()).unwrap_err().contains("16 MiB"));
+        assert!(load_image(file.path()).unwrap_err().contains("16 MiB"));
         file.as_file().set_len(0).unwrap();
-        assert!(decode_image(file.path()).is_err());
+        assert!(load_image(file.path()).is_err());
+    }
+
+    #[test]
+    fn standalone_svg_uses_png_transport_and_rejects_svgz_and_large_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector.SvG");
+        std::fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="2" height="2" fill="red"/></svg>"#).unwrap();
+        let preview = load_image(&path).unwrap();
+        assert!(is_image_path(&path));
+        assert_eq!((preview.width, preview.height), (4, 2));
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&*preview.encoded)
+            .unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(3, 0).0, [0, 0, 0, 0]);
+        assert!(!is_image_path(Path::new("vector.svgz")));
+        File::create(&path)
+            .unwrap()
+            .set_len(crate::svg::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        assert!(load_image(&path).unwrap_err().contains("1 MiB"));
+        std::fs::write(&path, b"\x1f\x8bnot-an-xml-document").unwrap();
+        assert!(load_image(&path).is_err());
     }
 }

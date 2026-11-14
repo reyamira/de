@@ -31,7 +31,7 @@ fn next_image_id() -> u32 {
         AtomicU32::new(seed)
     });
     loop {
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed) & i32::MAX as u32;
         if id != 0 {
             return id;
         }
@@ -402,6 +402,7 @@ mod tests {
             .unwrap();
         assert_eq!(backend.cursor, cursor);
         let first_id = backend.image.as_ref().unwrap().id;
+        assert!((1..=i32::MAX as u32).contains(&first_id));
         let length = backend.writer.len();
         backend
             .draw_image(Some((&first, Rect::new(3, 2, 10, 5))))
@@ -422,6 +423,7 @@ mod tests {
             .unwrap();
         assert_eq!(backend.cursor, cursor);
         let second_id = backend.image.as_ref().unwrap().id;
+        assert!((1..=i32::MAX as u32).contains(&second_id));
         assert_ne!(first_id, second_id);
         backend.resize_viewport(30, 8).unwrap();
         assert!(backend.image.as_ref().unwrap().area.is_none());

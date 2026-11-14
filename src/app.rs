@@ -209,8 +209,9 @@ pub struct App {
     viewing: bool,
     viewer_expanded: bool,
     viewer_scroll: usize,
-    markdown_source: bool,
+    source_view: bool,
     reading: bool,
+    graphics_supported: bool,
     image_loader: Option<crate::image_loader::ImageLoader>,
     image_request: Option<u64>,
     viewer_text_cache: RefCell<Option<crate::ui::ViewerText>>,
@@ -285,8 +286,9 @@ impl App {
             viewing: false,
             viewer_expanded: false,
             viewer_scroll: 0,
-            markdown_source: false,
+            source_view: false,
             reading: false,
+            graphics_supported: false,
             image_loader: None,
             image_request: None,
             viewer_text_cache: RefCell::new(None),
@@ -305,6 +307,40 @@ impl App {
         };
         app.refresh_preview();
         Ok(app)
+    }
+
+    /// Apply the result of the terminal's PNG graphics capability probe.
+    pub fn set_graphics_supported(&mut self, supported: bool) {
+        if self.graphics_supported == supported {
+            return;
+        }
+        self.graphics_supported = supported;
+        self.cancel_image_request();
+        self.cancel_markdown();
+        self.preview.image = None;
+        if self.is_rendered_markdown_view() {
+            self.viewer_selection = None;
+            self.update_find_matches();
+        }
+        if self.editor.is_none()
+            && let Some(path) = self.preview.path.clone()
+            && crate::media::is_image_path(&path)
+            && (!crate::media::is_svg_path(&path) || self.preview.document.is_some())
+            && self
+                .selected_entry()
+                .is_some_and(|entry| !entry.is_dir && entry.path == path)
+        {
+            let source = crate::media::is_svg_path(&path)
+                .then(|| {
+                    self.preview
+                        .document
+                        .as_ref()
+                        .map(|document| Arc::clone(&document.source))
+                })
+                .flatten();
+            self.preview.message = Some(self.prepare_image(path, source));
+        }
+        self.viewer_text_cache.get_mut().take();
     }
 
     pub fn current_dir(&self) -> &Path {
@@ -386,7 +422,7 @@ impl App {
             self.refresh_preview();
         } else {
             self.viewing = true;
-            self.markdown_source = sample == ThemeSample::Source;
+            self.source_view = sample == ThemeSample::Source;
             self.preview = Preview {
                 label: "theme sample".into(),
                 path: Some(self.current_dir.join(".de-theme-sample.md")),
@@ -399,8 +435,32 @@ impl App {
         }
     }
 
-    pub fn is_markdown_source(&self) -> bool {
-        self.markdown_source
+    pub fn is_source_view(&self) -> bool {
+        self.source_view || (self.is_svg() && self.preview.image.is_none())
+    }
+
+    pub fn is_svg(&self) -> bool {
+        self.preview
+            .path
+            .as_deref()
+            .is_some_and(crate::media::is_svg_path)
+    }
+
+    /// The image visible in the current mode, not the retained source-mode image.
+    pub fn preview_image(&self) -> Option<&crate::media::ImagePreview> {
+        if self.is_svg() && ((self.viewing && self.source_view) || self.browser_source_target()) {
+            None
+        } else {
+            self.preview.image.as_ref()
+        }
+    }
+
+    fn browser_source_target(&self) -> bool {
+        !self.viewing
+            && self.is_svg()
+            && self
+                .selected_search_hit()
+                .is_some_and(|hit| hit.line.is_some())
     }
 
     pub fn is_reading(&self) -> bool {
@@ -433,21 +493,26 @@ impl App {
         &self.viewer_text_cache
     }
 
-    pub fn toggle_markdown_source(&mut self) {
+    pub fn toggle_source_view(&mut self) {
         if self.viewing
-            && self
-                .preview
-                .document
-                .as_ref()
-                .is_some_and(|document| document.markdown_source.is_some())
+            && (self.is_svg()
+                || self
+                    .preview
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.markdown_source.is_some()))
         {
             self.browser_target = None;
-            self.markdown_source = !self.markdown_source;
+            if self.is_svg() && self.preview.image.is_none() {
+                self.status = self.preview.message.clone();
+                return;
+            }
+            self.source_view = !self.source_view;
             self.reading = false;
             self.status = None;
             self.viewer_scroll = 0;
             if self.theme_sample != ThemeSample::Picker {
-                self.theme_sample = if self.markdown_source {
+                self.theme_sample = if self.source_view {
                     ThemeSample::Source
                 } else {
                     ThemeSample::Rendered
@@ -455,6 +520,7 @@ impl App {
             }
             self.cancel_markdown();
             self.viewer_selection = None;
+            self.viewer_text_cache.get_mut().take();
             self.update_find_matches();
         }
     }
@@ -465,7 +531,7 @@ impl App {
         else {
             return false;
         };
-        if self.image_request != Some(request) {
+        if !self.graphics_supported || self.image_request != Some(request) {
             return false;
         }
         self.image_request = None;
@@ -479,15 +545,18 @@ impl App {
     }
 
     pub fn image_pending(&self) -> bool {
-        self.image_loader
-            .as_ref()
-            .is_some_and(|loader| loader.is_pending())
+        self.graphics_supported
+            && self.image_request.is_some()
+            && self
+                .image_loader
+                .as_ref()
+                .is_some_and(|loader| loader.is_pending())
     }
 
     pub fn is_rendered_markdown_view(&self) -> bool {
         self.viewing
             && self.editor.is_none()
-            && !self.markdown_source
+            && !self.source_view
             && self
                 .preview
                 .document
@@ -503,6 +572,11 @@ impl App {
     }
 
     pub fn markdown_message(&self) -> Option<&str> {
+        if !self.graphics_supported {
+            return Some(
+                "Rendered Markdown requires PNG support in the Kitty graphics protocol. Press m for source or o to open externally.",
+            );
+        }
         self.markdown_error.as_deref().or_else(|| {
             self.markdown_page
                 .is_none()
@@ -511,9 +585,12 @@ impl App {
     }
 
     pub fn markdown_pending(&self) -> bool {
-        self.markdown_renderer
-            .as_ref()
-            .is_some_and(|renderer| renderer.is_pending())
+        self.graphics_supported
+            && self.markdown_request.is_some()
+            && self
+                .markdown_renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.is_pending())
     }
 
     pub fn markdown_scroll_step(&self) -> usize {
@@ -527,7 +604,11 @@ impl App {
     }
 
     pub fn update_markdown_view(&mut self, width: u32, height: u32, cell_height: u32) {
-        if !self.is_rendered_markdown_view() || width == 0 || height == 0 {
+        if !self.graphics_supported
+            || !self.is_rendered_markdown_view()
+            || width == 0
+            || height == 0
+        {
             return;
         }
         self.markdown_cell_height = cell_height.max(1) as usize;
@@ -583,7 +664,10 @@ impl App {
         else {
             return false;
         };
-        if self.markdown_request != Some(generation) || !self.is_rendered_markdown_view() {
+        if !self.graphics_supported
+            || self.markdown_request != Some(generation)
+            || !self.is_rendered_markdown_view()
+        {
             return false;
         }
         self.markdown_request = None;
@@ -595,6 +679,9 @@ impl App {
         &mut self,
         result: Result<crate::markdown_renderer::RenderedPage, String>,
     ) {
+        if !self.graphics_supported {
+            return;
+        }
         match result {
             Ok(page) => {
                 let layout_changed = self
@@ -613,7 +700,7 @@ impl App {
                 if layout_changed && self.browser_target.is_some() && self.active_match().is_none()
                 {
                     // Only genuinely hidden Markdown syntax opens in source mode.
-                    self.markdown_source = true;
+                    self.source_view = true;
                     self.viewer_text_cache.get_mut().take();
                     self.update_find_matches();
                     self.reveal_match = true;
@@ -657,7 +744,7 @@ impl App {
                     Some(start + range.start..start + range.end)
                 });
                 self.viewer_source_line = self.selected_search_hit().and_then(|hit| hit.line);
-                self.markdown_source = false;
+                self.source_view = self.is_svg() && self.viewer_source_line.is_some();
                 self.reading = false;
                 if self.is_searching() {
                     self.find.query = self.search_query.clone();
@@ -813,13 +900,13 @@ impl App {
             self.editor = None;
             self.editor_cache.get_mut().take();
             let scroll = self.viewer_scroll;
-            let source = self.markdown_source;
+            let source = self.source_view;
             let reading = self.reading;
             self.preview.path = None;
             self.find.preview_document = None;
             self.refresh_preview();
             self.viewer_scroll = scroll;
-            self.markdown_source = source;
+            self.source_view = source;
             self.reading = reading;
             self.browser_target = None;
             self.update_find_matches();
@@ -899,7 +986,10 @@ impl App {
             .preview
             .document
             .clone()
-            .map(|doc| (self.markdown_source, self.reading, self.viewer_scroll, doc));
+            .map(|doc| (self.source_view, self.reading, self.viewer_scroll, doc));
+        if self.is_svg() {
+            self.source_view = true;
+        }
         self.find.prompt = true;
         self.viewer_selection = None;
         self.find.query.clear();
@@ -943,7 +1033,7 @@ impl App {
         self.find.prompt = false;
         if cancel {
             if let Some((source, reading, scroll, document)) = self.find.saved.take() {
-                self.markdown_source = source;
+                self.source_view = source;
                 self.reading = reading;
                 self.preview.document = Some(document);
                 self.set_viewer_scroll(scroll);
@@ -1009,6 +1099,9 @@ impl App {
         let count = self.find.matches.len();
         if count == 0 {
             return;
+        }
+        if self.is_svg() {
+            self.source_view = true;
         }
         let index = self.find.active.unwrap_or(0);
         self.find.active = Some(if backwards {
@@ -1161,10 +1254,20 @@ impl App {
         let changed = self.theme.name() != theme.name()
             || self.theme.palette() != theme.palette()
             || !Arc::ptr_eq(&self.theme.rendered(), &theme.rendered());
-        if changed && self.preview.document.is_some() {
+        if changed && self.preview.document.is_some() && !self.is_svg() {
             self.preview.path = None;
         }
         self.theme = theme;
+        if changed
+            && self.is_svg()
+            && let (Some(path), Some(document)) = (&self.preview.path, &self.preview.document)
+        {
+            self.preview.document = Some(crate::document::source_from_text(
+                path,
+                &document.source,
+                &self.theme.palette(),
+            ));
+        }
         if changed {
             self.cancel_markdown();
             self.viewer_text_cache.get_mut().take();
@@ -1562,7 +1665,7 @@ impl App {
             self.cancel_image_request();
             self.cancel_markdown();
             self.viewer_text_cache.get_mut().take();
-            self.markdown_source = false;
+            self.source_view = false;
             self.reading = false;
             self.viewer_scroll = 0;
             self.preview = Preview {
@@ -1595,7 +1698,7 @@ impl App {
         self.cancel_image_request();
         self.cancel_markdown();
         self.viewer_text_cache.get_mut().take();
-        self.markdown_source = false;
+        self.source_view = false;
         self.reading = false;
         self.viewer_scroll = 0;
         let mut preview = Preview {
@@ -1620,12 +1723,20 @@ impl App {
                 }
                 Err(error) => preview.message = Some(format!("cannot preview: {error}")),
             }
+        } else if crate::media::is_svg_path(&path) {
+            match crate::document::load_source(&path, &self.theme.palette()) {
+                Ok(document) => {
+                    preview.details = Some(source_details(&path, &document.source));
+                    preview.message =
+                        Some(self.prepare_image(path.clone(), Some(Arc::clone(&document.source))));
+                    preview.document = Some(document);
+                }
+                Err(error) => {
+                    preview.message = Some(format!("{error} · press o to open externally"))
+                }
+            }
         } else if crate::media::is_image_path(&path) {
-            let loader = self
-                .image_loader
-                .get_or_insert_with(crate::image_loader::ImageLoader::new);
-            self.image_request = Some(loader.request(path.clone()));
-            preview.message = Some("loading image…".into());
+            preview.message = Some(self.prepare_image(path.clone(), None));
         } else if path.extension().and_then(OsStr::to_str).is_some_and(|ext| {
             [
                 "mp4", "mkv", "webm", "mov", "avi", "m4v", "mpeg", "mpg", "wmv",
@@ -1651,6 +1762,20 @@ impl App {
             }
         }
         self.preview = preview;
+    }
+
+    fn prepare_image(&mut self, path: PathBuf, source: Option<Arc<str>>) -> String {
+        if !self.graphics_supported {
+            return "Image previews require PNG support in the Kitty graphics protocol. Press o to open externally.".into();
+        }
+        let loader = self
+            .image_loader
+            .get_or_insert_with(crate::image_loader::ImageLoader::new);
+        self.image_request = Some(match source {
+            Some(source) => loader.request_svg(path, source),
+            None => loader.request(path),
+        });
+        "loading image…".into()
     }
 
     fn cancel_image_request(&mut self) {
@@ -1789,7 +1914,7 @@ mod tests {
         (temp, app)
     }
 
-    fn apply_rendered_markdown(app: &mut App, width: u32) {
+    fn rendered_markdown(app: &App, width: u32) -> crate::markdown_renderer::RenderedPage {
         let request = crate::markdown_renderer::RenderRequest {
             path: app.preview.path.clone().unwrap(),
             source: app
@@ -1806,7 +1931,12 @@ mod tests {
             style: app.theme.rendered(),
             annotations: app.text_annotations(),
         };
-        let page = crate::markdown_renderer::render_test_page(&request).unwrap();
+        crate::markdown_renderer::render_test_page(&request).unwrap()
+    }
+
+    fn apply_rendered_markdown(app: &mut App, width: u32) {
+        app.set_graphics_supported(true);
+        let page = rendered_markdown(app, width);
         app.apply_markdown_result(Ok(page));
     }
 
@@ -1871,9 +2001,9 @@ mod tests {
 
         // A later visible occurrence must not replace the hidden browser target.
         apply_rendered_markdown(&mut app, 320);
-        assert!(app.is_markdown_source());
+        assert!(app.is_source_view());
         assert_eq!(app.active_match(), Some(target));
-        app.toggle_markdown_source();
+        app.toggle_source_view();
         assert!(app.is_rendered_markdown_view());
         assert!(app.browser_target.is_none());
         apply_rendered_markdown(&mut app, 320);
@@ -2093,6 +2223,7 @@ mod tests {
     fn sample_reuses_real_viewer_and_invalidates_render_on_theme_change() {
         let temp = tempdir().unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_graphics_supported(true);
         let catalog = crate::Config::built_ins();
         app.set_theme_sample(ThemeSample::Rendered);
         assert!(app.is_rendered_markdown_view());
@@ -2132,25 +2263,20 @@ mod tests {
     #[test]
     fn markdown_page_is_discarded_when_mode_or_selection_changes() {
         let temp = tempdir().unwrap();
-        fs::write(temp.path().join("a.md"), "# A").unwrap();
+        fs::write(
+            temp.path().join("a.md"),
+            "# A\n\nA paragraph.\n\n".repeat(40),
+        )
+        .unwrap();
         fs::write(temp.path().join("b.md"), "# B").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         app.open_viewer();
-        app.markdown_page = Some(crate::markdown_renderer::RenderedPage {
-            image: crate::media::ImagePreview {
-                width: 10,
-                height: 20,
-                encoded: "image".into(),
-            },
-            scroll_y: 0,
-            max_scroll: 250,
-            text: Arc::new(crate::rendered_text::RenderedText::default()),
-        });
-        assert_eq!(app.markdown_scroll_max(), 250);
+        apply_rendered_markdown(&mut app, 320);
+        assert!(app.markdown_scroll_max() > 0);
         assert!(app.markdown_image().is_some());
-        app.toggle_markdown_source();
+        app.toggle_source_view();
         assert!(app.markdown_image().is_none());
-        app.toggle_markdown_source();
+        app.toggle_source_view();
         assert!(app.markdown_image().is_none());
         app.move_down();
         assert!(app.markdown_image().is_none());
@@ -2300,12 +2426,143 @@ mod tests {
         );
     }
 
+    fn save_pixel(path: &Path) {
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save(path)
+            .unwrap();
+    }
+
+    fn finish_image(app: &mut App) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.image_pending() {
+            app.poll_preview();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "image decode timed out"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        app.poll_preview();
+    }
+
+    #[test]
+    fn graphics_enable_loads_initial_image_without_resetting_view() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("pixel.png");
+        save_pixel(&path);
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let other = App::new(temp.path().to_path_buf()).unwrap();
+        assert!(app.image_loader.is_none());
+        assert!(!app.image_pending());
+        assert!(app.preview().image().is_none());
+        assert!(app.preview().message().unwrap().contains("PNG"));
+        app.open_viewer();
+        app.toggle_viewer_expanded();
+        app.set_viewer_scroll(7);
+
+        app.set_graphics_supported(true);
+        let request = app.image_request;
+        app.set_graphics_supported(true);
+        assert_eq!(app.image_request, request);
+        finish_image(&mut app);
+        assert_eq!(
+            app.preview().image(),
+            Some(&crate::media::load_image(&path).unwrap())
+        );
+        assert!(app.preview().message().is_none());
+        assert!(app.is_viewing());
+        assert!(app.viewer_expanded());
+        assert_eq!(app.viewer_scroll(), 7);
+        assert!(other.image_loader.is_none());
+        assert!(other.preview().image().is_none());
+    }
+
+    #[test]
+    fn graphics_disable_discards_pending_and_displayed_images() {
+        let temp = tempdir().unwrap();
+        save_pixel(&temp.path().join("pixel.png"));
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_graphics_supported(true);
+        let first = app.image_request.unwrap();
+        app.set_graphics_supported(false);
+        assert!(!app.poll_preview());
+        assert!(app.image_request.is_none());
+        assert!(!app.image_pending());
+        assert!(!app.background_work_pending());
+        assert!(app.preview().image().is_none());
+        assert!(app.preview().message().unwrap().contains("PNG"));
+        assert!(!app.preview().message().unwrap().contains("loading"));
+
+        app.set_graphics_supported(true);
+        assert_ne!(app.image_request, Some(first));
+        finish_image(&mut app);
+        assert!(app.preview().image().is_some());
+        app.set_graphics_supported(false);
+        assert!(app.preview().image().is_none());
+        assert!(!app.image_pending());
+        assert_eq!(
+            app.open_selected(),
+            NavigationResult::Open(temp.path().join("pixel.png"))
+        );
+    }
+
+    #[test]
+    fn graphics_disable_preserves_markdown_source_and_rejects_pending_pages() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notes.md");
+        fs::write(&path, "# Original\n\nA paragraph.\n\n".repeat(40)).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let snapshot = app.preview().document().unwrap().clone();
+        app.open_viewer();
+        app.update_markdown_view(320, 160, 16);
+        assert!(app.markdown_renderer.is_none());
+        assert!(!app.markdown_pending());
+        assert!(app.markdown_message().unwrap().contains("PNG"));
+        app.toggle_source_view();
+        app.set_viewer_scroll(3);
+        fs::write(&path, "# Changed on disk").unwrap();
+        app.set_graphics_supported(true);
+        app.set_graphics_supported(false);
+        assert!(app.is_source_view());
+        assert_eq!(app.viewer_scroll(), 3);
+        assert_eq!(app.preview().document(), Some(&snapshot));
+        assert_eq!(app.open_selected(), NavigationResult::Open(path));
+
+        app.toggle_source_view();
+        app.set_graphics_supported(true);
+        app.update_markdown_view(320, 160, 16);
+        assert!(app.markdown_request.is_some());
+        let pending_page = rendered_markdown(&app, 320);
+        app.set_graphics_supported(false);
+        app.apply_markdown_result(Ok(pending_page));
+        assert!(!app.poll_markdown());
+        assert!(app.markdown_request.is_none());
+        assert!(app.markdown_page.is_none());
+        assert!(app.markdown_key.is_none());
+        assert!(app.markdown_layout.is_none());
+        assert!(!app.markdown_pending());
+        assert!(!app.background_work_pending());
+        assert!(app.markdown_message().unwrap().contains("PNG"));
+        assert_eq!(app.preview().document(), Some(&snapshot));
+
+        apply_rendered_markdown(&mut app, 320);
+        assert!(app.markdown_image().is_some());
+        app.set_viewer_scroll(32);
+        app.set_graphics_supported(false);
+        assert!(app.markdown_image().is_none());
+        assert_eq!(app.viewer_scroll(), 32);
+        assert!(app.is_rendered_markdown_view());
+        app.toggle_source_view();
+        assert_eq!(app.preview().document(), Some(&snapshot));
+    }
+
     #[test]
     fn leaving_an_image_cancels_its_pending_preview() {
         let temp = tempdir().unwrap();
-        fs::write(temp.path().join("a.png"), "invalid image").unwrap();
+        save_pixel(&temp.path().join("a.png"));
         fs::write(temp.path().join("b.txt"), "selected text").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_graphics_supported(true);
         let first_request = app.image_request.unwrap();
 
         app.move_down();
@@ -2712,5 +2969,165 @@ mod tests {
             SortDirection::Descending,
         );
         assert_eq!(incomplete_metadata[0].name, "known");
+    }
+
+    const SVG_SOURCE: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">\n<rect width=\"32\" height=\"32\" fill=\"red\"/>\n<text x=\"1\" y=\"20\">needle λ</text>\n</svg>";
+
+    #[test]
+    fn svg_modes_find_copy_and_capability_use_one_source_snapshot() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vector.SVG");
+        fs::write(&path, SVG_SOURCE).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        let snapshot = Arc::clone(&app.preview().document().unwrap().source);
+        assert!(app.preview().message().unwrap().contains("PNG"));
+        assert!(app.is_source_view());
+        assert!(!app.is_rendered_markdown_view());
+        fs::write(&path, "<svg>changed on disk</svg>").unwrap();
+        app.set_graphics_supported(true);
+        finish_image(&mut app);
+        assert_eq!(
+            app.preview_image().unwrap(),
+            &crate::media::load_svg(SVG_SOURCE).unwrap()
+        );
+        app.open_viewer();
+        assert!(!app.is_source_view());
+        app.toggle_source_view();
+        assert!(app.is_source_view());
+        assert!(app.preview_image().is_none());
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &app.preview().document().unwrap().source
+        ));
+        let image = app.preview.image.clone();
+        let themes = crate::Config::built_ins();
+        for name in ["light", "dark"] {
+            app.set_theme(themes.find(name).unwrap().clone());
+            assert!(app.is_source_view());
+            assert!(Arc::ptr_eq(
+                &snapshot,
+                &app.preview().document().unwrap().source
+            ));
+            assert_eq!(app.preview.image, image);
+        }
+        let start = SVG_SOURCE.find("needle").unwrap();
+        app.begin_viewer_selection(start);
+        app.extend_viewer_selection(start + "needle λ".len());
+        assert_eq!(app.selected_viewer_text(), Some("needle λ"));
+        let mut output = Vec::new();
+        app.copy_viewer_selection(&mut output).unwrap();
+        assert!(output.starts_with(b"\x1b]52;c;"));
+        app.toggle_source_view();
+        app.begin_find();
+        assert!(app.is_source_view());
+        for ch in "needle".chars() {
+            app.push_find_char(ch);
+        }
+        assert_eq!(app.active_match(), Some(start..start + 6));
+        app.finish_find(true);
+        assert!(!app.is_source_view());
+        assert!(app.preview_image().is_some());
+        app.begin_find();
+        for ch in "needle".chars() {
+            app.push_find_char(ch);
+        }
+        app.finish_find(false);
+        assert!(app.is_source_view());
+        app.set_graphics_supported(false);
+        assert!(app.preview_image().is_none());
+        app.set_graphics_supported(true);
+        finish_image(&mut app);
+        assert!(app.is_source_view());
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &app.preview().document().unwrap().source
+        ));
+        app.close_viewer();
+        assert!(app.preview_image().is_some());
+    }
+
+    #[test]
+    fn svg_invalid_resources_keep_xml_source_and_editor_returns_to_mode() {
+        use termina::event::{KeyCode, KeyEvent, Modifiers};
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vector.svg");
+        let invalid = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\"><image href=\"https://example.invalid/image.png\"/></svg>";
+        fs::write(&path, invalid).unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_graphics_supported(true);
+        finish_image(&mut app);
+        assert!(app.preview().message().unwrap().contains("references"));
+        assert_eq!(&*app.preview().document().unwrap().source, invalid);
+        app.open_viewer();
+        assert!(app.is_source_view());
+        assert!(!app.is_rendered_markdown_view());
+        app.toggle_source_view();
+        assert!(app.is_source_view());
+        app.open_editor();
+        assert_eq!(app.editor().unwrap().lines()[0], invalid);
+        app.handle_editor_key(KeyCode::Escape.into(), 5);
+        assert!(app.is_viewing());
+        finish_image(&mut app);
+        fs::write(&path, SVG_SOURCE).unwrap();
+        app.refresh();
+        finish_image(&mut app);
+        app.open_viewer();
+        assert!(!app.is_source_view());
+        app.open_editor();
+        assert_eq!(
+            app.editor().unwrap().lines()[2],
+            "<text x=\"1\" y=\"20\">needle λ</text>"
+        );
+        app.paste("<!-- saved -->");
+        app.handle_editor_key(KeyEvent::new(KeyCode::Char('s'), Modifiers::CONTROL), 5);
+        app.handle_editor_key(KeyCode::Escape.into(), 5);
+        finish_image(&mut app);
+        assert!(app.is_viewing());
+        assert!(!app.is_source_view());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("<!-- saved -->")
+        );
+        assert!(app.preview_image().is_some());
+    }
+
+    #[test]
+    fn svg_content_hit_activates_original_xml_and_stale_image_cannot_replace_selection() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("a.svg"), SVG_SOURCE).unwrap();
+        fs::write(temp.path().join("b.txt"), "other source").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.set_graphics_supported(true);
+        app.move_down();
+        assert!(app.image_request.is_none());
+        assert!(!app.image_pending());
+        assert_eq!(&*app.preview().document().unwrap().source, "other source");
+        assert!(!app.poll_preview());
+        app.begin_search();
+        for ch in "needle".chars() {
+            app.push_search_char(ch);
+        }
+        finish_search(&mut app);
+        finish_image(&mut app);
+        assert_eq!(app.selected_search_hit().unwrap().line, Some(3));
+        assert!(app.preview_image().is_none());
+        let snapshot = Arc::clone(&app.preview().document().unwrap().source);
+        fs::write(temp.path().join("a.svg"), "<svg>changed</svg>").unwrap();
+        app.open_viewer();
+        assert!(app.is_source_view());
+        assert_eq!(
+            app.active_match(),
+            Some(SVG_SOURCE.find("needle").unwrap()..SVG_SOURCE.find("needle").unwrap() + 6)
+        );
+        app.reveal_viewer_source(ratatui::layout::Rect::new(0, 0, 80, 10));
+        assert_eq!(crate::ui::viewer_source_at_scroll(&app), Some(3));
+        app.toggle_source_view();
+        assert!(app.preview_image().is_some());
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &app.preview().document().unwrap().source
+        ));
+        assert!(app.markdown_request.is_none());
     }
 }

@@ -112,7 +112,9 @@ impl<'a> Assets<'a> {
                 | Inline::Strikethrough(content)
                 | Inline::Link { content, .. } => self.inlines(content, cancelled)?,
                 Inline::Image { dest, alt, .. } => {
-                    if let Some(key) = self.load(dest) {
+                    let loaded = self.load(dest, cancelled);
+                    check_cancelled(cancelled)?;
+                    if let Some(key) = loaded {
                         *dest = key;
                     } else {
                         *inline = Inline::Text(crate::fmd_parse::image_fallback(alt));
@@ -131,12 +133,15 @@ impl<'a> Assets<'a> {
         Ok(())
     }
 
-    fn load(&mut self, destination: &str) -> Option<String> {
+    fn load(&mut self, destination: &str, cancelled: &mut dyn FnMut() -> bool) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         if self.occurrences == 0 {
             return None;
         }
         self.occurrences -= 1;
+        if cancelled() {
+            return None;
+        }
         let file = open_local_image(self.parent, destination)?;
         let metadata = file.metadata().ok()?;
         if !metadata.is_file() {
@@ -144,7 +149,8 @@ impl<'a> Assets<'a> {
         }
         let identity = (metadata.dev(), metadata.ino());
         if !self.cache.contains_key(&identity) {
-            let image = self.decode(file, metadata.len());
+            let svg = decode_path(destination).is_some_and(|path| crate::media::is_svg_path(&path));
+            let image = self.decode(file, metadata.len(), svg, cancelled);
             self.cache.insert(identity, image);
         }
         let image = self.cache.get(&identity)?.as_ref()?;
@@ -161,8 +167,17 @@ impl<'a> Assets<'a> {
         Some(key)
     }
 
-    fn decode(&mut self, file: fs::File, size: u64) -> Option<Image> {
+    fn decode(
+        &mut self,
+        file: fs::File,
+        size: u64,
+        svg: bool,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<Image> {
         if size > 16 * 1024 * 1024 || size > self.source_bytes {
+            return None;
+        }
+        if svg && size > crate::svg::MAX_SOURCE_BYTES {
             return None;
         }
         self.source_bytes -= size;
@@ -170,6 +185,24 @@ impl<'a> Assets<'a> {
         file.take(size + 1).read_to_end(&mut data).ok()?;
         if data.len() as u64 != size {
             return None;
+        }
+        if svg {
+            let svg = crate::svg::Svg::parse(std::str::from_utf8(&data).ok()?).ok()?;
+            if svg.intrinsic_pixels > self.decoded_pixels
+                || svg.output_pixels() > self.rendered_pixels
+                || cancelled()
+            {
+                return None;
+            }
+            self.decoded_pixels -= svg.intrinsic_pixels;
+            let png = svg.render().ok()?;
+            if cancelled() {
+                return None;
+            }
+            return Some(Image {
+                png,
+                pixels: svg.output_pixels(),
+            });
         }
         let format = image::guess_format(&data).ok()?;
         if !matches!(
@@ -406,24 +439,138 @@ mod tests {
             .unwrap();
         let mut assets = Assets::new(dir.path());
         assets.source_bytes = 0;
-        assert!(assets.load("image.png").is_none());
+        assert!(assets.load("image.png", &mut || false).is_none());
         let mut assets = Assets::new(dir.path());
         assets.decoded_pixels = 3;
-        assert!(assets.load("image.png").is_none());
+        assert!(assets.load("image.png", &mut || false).is_none());
         let mut assets = Assets::new(dir.path());
         assets.rendered_pixels = 4;
-        assert!(assets.load("image.png").is_some());
-        assert!(assets.load("image.png").is_none());
+        assert!(assets.load("image.png", &mut || false).is_some());
+        assert!(assets.load("image.png", &mut || false).is_none());
         let mut assets = Assets::new(dir.path());
         assets.encoded_bytes = 0;
-        assert!(assets.load("image.png").is_none());
+        assert!(assets.load("image.png", &mut || false).is_none());
         let mut assets = Assets::new(dir.path());
         assets.occurrences = 1;
-        assert!(assets.load("https://example.com/a.png").is_none());
-        assert!(assets.load("image.png").is_none());
+        assert!(
+            assets
+                .load("https://example.com/a.png", &mut || false)
+                .is_none()
+        );
+        assert!(assets.load("image.png", &mut || false).is_none());
         let mut doc = Document {
             blocks: vec![Block::Paragraph(vec![image("image.png")])],
         };
         assert!(prepare(&mut doc, &dir.path().join("test.md"), &mut || true).is_err());
+    }
+
+    #[test]
+    fn prepares_confined_svg_and_charges_intrinsics_and_each_occurrence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector.SVG");
+        fs::write(&path, r#"<svg xmlns="http://www.w3.org/2000/svg" width="4096" height="16"><rect width="2048" height="16" fill="red"/></svg>"#).unwrap();
+        let mut assets = Assets::new(dir.path());
+        assets.decoded_pixels = 4096 * 16;
+        assets.rendered_pixels = 2048 * 8 * 2;
+        assert!(assets.load("vector.SVG", &mut || false).is_some());
+        assert_eq!(assets.decoded_pixels, 0);
+        assert!(assets.load("%76ector.SVG", &mut || false).is_some());
+        assert!(assets.load("vector.SVG", &mut || false).is_none());
+        assert_eq!(
+            assets.source_bytes,
+            BUDGET - fs::metadata(&path).unwrap().len()
+        );
+        let pixels = image::load_from_memory(&assets.output[0].bytes)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(pixels.dimensions(), (2048, 8));
+        assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(pixels.get_pixel(2047, 0).0, [0, 0, 0, 0]);
+        let mut assets = Assets::new(dir.path());
+        assets.decoded_pixels = 4096 * 16 - 1;
+        assert!(assets.load("vector.SVG", &mut || false).is_none());
+        let mut assets = Assets::new(dir.path());
+        assets.encoded_bytes = 0;
+        assert!(assets.load("vector.SVG", &mut || false).is_none());
+        let mut assets = Assets::new(dir.path());
+        let mut checks = 0;
+        assert!(
+            assets
+                .load("vector.SVG", &mut || {
+                    checks += 1;
+                    checks >= 2
+                })
+                .is_none()
+        );
+        assert!(assets.output.is_empty());
+    }
+
+    #[test]
+    fn svg_resources_and_symlink_escape_fall_back_to_markdown_alt_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("outside.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.svg"),
+            dir.path().join("escape.svg"),
+        )
+        .unwrap();
+        fs::write(dir.path().join("unsafe.svg"), r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image href="data:image/svg+xml,%3Csvg/%3E" width="4" height="4"/></svg>"#).unwrap();
+        let mut doc = Document {
+            blocks: vec![Block::Paragraph(vec![
+                image("escape.svg"),
+                image("../outside.svg"),
+                image("unsafe.svg"),
+            ])],
+        };
+        assert!(
+            prepare(&mut doc, &dir.path().join("test.md"), &mut || false)
+                .unwrap()
+                .is_empty()
+        );
+        let Block::Paragraph(inlines) = &doc.blocks[0] else {
+            panic!()
+        };
+        assert!(inlines.iter().all(|inline| matches!(inline, Inline::Text(text) if text.contains("Image unavailable") && text.contains("description"))));
+    }
+
+    #[test]
+    fn markdown_composites_svg_transparency_over_the_rendered_background() {
+        use base64::Engine;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("vector.svg"), r#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="40" height="40" fill="red"/></svg>"#).unwrap();
+        let mut style = crate::render_theme::RenderedTheme::defaults(false);
+        style.background = "#123456".into();
+        let request = crate::markdown_renderer::RenderRequest {
+            path: dir.path().join("test.md"),
+            source: Arc::from("![description](vector.svg)"),
+            width: 320,
+            height: 180,
+            scroll_y: 0,
+            style: style.resolve(dir.path()).unwrap(),
+            annotations: Default::default(),
+        };
+        let page = crate::markdown_renderer::render_test_page(&request).unwrap();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(&*page.image.encoded)
+            .unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        let red: Vec<_> = image
+            .enumerate_pixels()
+            .filter(|(_, _, pixel)| pixel.0 == [255, 0, 0, 255])
+            .collect();
+        assert!(red.len() > 100);
+        let left = red.iter().map(|(x, _, _)| *x).min().unwrap();
+        let right = red.iter().map(|(x, _, _)| *x).max().unwrap();
+        let y = red[red.len() / 2].1;
+        assert_eq!(
+            image.get_pixel(right + (right - left) / 2, y).0,
+            [0x12, 0x34, 0x56, 255]
+        );
     }
 }

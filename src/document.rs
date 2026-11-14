@@ -442,6 +442,9 @@ fn syntax_for<'a>(
         .and_then(|name| name.to_str())
         .unwrap_or("");
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    if extension.eq_ignore_ascii_case("svg") {
+        return assets.syntaxes.find_syntax_by_extension("xml");
+    }
     if is_jsonc_config(path) {
         return assets.syntaxes.find_syntax_by_extension("jsonc");
     }

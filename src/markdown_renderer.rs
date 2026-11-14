@@ -107,8 +107,7 @@ fn worker_loop(shared: Arc<(Mutex<State>, Condvar)>) {
             let state = shared.0.lock().unwrap_or_else(|e| e.into_inner());
             state.shutdown || state.generation != generation
         };
-        let result = crate::media::ensure_terminal_support()
-            .and_then(|()| render(&request, &mut cache, &mut cancelled));
+        let result = render(&request, &mut cache, &mut cancelled);
         let mut state = shared.0.lock().unwrap_or_else(|e| e.into_inner());
         state.working = false;
         if state.shutdown {

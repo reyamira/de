@@ -58,7 +58,7 @@ pub fn render_editor_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .areas(area);
         frame.render_widget(Clear, header);
         frame.render_widget(
-            Paragraph::new(if app.is_markdown_source() {
+            Paragraph::new(if app.is_source_view() {
                 " Source"
             } else {
                 " Rendered Markdown"
@@ -657,6 +657,12 @@ fn viewer_details(app: &App, body: Rect, palette: &Palette) -> Vec<HeaderDetail>
             }
         }
     }
+    if app.preview_image().is_some() {
+        if let Some(total) = total {
+            details.push(HeaderDetail::new(count_label(total, "line", "lines"), 2));
+        }
+        return details;
+    }
     let Some(total) = total else {
         return details;
     };
@@ -899,6 +905,9 @@ fn render_preview(
         ),
         title,
     );
+    if app.preview_image().is_some() {
+        return;
+    }
 
     if app.preview().document().is_some() || app.preview().message().is_some() {
         let cached = viewer_text(app, list.width, palette);
@@ -1085,7 +1094,7 @@ pub fn preview_image_area(app: &App, area: Rect) -> Option<Rect> {
         let body = viewer_body(area);
         return (body.width > 0 && body.height > 0).then_some(body);
     }
-    app.preview().image()?;
+    app.preview_image()?;
     let image_area = if app.is_viewing() {
         viewer_body(area)
     } else {
@@ -1510,6 +1519,9 @@ fn source_geometry(
 }
 
 pub(crate) fn source_hit_test(app: &App, width: u16, column: u16, row: usize) -> Option<usize> {
+    if app.preview_image().is_some() {
+        return None;
+    }
     let cached = viewer_text(app, width, &app.theme().palette());
     let cells = cached.geometry.get(row)?;
     if cells.is_empty() {
@@ -2347,6 +2359,9 @@ fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Re
 }
 
 pub fn viewer_scroll_max(app: &App, area: Rect) -> usize {
+    if app.preview_image().is_some() {
+        return 0;
+    }
     if app.is_rendered_markdown_view() {
         return app.markdown_scroll_max();
     }
@@ -2390,10 +2405,16 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
         };
         let sample = app.theme_sample() != crate::ThemeSample::Picker;
         let mode = if markdown {
-            if app.is_markdown_source() {
+            if app.is_source_view() {
                 "source"
             } else {
                 "FMD rendered"
+            }
+        } else if app.is_svg() {
+            if app.is_source_view() {
+                "XML source"
+            } else {
+                "rendered SVG"
             }
         } else if app.supports_reading() {
             if app.is_reading() { "reading" } else { "raw" }
@@ -2446,11 +2467,11 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
                 " tab sample  m mode  ←→/↑↓ theme  pg↑↓ scroll  enter save  esc cancel"
             } else if app.theme_sample() != crate::ThemeSample::Picker {
                 " tab sample  m mode  arrows theme  ↵ save  esc"
-            } else if markdown && footer.width >= 72 {
+            } else if (markdown || app.is_svg()) && footer.width >= 72 {
                 " f size  / find  n/N next  y copy  e edit  m mode  q back  ↑↓ scroll"
-            } else if markdown && footer.width >= 42 {
+            } else if (markdown || app.is_svg()) && footer.width >= 42 {
                 " f size  e edit  m mode  q back  ↑↓"
-            } else if markdown {
+            } else if markdown || app.is_svg() {
                 "f size  m mode  q back"
             } else if app.supports_reading() && footer.width >= 64 {
                 " f size  / find  n/N next  y copy  e edit  R mode  q back  ↑↓"
@@ -2490,6 +2511,9 @@ fn render_viewer(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Palette
                 body,
             );
         }
+        return;
+    }
+    if app.preview_image().is_some() {
         return;
     }
     let cached = viewer_text(app, body.width, palette);
@@ -3179,7 +3203,7 @@ mod tests {
         app.open_viewer();
         let area = Rect::new(0, 0, 11, 5);
         assert!(viewer_scrollbar(&app, area).is_none());
-        app.toggle_markdown_source();
+        app.toggle_source_view();
         let bar = viewer_scrollbar(&app, area).unwrap();
         assert_eq!(viewer_body(area).width, 8);
         assert_eq!(bar.maximum, 1);
@@ -3208,7 +3232,7 @@ mod tests {
         for width in [25, 80] {
             let preview = preview_text_lines(&app, width, &palette, 0, usize::MAX, true);
             app.open_viewer();
-            app.toggle_markdown_source();
+            app.toggle_source_view();
             let source = preview_text_lines(&app, width, &palette, 0, usize::MAX, true);
             assert_eq!(preview, source);
             app.close_viewer();
@@ -3232,7 +3256,7 @@ mod tests {
         assert!(rendered.contains("m mode"));
         assert!(!rendered.contains("Some bold text"));
         assert!(!rendered.contains("**bold**"));
-        app.toggle_markdown_source();
+        app.toggle_source_view();
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let source = terminal.backend().to_string();
         assert!(source.contains("source"));
@@ -3541,7 +3565,7 @@ mod tests {
                 app.move_last();
                 app.open_viewer();
                 if source {
-                    app.toggle_markdown_source();
+                    app.toggle_source_view();
                 }
                 app.open_editor();
                 let area = Rect::new(0, 0, width, height);
@@ -3589,7 +3613,7 @@ mod tests {
                 }
                 app.handle_editor_key(termina::event::KeyCode::Escape.into(), rows);
                 assert!(app.editor().is_none() && app.is_viewing());
-                assert_eq!(app.is_markdown_source(), source);
+                assert_eq!(app.is_source_view(), source);
             }
         }
     }
@@ -4675,5 +4699,58 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 - 1), "1.0 MiB");
         assert_eq!(language_label("JavaScript (Babel)"), "JavaScript");
         assert_eq!(language_label("TypeScriptReact"), "TSX");
+    }
+
+    #[test]
+    fn svg_viewer_modes_show_xml_only_in_source_and_keep_highlighted_rows() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vector.SVG");
+        fs::write(&path, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"32\">\n<rect width=\"32\" height=\"32\" fill=\"red\"/>\n</svg>").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.open_viewer();
+        let mut terminal = Terminal::new(TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let unsupported = terminal.backend().to_string();
+        assert!(unsupported.contains("XML source"));
+        assert!(unsupported.contains("PNG"));
+        assert!(unsupported.contains("xmlns"));
+        assert!(unsupported.contains("m mode"));
+        let rows = app.preview().document().unwrap().lines.as_ptr();
+        assert_eq!(
+            crate::document::SourceSyntax::for_path(&path, "<svg>").name(),
+            Some("XML")
+        );
+        assert!(
+            app.preview()
+                .document()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.spans.len() > 2)
+        );
+        app.set_graphics_supported(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while app.image_pending() {
+            app.poll_preview();
+            assert!(std::time::Instant::now() < deadline, "SVG render timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("rendered SVG"));
+        assert!(!rendered.contains("xmlns"));
+        let area = Rect::new(0, 0, 100, 15);
+        assert!(preview_image_area(&app, area).is_some());
+        assert!(source_hit_test(&app, 80, 8, 0).is_none());
+        app.toggle_source_view();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let source = terminal.backend().to_string();
+        assert!(source.contains("XML source"));
+        assert!(source.contains("xmlns"));
+        assert!(preview_image_area(&app, area).is_none());
+        assert_eq!(app.preview().document().unwrap().lines.as_ptr(), rows);
+        app.toggle_source_view();
+        assert!(preview_image_area(&app, area).is_some());
+        assert_eq!(app.preview().document().unwrap().lines.as_ptr(), rows);
     }
 }
