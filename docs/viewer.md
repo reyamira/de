@@ -2,6 +2,24 @@
 
 Return to the [README](../README.md) for installation and navigation controls.
 
+## Opening a file at startup
+
+An exact existing path argument takes priority over fuzzy lookup.
+An existing directory opens in the browser.
+An existing file opens in the inline viewer, including an explicitly named hidden file such as `de .env`.
+From this viewer, `Escape` returns to the parent directory with that file selected.
+Direct file startup keeps the editor's file safety rules, including rejection of symbolic links.
+
+If the argument names no existing path, `de` starts interactive fuzzy lookup below the current directory.
+Lookup starts with `Files & folders`, not content search.
+It always requires interactive selection, even when only one result matches.
+`Enter` chooses a folder or opens a file.
+From that file viewer, `Escape` returns to lookup results.
+In startup lookup, `Escape` exits without changing the shell's working directory.
+Lookup uses the search policies and limits below, with no global index.
+
+## Supported files and viewer controls
+
 The right pane and inline viewer support these file types:
 
 - **Markdown:** `.md`, `.markdown`, `.mdown`, and `.markdn` share Markdown behavior.
@@ -265,21 +283,30 @@ File data is synced before replacement; directory-entry crash durability is not 
 
 Search runs in one background worker below the folder where search started.
 New queries cancel old work, and stale results cannot replace current results.
-Names and text use literal case-insensitive matching.
+Names use case-insensitive fuzzy matching. Content uses literal, case-insensitive matching.
+Neither uses regular expressions.
+In-file viewer find remains literal.
 The browser offers `Both`, `Files & folders`, and `Content` scopes.
-`Both` is the initial scope.
+For `/` search, `Both` is the initial scope.
+Startup lookup starts in `Files & folders`.
 During search input, `Shift+Tab` cycles scopes without clearing the query.
 The app remembers the scope for the current session, not in configuration.
 The header shows only `/ query▏`, with the query tail visible on narrow terminals.
 The footer shows only the active mode and its `Shift+Tab` control.
 `Up`, `Down`, `PageUp`, `PageDown`, `Home`, and `End` select only filtered results.
 `Left`, `Right`, and plain `Tab` do not browse folders during search.
-Press `Escape` before using folder-browsing keys.
-`Escape` restores the folder and selection from before search.
-`Enter` still chooses the selected folder or opens the selected file at its first match.
+During ordinary `/` search, press `Escape` before using folder-browsing keys.
+For `/` search, `Escape` restores the folder and selection from before search.
+For startup lookup, `Escape` exits without changing the shell's working directory.
+`Enter` chooses the selected folder or opens the selected file in the viewer.
+For content results, the viewer opens at the exact source match.
 From a viewer, `Escape` first returns to search.
-Name matching still uses the full relative path, including parent directory names.
-Content matching uses original source text.
+Name matching uses the full relative path, including parent directory names.
+Exact basename or relative-path matches rank first, then substring matches, then other fuzzy matches.
+Other fuzzy matches use characters in order without requiring adjacent characters.
+Name highlights mark original matched characters, including nonadjacent characters in UTF-8 names.
+Content matching uses literal original source text.
+`Both` combines fuzzy name matches with literal content matches.
 Each matching original line produces one content result.
 Results highlight matching excerpt text and retain exact original-byte activation targets.
 Each excerpt contains up to 240 source characters around the first match.
@@ -296,13 +323,16 @@ Unselected matches use the theme accent and underlines.
 Long paths retain the basename when space permits.
 Excerpt windows keep the first match visible without splitting Unicode graphemes.
 Selecting a content-only file header opens its first matching source line.
-Source and rendered previews highlight all matches in the loaded document.
+Content-search previews highlight all literal matches in the loaded document.
 The search skips file contents above 1 MiB or 20,000 logical lines, including an empty final line.
 It skips binary, non-UTF-8, and symlink contents without hiding matching names.
 It respects ignore rules and hides dotfiles unless the current hidden setting enables them.
 It does not traverse directory symlinks.
-Results are ordered by path, then header, then source line.
+Ranking keeps each file's header and matching source lines together.
+Within each file, content results follow source-line order.
 The result limit is 10,000 name and line matches, excluding content-only file headers.
+Ranking covers only collected results within this limit, not all possible matches below the search folder.
+Search uses no global index.
 The footer prioritizes the active mode and its control, and retains the result-limit warning.
 It adds name, line, and content-file counts, progress, scanned paths, and `Esc` when space permits.
 On narrow terminals, `N`, `L`, `F`, and `S` mean names, lines, content files, and scanned paths.

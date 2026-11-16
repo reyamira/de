@@ -843,7 +843,11 @@ fn render_current_entries(
         ));
     }
 
-    let matcher = crate::matching::LiteralMatcher::new(app.search_query());
+    let matcher = crate::matching::LiteralMatcher::new(if app.search_counts().1 > 0 {
+        app.search_query()
+    } else {
+        ""
+    });
     for (index, entry) in app
         .entries()
         .iter()
@@ -1655,7 +1659,7 @@ fn search_result_line(
             first,
             text_width,
             base,
-            Some(matcher),
+            Some(SearchHighlight::Literal(matcher)),
             matched,
         );
     } else {
@@ -1687,9 +1691,27 @@ fn search_result_line(
         } else {
             base
         };
-        let highlight = (hit.kind == SearchHitKind::Name).then_some(matcher);
-        let directory_match =
-            hit.kind == SearchHitKind::Name && hit.first_match.start < basename_start;
+        let highlight = (hit.kind == SearchHitKind::Name).then_some(SearchHighlight::Name {
+            ranges: &hit.name_ranges,
+            offset: 0,
+        });
+        let directory_match = hit.kind == SearchHitKind::Name
+            && hit
+                .name_ranges
+                .first()
+                .is_some_and(|range| range.start < basename_start);
+        let basename_match = if hit.kind == SearchHitKind::Name {
+            hit.name_ranges
+                .iter()
+                .find(|range| range.end > basename_start)
+                .map(|range| {
+                    range.start.saturating_sub(basename_start)
+                        ..range.end.saturating_sub(basename_start)
+                })
+                .unwrap_or(0..0)
+        } else {
+            0..0
+        };
         let directory_reserve = if directory_match {
             let match_end = hit.first_match.end.min(directory.len());
             let match_width = UnicodeWidthStr::width(&directory[hit.first_match.start..match_end]);
@@ -1700,19 +1722,14 @@ fn search_result_line(
             0
         };
         if basename_width >= path_width && !directory_match {
-            let first = if hit.kind == SearchHitKind::Name {
-                hit.first_match.start.saturating_sub(basename_start)
-                    ..hit.first_match.end.saturating_sub(basename_start)
-            } else {
-                0..0
-            };
+            let first = basename_match.clone();
             append_search_window(
                 &mut spans,
                 basename,
                 first,
                 path_width,
                 header_style,
-                highlight,
+                highlight.map(|highlight| highlight.at(basename_start)),
                 matched,
             );
         } else {
@@ -1736,9 +1753,11 @@ fn search_result_line(
                     highlight,
                     matched,
                 );
-                let slash_style = if highlight.is_some()
-                    && hit.first_match.start < basename_start
-                    && hit.first_match.end >= basename_start
+                let slash_style = if hit.kind == SearchHitKind::Name
+                    && hit
+                        .name_ranges
+                        .iter()
+                        .any(|range| range.contains(&(basename_start - 1)))
                 {
                     matched
                 } else {
@@ -1746,15 +1765,14 @@ fn search_result_line(
                 };
                 spans.push(Span::styled("/", slash_style));
             }
-            let first = hit.first_match.start.saturating_sub(basename_start)
-                ..hit.first_match.end.saturating_sub(basename_start);
+            let first = basename_match;
             append_search_window(
                 &mut spans,
                 basename,
                 first,
                 basename_budget,
                 header_style,
-                highlight,
+                highlight.map(|highlight| highlight.at(basename_start)),
                 matched,
             );
         }
@@ -1838,13 +1856,31 @@ fn search_window(source: &str, first: std::ops::Range<usize>, width: usize) -> S
     window
 }
 
+#[derive(Clone, Copy)]
+enum SearchHighlight<'a> {
+    Literal(&'a crate::matching::LiteralMatcher),
+    Name {
+        ranges: &'a [std::ops::Range<usize>],
+        offset: usize,
+    },
+}
+
+impl SearchHighlight<'_> {
+    fn at(self, offset: usize) -> Self {
+        match self {
+            Self::Name { ranges, .. } => Self::Name { ranges, offset },
+            literal => literal,
+        }
+    }
+}
+
 fn append_search_window(
     spans: &mut Vec<Span<'static>>,
     source: &str,
     first: std::ops::Range<usize>,
     width: usize,
     style: Style,
-    matcher: Option<&crate::matching::LiteralMatcher>,
+    highlight: Option<SearchHighlight<'_>>,
     matched_style: Style,
 ) {
     use unicode_segmentation::UnicodeSegmentation;
@@ -1854,13 +1890,29 @@ fn append_search_window(
     if window.before {
         spans.push(Span::styled("…", style));
     }
-    let ranges = matcher.map_or_else(Vec::new, |matcher| matcher.ranges(source));
+    let literal_ranges = match highlight {
+        Some(SearchHighlight::Literal(matcher)) => matcher.ranges(source),
+        _ => Vec::new(),
+    };
+    let (ranges, offset) = match highlight {
+        Some(SearchHighlight::Name { ranges, offset }) => (ranges, offset),
+        _ => (literal_ranges.as_slice(), 0),
+    };
+    let mut range_index = ranges.partition_point(|range| range.end <= offset + start);
     for (byte, grapheme) in source[start..end].grapheme_indices(true) {
         let byte = byte + start;
-        let matched = matcher.is_some()
-            && std::iter::once(&first)
-                .chain(ranges.iter())
-                .any(|range| range.start < byte + grapheme.len() && byte < range.end);
+        while ranges
+            .get(range_index)
+            .is_some_and(|range| range.end <= offset + byte)
+        {
+            range_index += 1;
+        }
+        let matched = (matches!(highlight, Some(SearchHighlight::Literal(_)))
+            && first.start < byte + grapheme.len()
+            && byte < first.end)
+            || ranges
+                .get(range_index)
+                .is_some_and(|range| range.start < offset + byte + grapheme.len());
         let style = if matched { matched_style } else { style };
         if let Some(last) = spans.last_mut().filter(|last| last.style == style) {
             last.content.to_mut().push_str(grapheme);
@@ -2320,9 +2372,17 @@ fn render_file_editor(frame: &mut Frame<'_>, app: &App, area: Rect, palette: &Pa
 
 fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Ref<'a, ViewerText> {
     let reading = app.is_reading();
+    let browser_query = if app
+        .search_hit(app.selected())
+        .is_some_and(|hit| hit.line.is_some())
+    {
+        app.search_query()
+    } else {
+        ""
+    };
     let cache = app.viewer_text_cache();
     let needs_rebuild = cache.borrow().as_ref().is_none_or(|text| {
-        text.width != width || text.reading != reading || text.browser_query != app.search_query()
+        text.width != width || text.reading != reading || text.browser_query != browser_query
     });
     if needs_rebuild {
         let (rows, source_rows, geometry) = if app
@@ -2349,9 +2409,9 @@ fn viewer_text<'a>(app: &'a App, width: u16, palette: &Palette) -> std::cell::Re
             rows,
             source_rows,
             geometry,
-            browser_query: app.search_query().to_owned(),
+            browser_query: browser_query.to_owned(),
             browser_matches: app.preview().document().map_or_else(Vec::new, |doc| {
-                crate::matching::LiteralMatcher::new(app.search_query()).ranges(&doc.source)
+                crate::matching::LiteralMatcher::new(browser_query).ranges(&doc.source)
             }),
         });
     }
@@ -2613,7 +2673,15 @@ fn search_footer(app: &App, width: usize, palette: &Palette) -> Paragraph<'stati
         format!("{} paths scanned", app.search_scanned()),
         format!("S:{}", app.search_scanned()),
     );
-    append("Esc restore".to_owned(), "Esc".to_owned());
+    append(
+        if app.is_startup_lookup() {
+            "Esc cancel"
+        } else {
+            "Esc restore"
+        }
+        .to_owned(),
+        "Esc".to_owned(),
+    );
     if !limit.is_empty() {
         spans.push(key(limit, palette));
     }
@@ -4364,6 +4432,8 @@ mod tests {
             excerpt: source,
             first_match: 61..63,
             excerpt_start: 0,
+            name_rank: None,
+            name_ranges: Vec::new(),
         };
         let line = search_result_line(
             "42.txt",
@@ -4435,6 +4505,7 @@ mod tests {
             kind: SearchHitKind::Name,
             line: None,
             first_match: 0..6,
+            name_ranges: std::iter::once(0..6).collect(),
             ..hit.clone()
         };
         let line = search_result_line(
@@ -4504,6 +4575,66 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_name_highlights_keep_noncontiguous_original_utf8_bytes() {
+        use crate::search::{SearchHit, SearchHitKind};
+        let name = "Σx/İy界.txt";
+        let matched = crate::matching::NameMatcher::new("σ/i界")
+            .find(name)
+            .unwrap();
+        assert_eq!(matched.ranges, vec![0..2, 3..6, 7..10]);
+        let sigma = crate::matching::NameMatcher::new("ΟΣ").find("ΟΣ").unwrap();
+        assert_eq!(sigma.ranges, vec![0..4]);
+        assert!(crate::matching::NameMatcher::new("οσ").find("ΟΣ").is_none());
+        let hit = SearchHit {
+            kind: SearchHitKind::Name,
+            path: name.into(),
+            is_dir: false,
+            is_symlink: false,
+            line: None,
+            excerpt: name.into(),
+            first_match: matched.ranges[0].clone(),
+            name_rank: Some(matched.rank),
+            name_ranges: matched.ranges,
+            excerpt_start: 0,
+        };
+        let palette = crate::Theme::auto().palette();
+        let line = search_result_line(
+            name,
+            &hit,
+            0,
+            40,
+            false,
+            &palette,
+            &crate::matching::LiteralMatcher::new("σ/i界"),
+        );
+        let highlighted: String = line
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, "Σ/İ界");
+        for width in [5, 8, 14] {
+            let line = search_result_line(
+                name,
+                &hit,
+                0,
+                width,
+                false,
+                &palette,
+                &crate::matching::LiteralMatcher::new("σ/i界"),
+            );
+            assert!(line.width() <= width);
+            assert!(
+                line.spans
+                    .iter()
+                    .filter(|span| span.content.contains('x') || span.content.contains('y'))
+                    .all(|span| !span.style.add_modifier.contains(Modifier::UNDERLINED))
+            );
+        }
+    }
+
+    #[test]
     fn search_selection_keeps_effective_contrast_across_matches_gutters_and_padding() {
         use crate::search::{SearchHit, SearchHitKind};
         use ratatui::style::Color;
@@ -4518,6 +4649,8 @@ mod tests {
             excerpt: String::new(),
             first_match: 0..7,
             excerpt_start: 0,
+            name_rank: None,
+            name_ranges: vec![0..6, 7..13],
         };
         let fixtures = [
             ("needle/needle-file.txt", hit.clone()),

@@ -1,6 +1,7 @@
 //! Bounded, cancellable recursive name and UTF-8 source search.
 
-use crate::matching::LiteralMatcher;
+pub use crate::matching::NameRank;
+use crate::matching::{LiteralMatcher, NameMatcher};
 use ignore::WalkBuilder;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -67,6 +68,11 @@ pub struct SearchHit {
     /// First original UTF-8 match range, relative to the full source line.
     /// Name-hit ranges are relative to the displayed path instead.
     pub first_match: Range<usize>,
+    /// Cached fuzzy-name rank, shared by every row in this path's group.
+    pub name_rank: Option<NameRank>,
+    /// Fuzzy name matches in the displayed relative path's original UTF-8 bytes.
+    /// Content rows keep this empty and use literal matches instead.
+    pub name_ranges: Vec<Range<usize>>,
     /// Original UTF-8 byte offset of the excerpt within the source line.
     pub excerpt_start: usize,
 }
@@ -122,7 +128,7 @@ impl SearchWorker {
         Self { shared }
     }
 
-    /// Replace the current search. Relative path names and contents use lowercase matching.
+    /// Replace the search. Names use fuzzy matching; contents use literal matching.
     pub fn request(
         &mut self,
         root: PathBuf,
@@ -310,6 +316,7 @@ fn search(shared: &Shared, request: Request) {
         last_publish: Instant::now(),
     };
     let matcher = LiteralMatcher::new(&request.query);
+    let mut name_matcher = NameMatcher::new(&request.query);
 
     // Only an explicitly selected directory root may resolve through a symlink.
     if let Ok(metadata) = std::fs::symlink_metadata(&request.root)
@@ -324,7 +331,7 @@ fn search(shared: &Shared, request: Request) {
                 .unwrap_or(request.root.as_os_str())
                 .to_string_lossy()
                 .into_owned();
-            if let Some(first_match) = matcher.first(&name)
+            if let Some(matched) = name_matcher.find(&name)
                 && !run.push(
                     SearchHit {
                         kind: SearchHitKind::Name,
@@ -333,7 +340,9 @@ fn search(shared: &Shared, request: Request) {
                         is_symlink: true,
                         line: None,
                         excerpt: name,
-                        first_match,
+                        first_match: matched.ranges[0].clone(),
+                        name_rank: Some(matched.rank),
+                        name_ranges: matched.ranges,
                         excerpt_start: 0,
                     },
                     None,
@@ -393,26 +402,35 @@ fn search(shared: &Shared, request: Request) {
             }
         };
         let mut has_header = false;
-        if request.scope != SearchScope::Content {
-            let name = relative.to_string_lossy();
-            if let Some(first_match) = matcher.first(&name) {
-                if !run.push(
-                    SearchHit {
-                        kind: SearchHitKind::Name,
-                        path: logical_path(),
-                        is_dir,
-                        is_symlink,
-                        line: None,
-                        excerpt: name.into_owned(),
-                        first_match,
-                        excerpt_start: 0,
-                    },
-                    None,
-                ) {
-                    return;
-                }
-                has_header = true;
+        let name = relative.to_string_lossy();
+        let (name_match, name_rank) = if request.scope == SearchScope::Content {
+            (None, name_matcher.rank(&name))
+        } else {
+            let matched = name_matcher.find(&name);
+            let rank = matched.as_ref().map(|matched| matched.rank);
+            (matched, rank)
+        };
+        if request.scope != SearchScope::Content
+            && let Some(matched) = name_match
+        {
+            if !run.push(
+                SearchHit {
+                    kind: SearchHitKind::Name,
+                    path: logical_path(),
+                    is_dir,
+                    is_symlink,
+                    line: None,
+                    excerpt: name.into_owned(),
+                    first_match: matched.ranges[0].clone(),
+                    name_rank,
+                    name_ranges: matched.ranges,
+                    excerpt_start: 0,
+                },
+                None,
+            ) {
+                return;
             }
+            has_header = true;
         }
         if request.scope != SearchScope::Names
             && file_type.is_file()
@@ -454,6 +472,8 @@ fn search(shared: &Shared, request: Request) {
                                 line: Some(index + 1),
                                 excerpt: String::new(),
                                 first_match: first_match.clone(),
+                                name_rank,
+                                name_ranges: Vec::new(),
                                 excerpt_start: 0,
                             })
                         };
@@ -467,6 +487,8 @@ fn search(shared: &Shared, request: Request) {
                                 line: Some(index + 1),
                                 excerpt,
                                 first_match,
+                                name_rank,
+                                name_ranges: Vec::new(),
                                 excerpt_start,
                             },
                             header,

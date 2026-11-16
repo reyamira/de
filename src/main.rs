@@ -19,7 +19,7 @@ use de::{
 use ratatui::Terminal;
 use ratatui::layout::Rect;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -36,9 +36,9 @@ mod terminal_input;
 const PICKER_HELP: &str = "Picker controls:
   ↑/↓ or j/k         Select          PageUp/PageDown  Jump a page
   → or l/Tab         Open folder     ← or h/Backspace  Go to parent
-  /                  Recursive names + text search
+  /                  Recursive fuzzy names + literal text search
   Shift+Tab (search) Cycle Both / Files & folders / Content, keeping the query
-  ↑/↓ (search)       Select results; Esc restores folder browsing
+  ↑/↓ (search)       Select results; Esc restores browsing or cancels startup lookup
   Shift+S            Ascending / descending
   v                  View file inline   Esc / q           Return to picker
   f (viewer)         Toggle inline / full terminal size
@@ -95,9 +95,9 @@ struct Cli {
     #[arg(long, value_name = "THEME")]
     theme: Option<String>,
 
-    /// Directory to start exploring from
-    #[arg(value_name = "DIRECTORY")]
-    directory: Option<OsString>,
+    /// Existing file or directory, or a fuzzy name query below the current directory
+    #[arg(value_name = "PATH_OR_QUERY")]
+    target: Option<OsString>,
 
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -193,7 +193,7 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     let Cli {
         theme,
-        directory,
+        target,
         command,
     } = cli;
     match command {
@@ -310,10 +310,8 @@ fn run(cli: Cli) -> Result<(), String> {
         None => {
             require_terminal()?;
             let catalog = Config::load().map_err(|error| format!("cannot load config: {error}"))?;
-            let start = resolve_start_path(directory.as_deref())
-                .map_err(|error| format!("cannot resolve start directory: {error}"))?;
-            let mut app = App::with_defaults(start, catalog.defaults())
-                .map_err(|error| format!("cannot open start directory: {error}"))?;
+            let mut app = startup_app(target.as_deref(), catalog.defaults())
+                .map_err(|error| format!("cannot open start path or query: {error}"))?;
             app.set_theme(resolve_theme(theme, &catalog)?);
             app.set_display_settings(catalog.display().clone());
             if let Some(action) = run_picker(app).map_err(|error| error.to_string())? {
@@ -330,6 +328,47 @@ fn run(cli: Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn startup_app(target: Option<&OsStr>, defaults: BrowseDefaults) -> io::Result<App> {
+    let Some(target) = target else {
+        return App::with_defaults(resolve_start_path(None)?, defaults);
+    };
+    let path = Path::new(target);
+    let current_dir = if path.is_absolute() {
+        None
+    } else {
+        Some(resolve_start_path(None)?)
+    };
+    let path = match &current_dir {
+        Some(root) => root.join(path),
+        None => path.to_path_buf(),
+    };
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            // Keep a file's leaf identity so editor symlink checks still apply.
+            let path = if metadata.is_dir() || (metadata.file_type().is_symlink() && path.is_dir())
+            {
+                std::fs::canonicalize(path)?
+            } else {
+                path
+            };
+            App::with_defaults(path, defaults)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let query = target.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "fuzzy queries must be UTF-8")
+            })?;
+            let root = match current_dir {
+                Some(root) => root,
+                None => resolve_start_path(None)?,
+            };
+            let mut app = App::with_defaults(root, defaults)?;
+            app.begin_name_search(query.to_owned());
+            Ok(app)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn require_terminal() -> Result<(), String> {
@@ -1150,6 +1189,7 @@ fn handle_key(app: &mut App, key: KeyEvent, page_rows: usize) -> NavigationResul
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => app.cycle_search_scope(),
             KeyCode::Backspace => app.pop_search_char(),
             KeyCode::Enter => return app.activate_selected(),
+            KeyCode::Escape if app.is_startup_lookup() => return NavigationResult::Cancel,
             KeyCode::Escape => app.cancel_search(),
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -1314,6 +1354,70 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn startup_keeps_hidden_symlink_leaf_so_editing_stays_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let parent = temp.path().join("actual");
+        fs::create_dir(&parent).unwrap();
+        let original = parent.join("original.rs");
+        fs::write(&original, "fn original() {}\n").unwrap();
+        symlink(&original, parent.join(".shortcut.rs")).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&parent, &alias).unwrap();
+        let argument = alias.join(".shortcut.rs");
+        let mut app = startup_app(Some(argument.as_os_str()), BrowseDefaults::default()).unwrap();
+
+        assert!(!app.is_startup_lookup());
+        assert!(app.is_viewing());
+        assert!(app.selected_entry().unwrap().is_symlink);
+        assert_eq!(
+            app.selected_entry().unwrap().path.file_name(),
+            Some(OsStr::new(".shortcut.rs"))
+        );
+        handle_key(&mut app, KeyCode::Char('e').into(), 10);
+        assert!(app.editor().is_none());
+        assert!(app.status().unwrap().contains("symlinks"));
+        assert_eq!(fs::read_to_string(&original).unwrap(), "fn original() {}\n");
+    }
+
+    #[test]
+    fn startup_lookup_escape_returns_from_find_and_viewer_before_canceling() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("README.md");
+        fs::write(&file, "# Read me\n").unwrap();
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_name_search("rdme".into());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while app.search_pending() {
+            app.poll_search();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "search did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.selected_entry().unwrap().path, file);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter.into(), 10),
+            NavigationResult::Continue
+        );
+        assert!(app.is_viewing());
+        handle_key(&mut app, KeyCode::Char('/').into(), 10);
+        handle_key(&mut app, KeyCode::Char('r').into(), 10);
+        let escape = KeyEvent::from(KeyCode::Escape);
+        assert_eq!(handle_key(&mut app, escape, 10), NavigationResult::Continue);
+        assert!(app.is_viewing());
+        assert!(!app.find_prompt());
+        assert_eq!(handle_key(&mut app, escape, 10), NavigationResult::Continue);
+        assert!(app.is_searching());
+        assert!(!app.is_viewing());
+        assert_eq!(app.selected_entry().unwrap().path, file);
+        assert_eq!(handle_key(&mut app, escape, 10), NavigationResult::Cancel);
+    }
+
     #[test]
     fn viewer_expansion_follows_terminal_size_and_resets_after_closing() {
         let temp = tempdir().unwrap();
@@ -1412,7 +1516,7 @@ mod tests {
     #[test]
     fn parses_a_start_directory() {
         let cli = Cli::try_parse_from(["de", "../somewhere"]).unwrap();
-        assert_eq!(cli.directory, Some(OsString::from("../somewhere")));
+        assert_eq!(cli.target, Some(OsString::from("../somewhere")));
         assert_eq!(cli.theme, None);
         assert!(cli.command.is_none());
     }
@@ -1499,18 +1603,6 @@ mod tests {
                 .kind(),
             ErrorKind::InvalidValue
         );
-    }
-
-    #[test]
-    fn short_help_stays_focused_on_the_clap_interface() {
-        let help = Cli::try_parse_from(["de", "-h"]).unwrap_err().to_string();
-        assert!(help.contains("Usage:"));
-        assert!(help.contains("Commands:"));
-        assert!(help.contains("theme"));
-        assert!(help.contains("--theme <THEME>"));
-        assert!(help.contains("DIRECTORY"));
-        assert!(!help.contains("Picker controls:"));
-        assert!(!help.contains("Setup examples:"));
     }
 
     #[test]

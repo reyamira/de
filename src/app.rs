@@ -188,6 +188,7 @@ pub struct App {
     status: Option<String>,
     preview: Preview,
     search_query: String,
+    startup_lookup: bool,
     search_scope: crate::search::SearchScope,
     search_snapshot: Option<SearchSnapshot>,
     search_worker: crate::search::SearchWorker,
@@ -235,24 +236,66 @@ impl App {
     }
 
     pub fn with_defaults(start: PathBuf, defaults: BrowseDefaults) -> io::Result<Self> {
-        if !start.is_dir() {
+        let metadata = fs::metadata(&start)?;
+        let target = if metadata.is_dir() {
+            None
+        } else if metadata.is_file() {
+            Some(
+                start
+                    .file_name()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "file path has no name")
+                    })?
+                    .to_os_string(),
+            )
+        } else {
             return Err(io::Error::new(
-                io::ErrorKind::NotADirectory,
-                format!("not a directory: {}", start.display()),
+                io::ErrorKind::InvalidInput,
+                format!("not a regular file or directory: {}", start.display()),
             ));
-        }
+        };
+        let directory = if target.is_some() {
+            start
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        } else {
+            start
+        };
 
         let BrowseDefaults {
             show_hidden,
             sort_mode,
             sort_direction,
         } = defaults;
-        let entries = read_entries(&start, show_hidden, sort_mode, sort_direction)?;
+        let mut entries = read_entries(&directory, show_hidden, sort_mode, sort_direction)?;
+        if let Some(name) = target.as_ref()
+            && !entries.iter().any(|entry| entry.name == *name)
+        {
+            // An explicit hidden target is visible only in this listing. Do not
+            // change the user's hidden-file default or resolve the leaf symlink.
+            let path = directory.join(name);
+            let is_symlink = fs::symlink_metadata(&path)?.file_type().is_symlink();
+            entries.push(Entry {
+                name: name.clone(),
+                path,
+                is_dir: false,
+                is_symlink,
+                modified: metadata.modified().ok(),
+                size: (!is_symlink).then_some(metadata.len()),
+            });
+            sort_entries(&mut entries, sort_mode, sort_direction);
+        }
+        let selected = target
+            .as_ref()
+            .and_then(|name| entries.iter().position(|entry| entry.name == *name))
+            .unwrap_or(0);
         let mut app = Self {
-            current_dir: start,
+            current_dir: directory,
             all_entries: entries.clone(),
             entries,
-            selected: 0,
+            selected,
             show_hidden,
             status: None,
             preview: Preview {
@@ -265,6 +308,7 @@ impl App {
                 details: None,
             },
             search_query: String::new(),
+            startup_lookup: false,
             search_scope: crate::search::SearchScope::default(),
             search_snapshot: None,
             search_worker: crate::search::SearchWorker::new(),
@@ -306,6 +350,9 @@ impl App {
             browser_target: None,
         };
         app.refresh_preview();
+        if target.is_some() {
+            app.open_viewer();
+        }
         Ok(app)
     }
 
@@ -746,7 +793,7 @@ impl App {
                 self.viewer_source_line = self.selected_search_hit().and_then(|hit| hit.line);
                 self.source_view = self.is_svg() && self.viewer_source_line.is_some();
                 self.reading = false;
-                if self.is_searching() {
+                if self.viewer_source_line.is_some() {
                     self.find.query = self.search_query.clone();
                     self.update_find_matches();
                     self.reveal_match = self.browser_target.is_some();
@@ -793,6 +840,10 @@ impl App {
 
     pub fn is_searching(&self) -> bool {
         self.search_snapshot.is_some()
+    }
+
+    pub fn is_startup_lookup(&self) -> bool {
+        self.is_searching() && self.startup_lookup
     }
 
     pub fn search_query(&self) -> &str {
@@ -1345,6 +1396,7 @@ impl App {
         if self.is_searching() {
             return;
         }
+        self.startup_lookup = false;
         self.search_snapshot = Some(SearchSnapshot {
             current_dir: self.current_dir.clone(),
             entries: self.entries.clone(),
@@ -1352,6 +1404,22 @@ impl App {
             selected: self.selected,
         });
         self.search_query.clear();
+        self.request_search();
+    }
+
+    /// Start one names-only lookup with the complete startup query.
+    pub fn begin_name_search(&mut self, query: String) {
+        if !self.is_searching() {
+            self.search_snapshot = Some(SearchSnapshot {
+                current_dir: self.current_dir.clone(),
+                entries: self.entries.clone(),
+                all_entries: self.all_entries.clone(),
+                selected: self.selected,
+            });
+        }
+        self.startup_lookup = true;
+        self.search_scope = crate::search::SearchScope::Names;
+        self.search_query = query;
         self.request_search();
     }
 
@@ -1366,6 +1434,7 @@ impl App {
     }
 
     pub fn cancel_search(&mut self) {
+        self.startup_lookup = false;
         self.search_worker.cancel();
         self.search_generation = None;
         self.search_hits.clear();
@@ -1441,10 +1510,13 @@ impl App {
         for hit in hits {
             let position = self.search_hits.binary_search_by(|existing| {
                 existing
-                    .path
-                    .cmp(&hit.path)
-                    .then(existing.kind.cmp(&hit.kind))
-                    .then(existing.line.cmp(&hit.line))
+                    .name_rank
+                    .is_none()
+                    .cmp(&hit.name_rank.is_none())
+                    .then_with(|| existing.name_rank.cmp(&hit.name_rank))
+                    .then_with(|| existing.path.cmp(&hit.path))
+                    .then_with(|| existing.kind.cmp(&hit.kind))
+                    .then_with(|| existing.line.cmp(&hit.line))
             });
             let Err(index) = position else {
                 continue;
@@ -1489,9 +1561,14 @@ impl App {
         };
         let start = self
             .search_hits
-            .partition_point(|hit| hit.path < anchor.path);
-        let end = start + self.search_hits[start..].partition_point(|hit| hit.path == anchor.path);
-        let group = &self.search_hits[start..end];
+            .iter()
+            .position(|hit| hit.path == anchor.path);
+        let (start, group) = if let Some(start) = start {
+            let length = self.search_hits[start..].partition_point(|hit| hit.path == anchor.path);
+            (start, &self.search_hits[start..start + length])
+        } else {
+            (0, &self.search_hits[0..0])
+        };
         let desired = group.iter().position(|hit| match self.search_scope {
             SearchScope::Names => hit.kind == SearchHitKind::Name,
             SearchScope::Content if anchor.kind == SearchHitKind::Name => {
@@ -2319,6 +2396,64 @@ mod tests {
     }
 
     #[test]
+    fn direct_hidden_file_startup_keeps_selection_without_changing_defaults() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join(".target.txt");
+        fs::write(&target, "target source").unwrap();
+        fs::write(temp.path().join(".other.txt"), "other").unwrap();
+        fs::write(temp.path().join("visible.txt"), "visible").unwrap();
+        let defaults = BrowseDefaults::default();
+        let mut app = App::with_defaults(target.clone(), defaults).unwrap();
+        assert!(app.is_viewing());
+        assert_eq!(app.current_dir(), temp.path());
+        assert_eq!(app.selected_entry().unwrap().path, target);
+        assert_eq!(
+            app.preview().document().unwrap().source.as_ref(),
+            "target source"
+        );
+        assert_eq!(app.browse_defaults(), defaults);
+        assert!(!app.entries().iter().any(|entry| entry.name == ".other.txt"));
+        app.close_viewer();
+        assert_eq!(app.selected_entry().unwrap().path, target);
+        app.begin_name_search("visible".into());
+        finish_search(&mut app);
+        app.cancel_search();
+        assert_eq!(app.selected_entry().unwrap().path, target);
+        assert_eq!(app.browse_defaults(), defaults);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_hidden_symlink_startup_keeps_the_link_identity() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.txt");
+        let link = temp.path().join(".alias.txt");
+        fs::write(&source, "source").unwrap();
+        symlink(&source, &link).unwrap();
+        let mut app = App::new(link.clone()).unwrap();
+        assert!(app.is_viewing());
+        assert!(app.selected_entry().unwrap().is_symlink);
+        assert_eq!(app.selected_entry().unwrap().path, link);
+        assert!(!app.show_hidden());
+        app.close_viewer();
+        assert_eq!(app.selected_entry().unwrap().path, link);
+        app.open_editor();
+        assert!(app.editor().is_none());
+        assert!(app.status().unwrap().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_special_file_startup_is_rejected_before_preview() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("socket.png");
+        let _socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let error = App::new(path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn toggling_hidden_preserves_selection() {
         let (_temp, mut app) = fixture();
         app.move_down();
@@ -2758,8 +2893,8 @@ mod tests {
         for index in 0..260 {
             fs::write(temp.path().join(format!("a/needle-{index:03}.txt")), "text").unwrap();
         }
-        // DFS finds this later, but path ordering puts it before a/needle-*.
-        fs::write(temp.path().join("a.needle"), "text").unwrap();
+        // DFS finds this exact match later; ranking puts it before a/needle-*.
+        fs::write(temp.path().join("needle"), "text").unwrap();
         let mut app = App::new(temp.path().to_path_buf()).unwrap();
         app.begin_search();
         for ch in "needle".chars() {
@@ -2802,6 +2937,12 @@ mod tests {
             .unwrap();
         assert_eq!(app.search_file_line_count(name), 2);
         assert_eq!(app.search_file_line_count(name + 1), 0);
+        app.selected = app
+            .search_hits
+            .iter()
+            .position(|hit| hit.path.ends_with("needle-folder") && hit.kind == SearchHitKind::Name)
+            .unwrap();
+        app.refresh_preview();
 
         // An unmatched directory has no content row: completion falls back to the first group.
         app.cycle_search_scope();
@@ -2838,6 +2979,76 @@ mod tests {
         app.paste("plain");
         finish_search(&mut app);
         assert_eq!(app.search_counts(), (0, 1, 1));
+    }
+
+    #[test]
+    fn fuzzy_groups_rank_names_and_keep_literal_content_targets_across_scopes() {
+        use crate::search::{SearchHitKind, SearchScope};
+        let temp = tempdir().unwrap();
+        for name in ["needle", "a-needle.txt", "n-e-e-d-l-e.txt", "other.txt"] {
+            fs::write(temp.path().join(name), "λ needle\nskip\nneedle\n").unwrap();
+        }
+        let mut app = App::new(temp.path().to_path_buf()).unwrap();
+        app.begin_name_search("needle".into());
+        finish_search(&mut app);
+        assert_eq!(app.search_scope(), SearchScope::Names);
+        let names: Vec<_> = app
+            .search_hits
+            .iter()
+            .map(|hit| hit.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["needle", "a-needle.txt", "n-e-e-d-l-e.txt"]);
+        app.move_last();
+        app.open_viewer();
+        assert!(app.find.query.is_empty());
+        assert!(app.browser_target.is_none());
+        assert!(app.viewer_source_line.is_none());
+        app.begin_find();
+        app.paste("ndle");
+        assert!(app.find.matches.is_empty());
+        app.finish_find(true);
+        app.close_viewer();
+
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.search_scope(), SearchScope::Content);
+        assert!(
+            app.selected_search_hit()
+                .unwrap()
+                .path
+                .ends_with("n-e-e-d-l-e.txt")
+        );
+        assert_eq!(app.selected_search_hit().unwrap().kind, SearchHitKind::Line);
+        assert_eq!(app.selected_search_hit().unwrap().first_match, 3..9);
+        let headers: Vec<_> = app
+            .search_hits
+            .iter()
+            .filter(|hit| hit.kind == SearchHitKind::File)
+            .map(|hit| hit.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            headers,
+            ["needle", "a-needle.txt", "n-e-e-d-l-e.txt", "other.txt"]
+        );
+        assert_eq!(app.search_counts(), (0, 8, 4));
+        for group in app.search_hits.as_chunks::<3>().0 {
+            assert!(group.iter().all(|hit| hit.path == group[0].path
+                && hit.name_rank == group[0].name_rank
+                && hit.name_ranges.is_empty()));
+            assert_eq!(group[1].line, Some(1));
+            assert_eq!(group[2].line, Some(3));
+        }
+        app.cycle_search_scope();
+        finish_search(&mut app);
+        assert_eq!(app.search_scope(), SearchScope::Both);
+        assert!(
+            app.selected_search_hit()
+                .unwrap()
+                .path
+                .ends_with("n-e-e-d-l-e.txt")
+        );
+        assert_eq!(app.selected_search_hit().unwrap().kind, SearchHitKind::Line);
+        assert_eq!(app.selected_search_hit().unwrap().first_match, 3..9);
     }
 
     #[test]

@@ -15,6 +15,16 @@ Press `e` to edit a regular UTF-8 file with the built-in editor.
 Press `o` to open a file in its default application.
 `de` has no file delete, rename, or copy commands.
 
+## What's new in v0.10.0
+
+- Open an existing file directly with `de PATH`, including an explicit hidden file.
+- Use an argument that names no existing path for interactive fuzzy lookup below the current directory.
+- Search names with fuzzy matching while content search and viewer find stay literal.
+- Rank exact names first, then substrings, then other fuzzy matches, with original matched characters highlighted.
+- Library callers constructing `SearchHit` must supply its new `name_rank` and `name_ranges` fields.
+
+See the [v0.10.0 release notes](https://github.com/reyamira/de/releases/tag/v0.10.0).
+
 ## What's new in v0.7.0
 
 - Press `f` in the file viewer to use every terminal row, or to restore its normal inline size.
@@ -118,6 +128,32 @@ command de init fish | source
 defined. The wrapper captures the directory printed by the executable and then
 asks the parent shell to `cd` there.
 
+## Usage
+
+```sh
+de
+de path/to/folder
+de path/to/file.rs
+de .env
+de partial-name
+```
+
+With no argument, `de` browses the current directory.
+An exact existing path always wins over fuzzy lookup.
+An existing directory opens in the browser.
+An existing file opens in the inline viewer, including an explicitly named hidden file.
+From this viewer, `Escape` returns to the parent directory with the file selected.
+Direct file startup does not bypass the editor's file safety rules, including its rejection of symbolic links.
+`init`, `theme`, `config`, and `languages` remain subcommands.
+Use `de -- config` to treat `config` as a path or fuzzy query.
+
+If the argument does not name an existing path, `de` starts interactive fuzzy lookup below the current directory.
+Lookup starts in `Files & folders` mode and always requires a selection, even for one result.
+`Enter` chooses a selected folder or opens a selected file.
+From that file viewer, `Escape` returns to the lookup results.
+In startup lookup, `Escape` exits without changing the shell's working directory.
+Lookup uses no global index and keeps the search policies and limits below.
+
 ## Controls
 
 | Key | Action |
@@ -129,7 +165,7 @@ asks the parent shell to `cd` there.
 | `/` | Search names and text recursively under the current folder |
 | `Shift+Tab` (search) | Cycle `Both`, `Files & folders`, and `Content` without clearing the query |
 | `Up` / `Down`, `PageUp` / `PageDown`, `Home` / `End` (search) | Select only filtered results |
-| `Left`, `Right`, `Tab` (search) | Do not browse folders; press `Escape` to leave search first |
+| `Left`, `Right`, `Tab` (search) | Do not browse folders; `Escape` restores browsing only in ordinary `/` search |
 | `s` | Toggle sorting by name or modification time |
 | `Shift+S` | Toggle ascending or descending order |
 | `v` | View the highlighted file inline |
@@ -175,14 +211,21 @@ requirements, Markdown rendering, and size limits.
 ### Recursive search
 
 Press `/` to search names and text under the current folder.
-The search uses literal, case-insensitive text, not a regular expression.
+Names use case-insensitive fuzzy matching. Content uses literal, case-insensitive text.
+Neither mode uses regular expressions.
 Search starts in `Both` mode.
 Press `Shift+Tab` while typing to cycle through `Files & folders`, `Content`, and `Both`.
 The header shows only `/ query▏`.
 The footer shows only the active mode and its `Shift+Tab` control.
 The app remembers the mode until it closes.
-`Files & folders` matches the full relative path, including parent directory names, as before.
-`Content` matches original source text.
+`Files & folders` matches the full relative path, including parent directory names.
+Exact basename or relative-path matches rank first, then substring matches, then other fuzzy matches.
+Other fuzzy matches can use nonadjacent characters in order.
+Highlights mark the original matched characters, including nonadjacent characters in UTF-8 names.
+Ranking covers only results collected within the existing result limit, not every possible match in the subtree.
+`Content` matches literal original source text.
+`Both` combines fuzzy name matches with literal content matches.
+In-file viewer find stays literal.
 Results group matching source lines under one filename.
 Unselected rows use muted directory names and source numbers.
 File headers show matching line counts when space permits.
@@ -193,18 +236,20 @@ The footer adds counts, progress, and controls when space permits.
 It keeps the result-limit warning when results reach the limit.
 `Up`, `Down`, `PageUp`, `PageDown`, `Home`, and `End` select only filtered results.
 Search continues in the background.
-`Enter` chooses a folder result or opens the exact first match in a file.
+`Enter` chooses a folder result or opens a file in the viewer.
+For content results, the viewer opens at the exact source match.
 Visible Markdown text opens in rendered mode; hidden Markdown syntax opens in source mode.
 SVG content matches open highlighted XML source.
 `Left`, `Right`, and plain `Tab` do not browse folders during search.
-Press `Escape` before using folder-browsing keys.
+During ordinary `/` search, press `Escape` before using folder-browsing keys.
 To edit a search result, press `Enter`, then `e`.
-`Escape` restores the exact folder and selection from before the search.
+For ordinary `/` search, `Escape` restores the exact folder and selection from before the search.
 From a viewer, `Escape` first returns to the search.
 
 The search respects `.gitignore`, `.ignore`, and the hidden-file setting.
 It does not follow directory symlinks or read symlink contents.
 It skips binary, non-UTF-8, and oversized text files.
+The search uses no global index.
 The footer distinguishes an active search from completed results.
 See the [viewer guide](docs/viewer.md) for search limits and editor safety rules.
 
